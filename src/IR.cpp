@@ -632,6 +632,7 @@ constexpr const char *intrinsic_op_names[] = {
     "extract_mask_element",
     "get_runtime_vscale",
     "get_user_context",
+    "gpu_named_barrier",
     "gpu_thread_barrier",
     "halving_add",
     "halving_sub",

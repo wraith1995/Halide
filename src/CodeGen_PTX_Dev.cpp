@@ -288,6 +288,32 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         return;
     }
 
+    if (op->is_intrinsic(Call::gpu_named_barrier)) {
+        // gpu_named_barrier(barrier_id, thread_count, mode):
+        //   mode 0 -> bar.sync   barrier_id, thread_count  (wait)
+        //   mode 1 -> bar.arrive barrier_id, thread_count  (non-blocking arrive)
+        // These are *partial* (non-aligned) named CTA barriers: only thread_count
+        // threads of the block participate, which is required for warp
+        // specialization where producer and consumer warps run different code and
+        // a whole-CTA __syncthreads would deadlock.
+        internal_assert(op->args.size() == 3)
+            << "gpu_named_barrier() intrinsic expects (barrier_id, thread_count, mode).\n";
+        auto mode = as_const_int(op->args[2]);
+        internal_assert(mode && (*mode == 0 || *mode == 1))
+            << "gpu_named_barrier() mode must be the constant 0 (wait) or 1 (arrive).\n";
+
+        Value *barrier_id = codegen(op->args[0]);
+        Value *thread_count = codegen(op->args[1]);
+        llvm::Intrinsic::ID id = (*mode == 1)
+                                     ? llvm::Intrinsic::nvvm_barrier_cta_arrive_count
+                                     : llvm::Intrinsic::nvvm_barrier_cta_sync_count;
+        llvm::Function *barrier = llvm::Intrinsic::getOrInsertDeclaration(module.get(), id);
+        internal_assert(barrier) << "Could not find PTX named-barrier intrinsic.\n";
+        builder->CreateCall(barrier, {barrier_id, thread_count});
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
+
     // TODO: It would be better if CodeGen_LLVM could handle overloaded intrin calls by default.
     value = call_overloaded_intrin(op->type, op->name, op->args);
     if (!value) {

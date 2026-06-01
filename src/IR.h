@@ -650,6 +650,13 @@ struct Call : public ExprNode<Call> {
         // Returns the runtime value of ARM SVE vscale (the vector length multiplier)
         get_runtime_vscale,
         get_user_context,
+        // A partial, named GPU block barrier for warp specialization:
+        // gpu_named_barrier(barrier_id, thread_count, mode). mode 0 waits until
+        // thread_count threads reach named barrier barrier_id; mode 1 marks the
+        // calling threads' arrival without blocking. Unlike gpu_thread_barrier
+        // (whole-CTA), only thread_count threads participate, so producer and
+        // consumer warps can synchronize without the other group reaching it.
+        gpu_named_barrier,
         gpu_thread_barrier,
         halving_add,
         halving_sub,
