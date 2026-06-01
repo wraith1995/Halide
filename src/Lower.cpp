@@ -290,6 +290,12 @@ void lower_impl(const vector<Function> &output_funcs,
         debug(1) << "Canonicalizing GPU var names...\n";
         s = canonicalize_gpu_vars(s);
         log("Lowering after canonicalizing GPU var names:", s);
+
+        // Must run before storage flattening, while producers are still Realize
+        // nodes with canonical thread-loop names.
+        debug(1) << "Injecting GPU warp specialization...\n";
+        s = inject_gpu_warp_specialization(s, env);
+        log("Lowering after injecting GPU warp specialization:", s);
     }
 
     debug(1) << "Bounding small realizations...\n";
@@ -359,10 +365,6 @@ void lower_impl(const vector<Function> &output_funcs,
 
     if (t.has_gpu_feature() ||
         t.has_feature(Target::Vulkan)) {
-        debug(1) << "Injecting GPU warp specialization...\n";
-        s = inject_gpu_warp_specialization(s, env);
-        log("Lowering after injecting GPU warp specialization:", s);
-
         debug(1) << "Injecting per-block gpu synchronization...\n";
         s = fuse_gpu_thread_loops(s);
         log("Lowering after injecting per-block gpu synchronization:", s);
