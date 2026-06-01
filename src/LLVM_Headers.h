@@ -53,6 +53,7 @@
 #ifdef WITH_HEXAGON
 #include <llvm/IR/IntrinsicsHexagon.h>
 #endif
+#include <llvm/IR/IntrinsicsNVPTX.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Metadata.h>
