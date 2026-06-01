@@ -15,8 +15,6 @@ using std::set;
 using std::string;
 using std::vector;
 
-namespace {
-
 /** A Func scheduled as an async producer whose storage lives in GPU shared
  * memory is lowered to GPU warp specialization (producer/consumer warps within
  * a block) rather than host-thread async. Detect that case so the host async
@@ -25,6 +23,8 @@ bool is_gpu_warp_specialized(const Function &f) {
     return f.schedule().async() &&
            f.schedule().memory_type() == MemoryType::GPUShared;
 }
+
+namespace {
 
 /** A mutator which eagerly folds no-op stmts */
 class NoOpCollapsingMutator : public IRMutator {

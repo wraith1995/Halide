@@ -2,12 +2,14 @@
 #include <cmath>
 #include <utility>
 
+#include "AsyncProducers.h"
 #include "Bounds.h"
 #include "CSE.h"
 #include "CanonicalizeGPUVars.h"
 #include "CodeGen_GPU_Dev.h"
 #include "CompilerLogger.h"
 #include "ExprUsesVar.h"
+#include "Function.h"
 #include "FuseGPUThreadLoops.h"
 #include "IR.h"
 #include "IREquality.h"
@@ -1600,7 +1602,124 @@ protected:
     }
 };
 
+// Does this statement contain a GPU thread/lane loop in the outermost thread
+// dimension (dim 2)? If so we can't reuse that dimension for the warp-group
+// split, and fall back to synchronous staging.
+class UsesOutermostThreadDim : public IRVisitor {
+    using IRVisitor::visit;
+    void visit(const For *op) override {
+        if ((op->for_type == ForType::GPUThread || op->for_type == ForType::GPULane) &&
+            ends_with(op->name, gpu_thread_name(2))) {
+            found = true;
+        }
+        IRVisitor::visit(op);
+    }
+
+public:
+    bool found = false;
+};
+
+// Does this statement contain a Realize of a warp-specialized producer other
+// than `self`? Nested warp specialization isn't handled yet.
+class ContainsNestedWarpSpec : public IRVisitor {
+    const std::map<std::string, Function> &env;
+    const std::string &self;
+    using IRVisitor::visit;
+    void visit(const Realize *op) override {
+        if (op->name != self) {
+            auto it = env.find(op->name);
+            if (it != env.end() && is_gpu_warp_specialized(it->second)) {
+                found = true;
+            }
+        }
+        IRVisitor::visit(op);
+    }
+
+public:
+    bool found = false;
+    ContainsNestedWarpSpec(const std::map<std::string, Function> &env, const std::string &self)
+        : env(env), self(self) {
+    }
+};
+
+// For a single warp-specialized producer, wrap its produce body so it runs on
+// warp group 0 and its consume body so it runs on warp group 1, by injecting an
+// outer GPU-thread loop over the (otherwise unused) dim-2 thread dimension and
+// guarding each side. fuse_gpu_thread_loops then fuses this into a launch with
+// disjoint producer/consumer warp groups and a whole-block barrier between them.
+class WrapWarpGroups : public IRMutator {
+    const std::string &name;
+    DeviceAPI device_api;
+    using IRMutator::visit;
+
+    Stmt wrap(const Stmt &body, int group) {
+        // Single producer/consumer pair -> two warp groups total.
+        const std::string wg = unique_name("warp_group") + gpu_thread_name(2);
+        Expr v = Variable::make(Int(32), wg);
+        Stmt guarded = IfThenElse::make(v == group, body);
+        // min 0, max 1 => extent 2 (group 0 = producer, group 1 = consumer).
+        return For::make(wg, 0, 1, ForType::GPUThread, Partition::Never, device_api, guarded);
+    }
+
+    Stmt visit(const ProducerConsumer *op) override {
+        if (op->name == name) {
+            int group = op->is_producer ? 0 : 1;
+            return ProducerConsumer::make(op->name, op->is_producer, wrap(op->body, group));
+        }
+        return IRMutator::visit(op);
+    }
+
+public:
+    WrapWarpGroups(const std::string &name, DeviceAPI device_api)
+        : name(name), device_api(device_api) {
+    }
+};
+
+class InjectGPUWarpSpecialization : public IRMutator {
+    const std::map<std::string, Function> &env;
+    DeviceAPI device_api = DeviceAPI::None;
+    using IRMutator::visit;
+
+    Stmt visit(const For *op) override {
+        ScopedValue<DeviceAPI> d(device_api,
+                                 op->device_api != DeviceAPI::None ? op->device_api : device_api);
+        return IRMutator::visit(op);
+    }
+
+    Stmt visit(const Realize *op) override {
+        auto it = env.find(op->name);
+        if (it == env.end() || !is_gpu_warp_specialized(it->second)) {
+            return IRMutator::visit(op);
+        }
+
+        // Conservative guards: only handle the simple, safe case. Otherwise
+        // leave it unchanged (synchronous shared-memory staging, still correct).
+        UsesOutermostThreadDim uses_dim2;
+        op->body.accept(&uses_dim2);
+        ContainsNestedWarpSpec nested(env, op->name);
+        op->body.accept(&nested);
+        if (uses_dim2.found || nested.found || device_api == DeviceAPI::None) {
+            return IRMutator::visit(op);
+        }
+
+        Stmt body = WrapWarpGroups(op->name, device_api)(op->body);
+        // Recurse to handle other warp-specialized producers elsewhere.
+        body = mutate(body);
+        return Realize::make(op->name, op->types, op->memory_type,
+                             op->bounds, op->condition, body);
+    }
+
+public:
+    InjectGPUWarpSpecialization(const std::map<std::string, Function> &env)
+        : env(env) {
+    }
+};
+
 }  // namespace
+
+Stmt inject_gpu_warp_specialization(Stmt s, const std::map<std::string, Function> &env) {
+    return InjectGPUWarpSpecialization(env)(s);
+}
 
 Stmt fuse_gpu_thread_loops(Stmt s) {
     // NormalizeIfStatements pushes the predicates between GPU blocks
