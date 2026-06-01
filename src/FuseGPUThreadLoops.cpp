@@ -1602,21 +1602,24 @@ protected:
     }
 };
 
-// Does this statement contain a GPU thread/lane loop in the outermost thread
-// dimension (dim 2)? If so we can't reuse that dimension for the warp-group
-// split, and fall back to synchronous staging.
-class UsesOutermostThreadDim : public IRVisitor {
+// The highest GPU thread/lane dimension (0..2) used in this statement, or -1 if
+// none. The warp-group split goes one dimension above this; if that would exceed
+// dim 2 there's no room and we fall back to synchronous staging.
+class MaxThreadDim : public IRVisitor {
     using IRVisitor::visit;
     void visit(const For *op) override {
-        if ((op->for_type == ForType::GPUThread || op->for_type == ForType::GPULane) &&
-            ends_with(op->name, gpu_thread_name(2))) {
-            found = true;
+        if (op->for_type == ForType::GPUThread || op->for_type == ForType::GPULane) {
+            for (int i = 0; i < 3; i++) {
+                if (ends_with(op->name, gpu_thread_name(i))) {
+                    max_dim = std::max(max_dim, i);
+                }
+            }
         }
         IRVisitor::visit(op);
     }
 
 public:
-    bool found = false;
+    int max_dim = -1;
 };
 
 // Does this statement contain a Realize of a warp-specialized producer other
@@ -1650,11 +1653,13 @@ public:
 class WrapWarpGroups : public IRMutator {
     const std::string &name;
     DeviceAPI device_api;
+    int wg_dim;
     using IRMutator::visit;
 
     Stmt wrap(const Stmt &body, int group) {
-        // Single producer/consumer pair -> two warp groups total.
-        const std::string wg = unique_name("warp_group") + gpu_thread_name(2);
+        // Single producer/consumer pair -> two warp groups total, placed on the
+        // lowest free thread dimension.
+        const std::string wg = unique_name("warp_group") + gpu_thread_name(wg_dim);
         Expr v = Variable::make(Int(32), wg);
         Stmt guarded = IfThenElse::make(v == group, body);
         // min 0, max 1 => extent 2 (group 0 = producer, group 1 = consumer).
@@ -1670,8 +1675,8 @@ class WrapWarpGroups : public IRMutator {
     }
 
 public:
-    WrapWarpGroups(const std::string &name, DeviceAPI device_api)
-        : name(name), device_api(device_api) {
+    WrapWarpGroups(const std::string &name, DeviceAPI device_api, int wg_dim)
+        : name(name), device_api(device_api), wg_dim(wg_dim) {
     }
 };
 
@@ -1694,15 +1699,16 @@ class InjectGPUWarpSpecialization : public IRMutator {
 
         // Conservative guards: only handle the simple, safe case. Otherwise
         // leave it unchanged (synchronous shared-memory staging, still correct).
-        UsesOutermostThreadDim uses_dim2;
-        op->body.accept(&uses_dim2);
+        MaxThreadDim mtd;
+        op->body.accept(&mtd);
+        int wg_dim = mtd.max_dim + 1;  // warp-group split goes one dim above.
         ContainsNestedWarpSpec nested(env, op->name);
         op->body.accept(&nested);
-        if (uses_dim2.found || nested.found || device_api == DeviceAPI::None) {
+        if (mtd.max_dim < 0 || wg_dim > 2 || nested.found || device_api == DeviceAPI::None) {
             return IRMutator::visit(op);
         }
 
-        Stmt body = WrapWarpGroups(op->name, device_api)(op->body);
+        Stmt body = WrapWarpGroups(op->name, device_api, wg_dim)(op->body);
         // Recurse to handle other warp-specialized producers elsewhere.
         body = mutate(body);
         return Realize::make(op->name, op->types, op->memory_type,
