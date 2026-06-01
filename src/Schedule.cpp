@@ -241,6 +241,10 @@ struct FuncScheduleContents {
     MemoryType memory_type = MemoryType::Auto;
     bool memoized = false;
     bool async = false;
+    // Number of GPU warps dedicated to producing this Func when it is scheduled
+    // as a warp-specialized async producer inside a GPU block. 0 means "auto"
+    // (use the default of one producer warp). See Func::gpu_producer_warps.
+    int gpu_producer_warps = 0;
     // This is an extent of the ring buffer and expected to be a positive integer.
     Expr ring_buffer;
     Expr memoize_eviction_key;
@@ -364,6 +368,7 @@ FuncSchedule FuncSchedule::deep_copy(
     copy.contents->memoized = contents->memoized;
     copy.contents->memoize_eviction_key = contents->memoize_eviction_key;
     copy.contents->async = contents->async;
+    copy.contents->gpu_producer_warps = contents->gpu_producer_warps;
     copy.contents->ring_buffer = contents->ring_buffer;
 
     // Deep-copy wrapper functions.
@@ -406,6 +411,14 @@ bool &FuncSchedule::async() {
 
 bool FuncSchedule::async() const {
     return contents->async;
+}
+
+int &FuncSchedule::gpu_producer_warps() {
+    return contents->gpu_producer_warps;
+}
+
+int FuncSchedule::gpu_producer_warps() const {
+    return contents->gpu_producer_warps;
 }
 
 Expr &FuncSchedule::ring_buffer() {

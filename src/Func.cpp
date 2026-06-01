@@ -2451,6 +2451,15 @@ Func &Func::ring_buffer(Expr extent) {
     return *this;
 }
 
+Func &Func::gpu_producer_warps(int n) {
+    invalidate_cache();
+    user_assert(n >= 1)
+        << "gpu_producer_warps() for Func " << name()
+        << " must be at least 1, but got " << n << "\n";
+    func.schedule().gpu_producer_warps() = n;
+    return *this;
+}
+
 Stage Func::specialize(const Expr &c) {
     invalidate_cache();
     return Stage(func, func.definition(), 0).specialize(c);

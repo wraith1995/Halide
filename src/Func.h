@@ -2345,6 +2345,19 @@ public:
      */
     Func &async();
 
+    /** When this Func is scheduled as an asynchronous producer whose compute
+     * level sits inside a GPU block loop but outside the GPU thread loops, it
+     * is lowered via GPU warp specialization: a group of warps in each block is
+     * dedicated to producing this Func (e.g. staging data into shared memory)
+     * while the remaining warps consume it. This directive sets how many warps
+     * are dedicated to production. The default (0) means one producer warp.
+     *
+     * This is currently only supported on the CUDA target. The producer/consumer
+     * split is warp-aligned, so the consumer thread count is rounded up to a
+     * multiple of the warp size and the block is launched with `n` extra warps.
+     */
+    Func &gpu_producer_warps(int n);
+
     /** Expands the storage of the function by an extra dimension
      * to enable ring buffering. For this to be useful the storage
      * of the function has to be hoisted to an upper loop level using

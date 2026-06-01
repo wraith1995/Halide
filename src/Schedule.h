@@ -613,6 +613,13 @@ public:
     bool &async();
     bool async() const;
 
+    /** Number of GPU warps dedicated to producing this Function when it is
+     * scheduled as a warp-specialized async producer inside a GPU block. A
+     * value of 0 means "auto" (one producer warp). See \ref
+     * Func::gpu_producer_warps. */
+    int &gpu_producer_warps();
+    int gpu_producer_warps() const;
+
     Expr &ring_buffer();
     Expr &ring_buffer() const;
 
