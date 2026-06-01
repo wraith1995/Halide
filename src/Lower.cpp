@@ -275,6 +275,9 @@ void lower_impl(const vector<Function> &output_funcs,
     s = skip_stages(s, outputs, fused_groups, env);
     log("Lowering after dynamically skipping stages:", s);
 
+    debug(1) << "Validating GPU async (warp-specialized) producers...\n";
+    validate_gpu_async_producers(env, t);
+
     debug(1) << "Forking asynchronous producers...\n";
     s = fork_async_producers(s, env);
     log("Lowering after forking asynchronous producers:", s);

@@ -10,11 +10,21 @@
 #include "Expr.h"
 
 namespace Halide {
+
+struct Target;
+
 namespace Internal {
 
 class Function;
 
 Stmt fork_async_producers(Stmt s, const std::map<std::string, Function> &env);
+
+/** A Func scheduled as an async producer stored in GPU shared memory lowers to
+ * GPU warp specialization. Validate such Funcs against what is currently
+ * supported (CUDA-only, plus not-yet-implemented combinations), emitting clear
+ * user errors. Runs early in lowering, before fork_async_producers. */
+void validate_gpu_async_producers(const std::map<std::string, Function> &env,
+                                  const Target &t);
 
 }  // namespace Internal
 }  // namespace Halide

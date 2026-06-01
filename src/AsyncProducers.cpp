@@ -4,6 +4,7 @@
 #include "IREquality.h"
 #include "IRMutator.h"
 #include "IROperator.h"
+#include "Target.h"
 
 namespace Halide {
 namespace Internal {
@@ -15,6 +16,15 @@ using std::string;
 using std::vector;
 
 namespace {
+
+/** A Func scheduled as an async producer whose storage lives in GPU shared
+ * memory is lowered to GPU warp specialization (producer/consumer warps within
+ * a block) rather than host-thread async. Detect that case so the host async
+ * machinery skips it. */
+bool is_gpu_warp_specialized(const Function &f) {
+    return f.schedule().async() &&
+           f.schedule().memory_type() == MemoryType::GPUShared;
+}
 
 /** A mutator which eagerly folds no-op stmts */
 class NoOpCollapsingMutator : public IRMutator {
@@ -455,7 +465,8 @@ protected:
         auto it = env.find(op->name);
         internal_assert(it != env.end());
         Function f = it->second;
-        if (f.schedule().async() && f.schedule().ring_buffer().defined()) {
+        if (f.schedule().async() && f.schedule().ring_buffer().defined() &&
+            !is_gpu_warp_specialized(f)) {
             body = process_body(op->name, body);
         } else {
             body = mutate(body);
@@ -468,7 +479,8 @@ protected:
         auto it = env.find(op->name);
         internal_assert(it != env.end());
         Function f = it->second;
-        if (f.schedule().async() && hoisted_storages.count(op->name) == 0) {
+        if (f.schedule().async() && hoisted_storages.count(op->name) == 0 &&
+            !is_gpu_warp_specialized(f)) {
             Stmt body = op->body;
             body = process_body(op->name, body);
             return Realize::make(op->name, op->types, op->memory_type,
@@ -762,7 +774,9 @@ protected:
         Stmt body = mutate(op->body);
         Function f = env.find(op->name)->second;
         Region bounds = op->bounds;
-        if (f.schedule().ring_buffer().defined()) {
+        // GPU warp-specialized producers ring-buffer in shared memory via a
+        // separate device path; the host ring-buffering transform skips them.
+        if (f.schedule().ring_buffer().defined() && !is_gpu_warp_specialized(f)) {
             // For the ring buffering we expand the storage by adding another dimension of
             // the range of [0, ring_buffer.extent].
             bounds.emplace_back(0, f.schedule().ring_buffer());
@@ -1023,6 +1037,29 @@ Stmt fork_async_producers(Stmt s, const map<string, Function> &env) {
     s = TightenForkNodes()(s);
     s = InitializeSemaphores()(s);
     return s;
+}
+
+void validate_gpu_async_producers(const map<string, Function> &env, const Target &t) {
+    for (const auto &p : env) {
+        const Function &f = p.second;
+        if (!is_gpu_warp_specialized(f)) {
+            continue;
+        }
+        // async() + store_in(GPUShared) selects GPU warp specialization.
+        user_assert(t.has_feature(Target::CUDA))
+            << "Func " << f.name() << " is scheduled as an asynchronous producer "
+            << "stored in GPU shared memory (async() + store_in(MemoryType::GPUShared)), "
+            << "which lowers to GPU warp specialization. This is currently only "
+            << "supported on the CUDA target.\n";
+
+        // Not-yet-implemented combinations. These guard features that later
+        // phases will add, so users get a clear message rather than silent
+        // miscompilation.
+        user_assert(!f.schedule().ring_buffer().defined())
+            << "Func " << f.name() << " combines ring_buffer() with GPU warp "
+            << "specialization (async() + store_in(MemoryType::GPUShared)). Ring "
+            << "buffering for GPU warp-specialized producers is not yet implemented.\n";
+    }
 }
 
 }  // namespace Internal
