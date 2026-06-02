@@ -1847,8 +1847,7 @@ class FlattenWarpSpecForks : public IRMutator {
                 prod = simplify(prod * maxe[i]);
             }
             Expr size = simplify(((prod + 31) / 32) * 32);  // warp-aligned group size
-            Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)
-                          .mutate(branch);
+            Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)(branch);
             // Group range guard: only this group's warp range runs the branch (incl. its
             // cross-group barriers), so per-edge barrier counts (= sum of two groups) hold.
             fb = IfThenElse::make(fv >= base && fv < simplify(base + size), fb);
@@ -1862,7 +1861,7 @@ class FlattenWarpSpecForks : public IRMutator {
 };
 
 Stmt flatten_warp_spec_forks(const Stmt &s) {
-    return FlattenWarpSpecForks().mutate(s);
+    return FlattenWarpSpecForks()(s);
 }
 
 // Is `name` a host semaphore of a warp-specialized ring producer? (Those are
