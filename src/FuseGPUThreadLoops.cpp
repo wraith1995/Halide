@@ -1457,6 +1457,11 @@ public:
     }
 };
 
+// Part 2 of the Fork-aware lowering: rewrite any device warp-spec Fork in this
+// statement into a flat 1D thread partition (defined below, after ThreadExtents).
+// No Fork => returns the statement unchanged (the identity invariant).
+Stmt flatten_warp_spec_forks(const Stmt &s);
+
 class FuseGPUThreadLoops : public IRMutator {
 protected:
     using IRMutator::visit;
@@ -1471,11 +1476,14 @@ protected:
             << "thread variables.\n";
 
         if (op->for_type == ForType::GPUBlock) {
-            // Do the analysis of thread block size and shared memory
-            // usage.
+            // Warp-spec forks become a flat thread partition before block-size
+            // analysis, so ExtractBlockSize sums the groups (one flat dim) instead
+            // of maxing them. A kernel with no fork is returned unchanged.
+            Stmt loop = flatten_warp_spec_forks(op);
+
+            // Do the analysis of thread block size and shared memory usage.
             ExtractBlockSize block_size;
-            block_size(op);
-            Stmt loop(op);
+            loop.accept(&block_size);
 
             ExtractSharedAndHeapAllocations block_allocations(op->device_api);
             loop = block_allocations(loop);
@@ -1756,6 +1764,106 @@ public:
     int max_dim = -1;
     Expr extent[3];
 };
+
+// Replace one fork branch's gpu_thread loops with their reconstruction from a flat
+// thread id. The branch occupies flat ids [base, base+size); `local` = flat - base.
+// Thread dim d is recovered as (local / stride[d]) and, for all but the top dim,
+// % max_extent[d]; a per-dim guard `idx < actual_extent` masks tails and warp
+// padding (the named ring barriers sit outside these guards, so all `size` lanes
+// still reach them — matching the per-edge counts).
+class FlattenBranchThreads : public IRMutator {
+    Expr local;
+    const Expr *stride;
+    const Expr *max_extent;
+    int max_dim;
+    using IRMutator::visit;
+
+    Stmt visit(const For *op) override {
+        int d = -1;
+        if (op->for_type == ForType::GPUThread || op->for_type == ForType::GPULane) {
+            for (int i = 0; i < 3; i++) {
+                if (ends_with(op->name, gpu_thread_name(i))) {
+                    d = i;
+                    break;
+                }
+            }
+        }
+        if (d < 0) {
+            return IRMutator::visit(op);
+        }
+        Expr idx = simplify(local / stride[d]);
+        if (d < max_dim) {
+            idx = simplify(idx % max_extent[d]);  // top dim keeps the full quotient
+        }
+        Stmt body = mutate(op->body);
+        body = substitute(op->name, op->min + idx, body);
+        return IfThenElse::make(idx < op->extent(), body);
+    }
+
+public:
+    FlattenBranchThreads(const Expr &local, const Expr *stride,
+                         const Expr *max_extent, int max_dim)
+        : local(local), stride(stride), max_extent(max_extent), max_dim(max_dim) {
+    }
+};
+
+// Convert a device warp-spec Fork into a flat 1D thread partition: branch g (a warp
+// group) runs on a contiguous, warp-aligned thread range [base_g, base_g+size_g),
+// summed across branches. Replaces the Fork with one gpu_thread loop of extent
+// Sum(size_g) on dim 0; ExtractBlockSize then reads that sum as blockDim.x.
+class FlattenWarpSpecForks : public IRMutator {
+    DeviceAPI device_api = DeviceAPI::None;
+    using IRMutator::visit;
+
+    static void flatten(const Stmt &s, std::vector<Stmt> &branches) {
+        if (const Fork *f = s.as<Fork>()) {
+            branches.push_back(f->first);
+            flatten(f->rest, branches);
+        } else {
+            branches.push_back(s);
+        }
+    }
+
+    Stmt visit(const For *op) override {
+        ScopedValue<DeviceAPI> d(device_api,
+                                 op->device_api != DeviceAPI::None ? op->device_api : device_api);
+        return IRMutator::visit(op);
+    }
+
+    Stmt visit(const Fork *op) override {
+        std::vector<Stmt> branches;
+        flatten(op, branches);
+        const std::string ftid = unique_name("warp_flat") + gpu_thread_name(0);
+        Expr fv = Variable::make(Int(32), ftid);
+        Expr base = 0;
+        Stmt body;
+        for (const Stmt &branch : branches) {
+            ThreadExtents te;
+            branch.accept(&te);
+            Expr stride[3], maxe[3], prod = 1;
+            for (int i = 0; i < 3; i++) {
+                stride[i] = prod;
+                maxe[i] = te.extent[i].defined() ? te.extent[i] : Expr(1);
+                prod = simplify(prod * maxe[i]);
+            }
+            Expr size = simplify(((prod + 31) / 32) * 32);  // warp-aligned group size
+            Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)
+                          .mutate(branch);
+            // Group range guard: only this group's warp range runs the branch (incl. its
+            // cross-group barriers), so per-edge barrier counts (= sum of two groups) hold.
+            fb = IfThenElse::make(fv >= base && fv < simplify(base + size), fb);
+            body = body.defined() ? Block::make(body, fb) : fb;
+            base = simplify(base + size);
+        }
+        // For stores an inclusive max; max = total-1 gives extent total.
+        return For::make(ftid, 0, simplify(base - 1), ForType::GPUThread,
+                         Partition::Never, device_api, body);
+    }
+};
+
+Stmt flatten_warp_spec_forks(const Stmt &s) {
+    return FlattenWarpSpecForks().mutate(s);
+}
 
 // Is `name` a host semaphore of a warp-specialized ring producer? (Those are
 // "<prod>.semaphore_<i>" / "<prod>.folding_semaphore.ring_buffer".)
