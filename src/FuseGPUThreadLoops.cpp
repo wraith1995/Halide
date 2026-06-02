@@ -1776,31 +1776,57 @@ bool sema_belongs_to_warpspec_ring(const std::string &name,
            it->second.schedule().ring_buffer().defined();
 }
 
-// (a)-1: lower a device async Fork (warp-specialized ring producer) to a warp-group
-// split coordinated by per-slot named barriers. The producer branch runs on warp
-// group wg<P, the consumer on wg>=P (an injected outer GPU-thread dim). acquire/
-// release become gpu_named_barrier with per-slot ids (full=[0,N), empty=[N,2N)); the
-// producer's first N empty-waits are primed out (slots start free); host semaphores
-// are stripped. Barrier wait/arrive is emitted via emit_barrier() so mbarrier can
-// later drop in at the same seam.
+// Collect the names of every warp-specialized ring producer in a statement, in
+// pre-order (outermost HoistedStorage first). Used to assign each producer a warp
+// group and a sequential block of named-barrier ids.
+class CollectWarpSpecRing : public IRVisitor {
+    const std::map<std::string, Function> &env;
+    using IRVisitor::visit;
+    void visit(const HoistedStorage *op) override {
+        auto it = env.find(op->name);
+        if (it != env.end() && is_gpu_warp_specialized(it->second) &&
+            it->second.schedule().ring_buffer().defined()) {
+            producers.push_back(op->name);
+        }
+        IRVisitor::visit(op);
+    }
+
+public:
+    std::vector<std::string> producers;
+    CollectWarpSpecRing(const std::map<std::string, Function> &env)
+        : env(env) {
+    }
+};
+
+// (a)-1/(a)-3: lower a device async Fork of N warp-specialized ring producers to an
+// (N+1)-way warp-group split coordinated by per-slot named barriers. Producer i runs
+// on warp group wg==i, the consumer on wg>=N (an injected outer GPU-thread dim).
+// acquire/release become gpu_named_barrier with per-slot ids; each producer owns a
+// block full=[2N*i, 2N*i+N), empty=[2N*i+N, 2N*i+2N) keyed by its semaphore names.
+// Each producer's first N empty-waits are primed out (slots start free); host
+// semaphores are stripped. Barrier wait/arrive is emitted via emit_barrier() so
+// mbarrier can later drop in at the same seam.
 class LowerGPUWarpAsyncFork : public IRMutator {
     const std::map<std::string, Function> &env;
     DeviceAPI device_api = DeviceAPI::None;
     bool active = false;
-    std::string full_sema, empty_sema, ring_loop;
-    int ring_n = 0;
+    std::string ring_loop;
     int wg_dim = -1;
-    const int num_groups = 2;    // MVP: 1 producer warp group + 1 consumer warp group
-    const int num_producer = 1;  // producer occupies wg in [0, num_producer)
+    int num_producers = 0;  // producers occupy wg [0, num_producers); consumer is wg >= num_producers
     Expr thread_count;
+    // Each warp-spec ring semaphore maps to a block of per-slot named-barrier ids.
+    struct BarrierInfo {
+        int base;       // first barrier id for this edge
+        int ring_n;     // ring depth (slot = ring_loop % ring_n)
+        bool is_empty;  // empty edge (producer waits) vs full edge (consumer waits)
+    };
+    std::map<std::string, BarrierInfo> sema_map;
     using IRMutator::visit;
 
-    Expr slot() const {
-        return Variable::make(Int(32), ring_loop) % ring_n;
-    }
-    // base 0 = full barriers, base ring_n = empty barriers; mode 0 = wait, 1 = arrive.
-    Stmt emit_barrier(int base, int mode) {
-        Expr id = base == 0 ? slot() : (base + slot());
+    // mode 0 = wait, 1 = arrive. id = base + (ring_loop % ring_n) selects the slot.
+    Stmt emit_barrier(const BarrierInfo &b, int mode) {
+        Expr slot = Variable::make(Int(32), ring_loop) % b.ring_n;
+        Expr id = b.base == 0 ? slot : (b.base + slot);
         return Evaluate::make(Call::make(Int(32), Call::gpu_named_barrier,
                                          {id, thread_count, mode}, Call::Intrinsic));
     }
@@ -1814,13 +1840,13 @@ class LowerGPUWarpAsyncFork : public IRMutator {
 
     Stmt visit(const HoistedStorage *op) override {
         auto it = env.find(op->name);
-        if (it == env.end() || !is_gpu_warp_specialized(it->second) ||
-            !it->second.schedule().ring_buffer().defined()) {
+        bool is_wsr = it != env.end() && is_gpu_warp_specialized(it->second) &&
+                      it->second.schedule().ring_buffer().defined();
+        if (!is_wsr || active) {
+            // Not a warp-spec ring producer, or a nested one already covered by the
+            // outermost context — just recurse.
             return IRMutator::visit(op);
         }
-        const Function &f = it->second;
-        auto n = as_const_int(f.schedule().ring_buffer());
-        internal_assert(n) << "ring_buffer extent must be a constant for warp specialization\n";
         ThreadExtents te;
         op->body.accept(&te);
         int wgd = te.max_dim + 1;
@@ -1828,16 +1854,32 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             // No free thread dim for the warp-group split; leave it (will error later).
             return IRMutator::visit(op);
         }
-        Expr tc = num_groups;
+        // Collect every warp-spec ring producer in this nest and give each a sequential
+        // block of barrier ids; key both its semaphores so acquire/release map by name.
+        CollectWarpSpecRing collector(env);
+        op->accept(&collector);
+        std::map<std::string, BarrierInfo> smap;
+        int base = 0;
+        for (const std::string &prod : collector.producers) {
+            auto n = as_const_int(env.at(prod).schedule().ring_buffer());
+            internal_assert(n) << "ring_buffer extent must be a constant for warp specialization\n";
+            int rn = (int)*n;
+            smap[prod + ".semaphore_0"] = {base, rn, /*is_empty*/ false};
+            smap[prod + ".folding_semaphore.ring_buffer"] = {base + rn, rn, /*is_empty*/ true};
+            base += 2 * rn;
+        }
+        // Per-edge participant count: producer warp group + consumer warp group. With
+        // equal one-warp groups this is 2x the per-dim thread extent, independent of the
+        // producer count. Asymmetric sizing (plan §9.1) will make this per-edge.
+        Expr tc = 2;
         for (int i = 0; i < wgd; i++) {
             if (te.extent[i].defined()) {
                 tc = tc * te.extent[i];
             }
         }
         ScopedValue<bool> a(active, true);
-        ScopedValue<std::string> fs(full_sema, op->name + ".semaphore_0");
-        ScopedValue<std::string> es(empty_sema, op->name + ".folding_semaphore.ring_buffer");
-        ScopedValue<int> rn(ring_n, (int)*n);
+        ScopedValue<std::map<std::string, BarrierInfo>> sm(sema_map, smap);
+        ScopedValue<int> np(num_producers, (int)collector.producers.size());
         ScopedValue<int> wd(wg_dim, wgd);
         ScopedValue<Expr> t(thread_count, simplify(tc));
         return HoistedStorage::make(op->name, mutate(op->body));
@@ -1851,16 +1893,39 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         return IRMutator::visit(op);
     }
 
+    // Halide builds an N-ary fork as right-nested binary Forks; flatten to an ordered
+    // branch list [producer_0, ..., producer_{P-1}, consumer].
+    static void flatten_fork(const Stmt &s, std::vector<Stmt> &branches) {
+        if (const Fork *f = s.as<Fork>()) {
+            branches.push_back(f->first);
+            flatten_fork(f->rest, branches);
+        } else {
+            branches.push_back(s);
+        }
+    }
+
     Stmt visit(const Fork *op) override {
         if (!active) {
             return IRMutator::visit(op);
         }
-        Stmt producer = mutate(op->first);
-        Stmt consumer = mutate(op->rest);
+        std::vector<Stmt> branches;
+        flatten_fork(op, branches);
+        int num_groups = (int)branches.size();  // P producers + 1 consumer
+        internal_assert(num_groups == num_producers + 1)
+            << "warp-spec fork has " << num_groups << " branches but "
+            << num_producers << " ring producers\n";
         std::string wg = unique_name("warp_group") + gpu_thread_name(wg_dim);
         Expr wgv = Variable::make(Int(32), wg);
-        Stmt body = Block::make(IfThenElse::make(wgv < num_producer, producer),
-                                IfThenElse::make(wgv >= num_producer, consumer));
+        // Producer i takes wg == i; the consumer (last branch) takes the rest. The
+        // barrier ids are keyed by semaphore name, so the wg a producer lands on is
+        // independent of which barriers coordinate it.
+        Stmt body;
+        for (int i = 0; i < num_groups; i++) {
+            Expr cond = (i < num_producers) ? (wgv == i) : (wgv >= num_producers);
+            Stmt guarded = IfThenElse::make(cond, mutate(branches[i]));
+            body = body.defined() ? Block::make(body, guarded) : guarded;
+        }
+        // For stores an inclusive max, so max = num_groups - 1 gives extent num_groups.
         return For::make(wg, 0, num_groups - 1, ForType::GPUThread,
                          Partition::Never, device_api, body);
     }
@@ -1868,13 +1933,14 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     Stmt visit(const Acquire *op) override {
         if (active) {
             const Variable *v = op->semaphore.as<Variable>();
-            if (v && (v->name == full_sema || v->name == empty_sema)) {
-                bool is_empty = v->name == empty_sema;
+            auto it = v ? sema_map.find(v->name) : sema_map.end();
+            if (it != sema_map.end()) {
+                const BarrierInfo &b = it->second;
                 Stmt body = mutate(op->body);
-                Stmt wait = emit_barrier(is_empty ? ring_n : 0, /*wait*/ 0);
-                if (is_empty) {
+                Stmt wait = emit_barrier(b, /*wait*/ 0);
+                if (b.is_empty) {
                     // Slots start free: skip the first N empty-waits or iter 0 deadlocks.
-                    wait = IfThenElse::make(Variable::make(Int(32), ring_loop) >= ring_n, wait);
+                    wait = IfThenElse::make(Variable::make(Int(32), ring_loop) >= b.ring_n, wait);
                 }
                 return Block::make(wait, body);
             }
@@ -1892,9 +1958,9 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         }
         if (active && c && c->name == "halide_semaphore_release" && !c->args.empty()) {
             const Variable *v = c->args[0].as<Variable>();
-            if (v && (v->name == full_sema || v->name == empty_sema)) {
-                bool is_empty = v->name == empty_sema;
-                return emit_barrier(is_empty ? ring_n : 0, /*arrive*/ 1);
+            auto it = v ? sema_map.find(v->name) : sema_map.end();
+            if (it != sema_map.end()) {
+                return emit_barrier(it->second, /*arrive*/ 1);
             }
         }
         return IRMutator::visit(op);
