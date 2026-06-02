@@ -20,6 +20,7 @@
 #include "Simplify.h"
 #include "Solve.h"
 #include "Substitute.h"
+#include "Util.h"
 
 namespace Halide {
 namespace Internal {
@@ -1814,11 +1815,21 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     int wg_dim = -1;
     int num_producers = 0;  // producers occupy wg [0, num_producers); consumer is wg >= num_producers
     Expr thread_count;
+    // Dev gate for the Fork-aware (flat-partition) lowering. When off, emit the proven
+    // rectangular wg-dim split. When on, leave the Fork for the Fork-aware fuser and use
+    // per-edge barrier counts. Toggle: HL_GPU_WARP_FORK_FUSE=1.
+    bool fork_fuse = false;
+    // Per-group warp-aligned thread counts (fork_fuse path), set per fork: producer i's
+    // threads and the consumer's. A producer<->consumer edge barrier is reached only by
+    // those two groups (flat partition), so its count is the sum of the two.
+    std::vector<Expr> producer_threads;
+    Expr consumer_threads;
     // Each warp-spec ring semaphore maps to a block of per-slot named-barrier ids.
     struct BarrierInfo {
         int base;       // first barrier id for this edge
         int ring_n;     // ring depth (slot = ring_loop % ring_n)
         bool is_empty;  // empty edge (producer waits) vs full edge (consumer waits)
+        int producer;   // producing warp-group index (selects its thread count, fork_fuse)
     };
     std::map<std::string, BarrierInfo> sema_map;
     using IRMutator::visit;
@@ -1827,8 +1838,12 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     Stmt emit_barrier(const BarrierInfo &b, int mode) {
         Expr slot = Variable::make(Int(32), ring_loop) % b.ring_n;
         Expr id = b.base == 0 ? slot : (b.base + slot);
+        // Rectangular: every blockDim lane of both groups hits the barrier (2*max).
+        // Flat partition: only the producing + consuming groups' lanes are in range.
+        Expr count = fork_fuse ? simplify(producer_threads[b.producer] + consumer_threads)
+                               : thread_count;
         return Evaluate::make(Call::make(Int(32), Call::gpu_named_barrier,
-                                         {id, thread_count, mode}, Call::Intrinsic));
+                                         {id, count, mode}, Call::Intrinsic));
     }
 
     Stmt visit(const LetStmt *op) override {
@@ -1860,12 +1875,13 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         op->accept(&collector);
         std::map<std::string, BarrierInfo> smap;
         int base = 0;
-        for (const std::string &prod : collector.producers) {
+        for (int pi = 0; pi < (int)collector.producers.size(); pi++) {
+            const std::string &prod = collector.producers[pi];
             auto n = as_const_int(env.at(prod).schedule().ring_buffer());
             internal_assert(n) << "ring_buffer extent must be a constant for warp specialization\n";
             int rn = (int)*n;
-            smap[prod + ".semaphore_0"] = {base, rn, /*is_empty*/ false};
-            smap[prod + ".folding_semaphore.ring_buffer"] = {base + rn, rn, /*is_empty*/ true};
+            smap[prod + ".semaphore_0"] = {base, rn, /*is_empty*/ false, pi};
+            smap[prod + ".folding_semaphore.ring_buffer"] = {base + rn, rn, /*is_empty*/ true, pi};
             base += 2 * rn;
         }
         // Per-edge participant count: producer warp group + consumer warp group. With
@@ -1935,6 +1951,44 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             << " group. Mark only one producer in a compute_with cluster as .async() — the"
             << " others are brought into its warp group by compute_with and share its"
             << " synchronization (still give them .ring_buffer(N) for double buffering).\n";
+
+        if (fork_fuse) {
+            // Leave the Fork for the Fork-aware fuser (sum-between, max-within). Here we
+            // only inject the cross-group ring barriers (with per-edge counts) and lift
+            // shared storage to block level; the fuser sizes/partitions the thread space.
+            auto branch_warp_threads = [&](const Stmt &s) {
+                ThreadExtents te;
+                s.accept(&te);
+                Expr t = 1;
+                for (int d = 0; d <= te.max_dim; d++) {
+                    if (te.extent[d].defined()) {
+                        t = t * te.extent[d];
+                    }
+                }
+                return simplify(((simplify(t) + 31) / 32) * 32);  // round up to a warp
+            };
+            std::vector<Expr> ptv(num_producers);
+            for (int i = 0; i < num_producers; i++) {
+                ptv[i] = branch_warp_threads(branches[i]);
+            }
+            ScopedValue<std::vector<Expr>> pt(producer_threads, ptv);
+            ScopedValue<Expr> ct(consumer_threads, branch_warp_threads(branches[num_groups - 1]));
+            std::vector<std::string> lifted;
+            std::set<std::string> lifted_seen;
+            std::vector<Stmt> out(num_groups);
+            for (int i = 0; i < num_groups; i++) {
+                out[i] = mutate(peel_hoisted(branches[i], lifted, lifted_seen));
+            }
+            Stmt result = out.back();  // right-nested fork, consumer innermost
+            for (int i = num_groups - 2; i >= 0; i--) {
+                result = Fork::make(out[i], result);
+            }
+            for (auto it = lifted.rbegin(); it != lifted.rend(); ++it) {
+                result = HoistedStorage::make(*it, result);
+            }
+            return result;
+        }
+
         std::string wg = unique_name("warp_group") + gpu_thread_name(wg_dim);
         Expr wgv = Variable::make(Int(32), wg);
         // Producer i takes wg == i; the consumer (last branch) takes the rest. The
@@ -1997,7 +2051,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
 
 public:
     LowerGPUWarpAsyncFork(const std::map<std::string, Function> &env)
-        : env(env) {
+        : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") == "1") {
     }
 };
 
