@@ -410,6 +410,50 @@ int main(int argc, char **argv) {
         }
     }
 
+    // 16. Per-role binding via compute_with: two staged producers folded onto ONE
+    //     producer warp group. Only the anchor (b) is async; a is compute_with'd
+    //     into it (still ring-buffered for double buffering, but not separately
+    //     async), so both are computed by the same warp group and a single
+    //     semaphore guards the whole cluster -> 2 warp groups (producer + consumer)
+    //     instead of the 3 of #15. This is the "same group, independent" cell of
+    //     the allocation algebra (plan §9).
+    {
+        Var x("x"), y("y"), xo("xo"), xi("xi");
+        auto algo = [](Func &a, Func &b, Func &c, Var x, Var y) {
+            a(x, y) = x + y;
+            b(x, y) = x - y;
+            c(x, y) = a(x, y) * 2 + b(x, y);
+        };
+
+        Func a_ref("a_ref"), b_ref("b_ref"), c_ref("c_ref");
+        algo(a_ref, b_ref, c_ref, x, y);
+        Buffer<int> ref = c_ref.realize({W, H});
+
+        Func a("As"), b("Bs"), c("consumer");
+        algo(a, b, c, x, y);
+        c.compute_root()
+            .split(x, xo, xi, 32)
+            .reorder(xi, xo, y)
+            .gpu_blocks(y)
+            .gpu_threads(xi);
+        for (Func *p : {&a, &b}) {
+            p->compute_at(c, xo)
+                .store_in(MemoryType::GPUShared)
+                .gpu_threads(x)
+                .hoist_storage(c, y)
+                .ring_buffer(2);
+        }
+        a.compute_with(b, x);  // fold a's producer into b's warp group
+        b.async();             // only the anchor is async
+        Buffer<int> got = c.realize({W, H}, target);
+        got.copy_to_host();
+        if (!compare(got, ref, "compute_with_role")) {
+            num_failures++;
+        } else {
+            printf("[compute_with_role] ok\n");
+        }
+    }
+
     if (num_failures > 0) {
         printf("FAILED: %d scenario(s)\n", num_failures);
         return 1;

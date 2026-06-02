@@ -1911,9 +1911,14 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         std::vector<Stmt> branches;
         flatten_fork(op, branches);
         int num_groups = (int)branches.size();  // P producers + 1 consumer
-        internal_assert(num_groups == num_producers + 1)
-            << "warp-spec fork has " << num_groups << " branches but "
-            << num_producers << " ring producers\n";
+        user_assert(num_groups == num_producers + 1)
+            << "Found " << num_producers << " async GPUShared ring-buffered producer(s)"
+            << " but the async fork has " << num_groups << " branch(es). This happens when"
+            << " async shared producers are combined with compute_with: the fusion merges"
+            << " their producer bodies into one, so they can no longer each own a warp"
+            << " group. Mark only one producer in a compute_with cluster as .async() — the"
+            << " others are brought into its warp group by compute_with and share its"
+            << " synchronization (still give them .ring_buffer(N) for double buffering).\n";
         std::string wg = unique_name("warp_group") + gpu_thread_name(wg_dim);
         Expr wgv = Variable::make(Int(32), wg);
         // Producer i takes wg == i; the consumer (last branch) takes the rest. The
