@@ -465,8 +465,10 @@ protected:
         auto it = env.find(op->name);
         internal_assert(it != env.end());
         Function f = it->second;
-        if (f.schedule().async() && f.schedule().ring_buffer().defined() &&
-            !is_gpu_warp_specialized(f)) {
+        if (f.schedule().async() && f.schedule().ring_buffer().defined()) {
+            // GPU warp-specialized ring producers fork like host ones; a later GPU
+            // pass (lower_gpu_warp_async) maps the Fork + semaphores to warp groups
+            // + named barriers.
             body = process_body(op->name, body);
         } else {
             body = mutate(body);
@@ -791,9 +793,9 @@ protected:
             // Adds an extra index for to the all of the references of f.
             body = UpdateIndices(op->name, current_index)(body);
 
-            // GPU warp-specialized producers ring-buffer in shared memory and
-            // synchronize via GPU barriers, not the host semaphore path below.
-            if (f.schedule().async() && !is_gpu_warp_specialized(f)) {
+            // Ring warp-spec producers also get the producer->consumer semaphore;
+            // the GPU pass maps both semaphores to named barriers.
+            if (f.schedule().async()) {
                 Expr sema_var = Variable::make(type_of<halide_semaphore_t *>(), f.name() + ".folding_semaphore.ring_buffer");
                 Expr release_producer = Call::make(Int(32), "halide_semaphore_release", {sema_var, 1}, Call::Extern);
                 Stmt release = Evaluate::make(release_producer);
@@ -813,8 +815,7 @@ protected:
         Stmt mutated = mutate(op->body);
         mutated = HoistedStorage::make(op->name, mutated);
 
-        if (f.schedule().async() && f.schedule().ring_buffer().defined() &&
-            !is_gpu_warp_specialized(f)) {
+        if (f.schedule().async() && f.schedule().ring_buffer().defined()) {
             // Make a semaphore on the stack
             Expr sema_space = Call::make(type_of<halide_semaphore_t *>(), "halide_make_semaphore",
                                          {2}, Call::Extern);

@@ -1698,7 +1698,10 @@ class InjectGPUWarpSpecialization : public IRMutator {
 
     Stmt visit(const Realize *op) override {
         auto it = env.find(op->name);
-        if (disable || it == env.end() || !is_gpu_warp_specialized(it->second)) {
+        if (disable || it == env.end() || !is_gpu_warp_specialized(it->second) ||
+            it->second.schedule().ring_buffer().defined()) {
+            // ring warp-spec producers go through lower_gpu_warp_async (fork mapping);
+            // this whole-CTA pass only handles the non-ring (depth-1) case.
             return IRMutator::visit(op);
         }
 
@@ -1732,10 +1735,185 @@ public:
     }
 };
 
+// Max GPU-thread extent per dim, used to size the warp-group split + barrier count.
+class ThreadExtents : public IRVisitor {
+    using IRVisitor::visit;
+    void visit(const For *op) override {
+        if (op->for_type == ForType::GPUThread || op->for_type == ForType::GPULane) {
+            for (int i = 0; i < 3; i++) {
+                if (ends_with(op->name, gpu_thread_name(i))) {
+                    max_dim = std::max(max_dim, i);
+                    Expr e = op->extent();
+                    extent[i] = extent[i].defined() ? simplify(Max::make(extent[i], e)) : e;
+                }
+            }
+        }
+        IRVisitor::visit(op);
+    }
+
+public:
+    int max_dim = -1;
+    Expr extent[3];
+};
+
+// Is `name` a host semaphore of a warp-specialized ring producer? (Those are
+// "<prod>.semaphore_<i>" / "<prod>.folding_semaphore.ring_buffer".)
+bool sema_belongs_to_warpspec_ring(const std::string &name,
+                                   const std::map<std::string, Function> &env) {
+    std::string prod;
+    const std::string ring_suffix = ".folding_semaphore.ring_buffer";
+    if (ends_with(name, ring_suffix)) {
+        prod = name.substr(0, name.size() - ring_suffix.size());
+    } else {
+        size_t pos = name.rfind(".semaphore_");
+        if (pos == std::string::npos) {
+            return false;
+        }
+        prod = name.substr(0, pos);
+    }
+    auto it = env.find(prod);
+    return it != env.end() && is_gpu_warp_specialized(it->second) &&
+           it->second.schedule().ring_buffer().defined();
+}
+
+// (a)-1: lower a device async Fork (warp-specialized ring producer) to a warp-group
+// split coordinated by per-slot named barriers. The producer branch runs on warp
+// group wg<P, the consumer on wg>=P (an injected outer GPU-thread dim). acquire/
+// release become gpu_named_barrier with per-slot ids (full=[0,N), empty=[N,2N)); the
+// producer's first N empty-waits are primed out (slots start free); host semaphores
+// are stripped. Barrier wait/arrive is emitted via emit_barrier() so mbarrier can
+// later drop in at the same seam.
+class LowerGPUWarpAsyncFork : public IRMutator {
+    const std::map<std::string, Function> &env;
+    DeviceAPI device_api = DeviceAPI::None;
+    bool active = false;
+    std::string full_sema, empty_sema, ring_loop;
+    int ring_n = 0;
+    int wg_dim = -1;
+    const int num_groups = 2;    // MVP: 1 producer warp group + 1 consumer warp group
+    const int num_producer = 1;  // producer occupies wg in [0, num_producer)
+    Expr thread_count;
+    using IRMutator::visit;
+
+    Expr slot() const {
+        return Variable::make(Int(32), ring_loop) % ring_n;
+    }
+    // base 0 = full barriers, base ring_n = empty barriers; mode 0 = wait, 1 = arrive.
+    Stmt emit_barrier(int base, int mode) {
+        Expr id = base == 0 ? slot() : (base + slot());
+        return Evaluate::make(Call::make(Int(32), Call::gpu_named_barrier,
+                                         {id, thread_count, mode}, Call::Intrinsic));
+    }
+
+    Stmt visit(const LetStmt *op) override {
+        if (sema_belongs_to_warpspec_ring(op->name, env)) {
+            return mutate(op->body);  // drop the host-semaphore alloca
+        }
+        return IRMutator::visit(op);
+    }
+
+    Stmt visit(const HoistedStorage *op) override {
+        auto it = env.find(op->name);
+        if (it == env.end() || !is_gpu_warp_specialized(it->second) ||
+            !it->second.schedule().ring_buffer().defined()) {
+            return IRMutator::visit(op);
+        }
+        const Function &f = it->second;
+        auto n = as_const_int(f.schedule().ring_buffer());
+        internal_assert(n) << "ring_buffer extent must be a constant for warp specialization\n";
+        ThreadExtents te;
+        op->body.accept(&te);
+        int wgd = te.max_dim + 1;
+        if (wgd > 2) {
+            // No free thread dim for the warp-group split; leave it (will error later).
+            return IRMutator::visit(op);
+        }
+        Expr tc = num_groups;
+        for (int i = 0; i < wgd; i++) {
+            if (te.extent[i].defined()) {
+                tc = tc * te.extent[i];
+            }
+        }
+        ScopedValue<bool> a(active, true);
+        ScopedValue<std::string> fs(full_sema, op->name + ".semaphore_0");
+        ScopedValue<std::string> es(empty_sema, op->name + ".folding_semaphore.ring_buffer");
+        ScopedValue<int> rn(ring_n, (int)*n);
+        ScopedValue<int> wd(wg_dim, wgd);
+        ScopedValue<Expr> t(thread_count, simplify(tc));
+        return HoistedStorage::make(op->name, mutate(op->body));
+    }
+
+    Stmt visit(const For *op) override {
+        ScopedValue<DeviceAPI> d(device_api,
+                                 op->device_api != DeviceAPI::None ? op->device_api : device_api);
+        ScopedValue<std::string> r(ring_loop,
+                                   (active && op->for_type == ForType::Serial) ? op->name : ring_loop);
+        return IRMutator::visit(op);
+    }
+
+    Stmt visit(const Fork *op) override {
+        if (!active) {
+            return IRMutator::visit(op);
+        }
+        Stmt producer = mutate(op->first);
+        Stmt consumer = mutate(op->rest);
+        std::string wg = unique_name("warp_group") + gpu_thread_name(wg_dim);
+        Expr wgv = Variable::make(Int(32), wg);
+        Stmt body = Block::make(IfThenElse::make(wgv < num_producer, producer),
+                                IfThenElse::make(wgv >= num_producer, consumer));
+        return For::make(wg, 0, num_groups - 1, ForType::GPUThread,
+                         Partition::Never, device_api, body);
+    }
+
+    Stmt visit(const Acquire *op) override {
+        if (active) {
+            const Variable *v = op->semaphore.as<Variable>();
+            if (v && (v->name == full_sema || v->name == empty_sema)) {
+                bool is_empty = v->name == empty_sema;
+                Stmt body = mutate(op->body);
+                Stmt wait = emit_barrier(is_empty ? ring_n : 0, /*wait*/ 0);
+                if (is_empty) {
+                    // Slots start free: skip the first N empty-waits or iter 0 deadlocks.
+                    wait = IfThenElse::make(Variable::make(Int(32), ring_loop) >= ring_n, wait);
+                }
+                return Block::make(wait, body);
+            }
+        }
+        return IRMutator::visit(op);
+    }
+
+    Stmt visit(const Evaluate *op) override {
+        const Call *c = op->value.as<Call>();
+        if (c && c->name == "halide_semaphore_init" && !c->args.empty()) {
+            const Variable *v = c->args[0].as<Variable>();
+            if (v && sema_belongs_to_warpspec_ring(v->name, env)) {
+                return Evaluate::make(0);
+            }
+        }
+        if (active && c && c->name == "halide_semaphore_release" && !c->args.empty()) {
+            const Variable *v = c->args[0].as<Variable>();
+            if (v && (v->name == full_sema || v->name == empty_sema)) {
+                bool is_empty = v->name == empty_sema;
+                return emit_barrier(is_empty ? ring_n : 0, /*arrive*/ 1);
+            }
+        }
+        return IRMutator::visit(op);
+    }
+
+public:
+    LowerGPUWarpAsyncFork(const std::map<std::string, Function> &env)
+        : env(env) {
+    }
+};
+
 }  // namespace
 
 Stmt inject_gpu_warp_specialization(Stmt s, const std::map<std::string, Function> &env) {
     return InjectGPUWarpSpecialization(env)(s);
+}
+
+Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env) {
+    return LowerGPUWarpAsyncFork(env)(s);
 }
 
 Stmt fuse_gpu_thread_loops(Stmt s) {

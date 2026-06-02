@@ -307,6 +307,7 @@ int main(int argc, char **argv) {
                 .gpu_threads(xi);
             p.compute_at(c, xo)
                 .store_in(MemoryType::GPUShared)
+                .gpu_threads(x)
                 .hoist_storage(c, y)
                 .ring_buffer(2)
                 .async();

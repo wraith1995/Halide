@@ -30,6 +30,13 @@ Stmt zero_gpu_loop_mins(const Stmt &s);
  * unchanged (they fall back to synchronous shared-memory staging). */
 Stmt inject_gpu_warp_specialization(Stmt s, const std::map<std::string, Function> &env);
 
+/** Lower device async Forks from warp-specialized ring producers (async() +
+ * store_in(GPUShared) + ring_buffer()) into a warp-group split coordinated by
+ * per-slot named barriers: producer warps stage into a shared ring while consumer
+ * warps compute, running ahead by the ring depth. Runs after canonicalize_gpu_vars,
+ * before inject_gpu_warp_specialization (which handles the non-ring case). */
+Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env);
+
 /** Converts Halide's GPGPU IR to the OpenCL/CUDA/Metal model. Within
  * every loop over gpu block indices, fuse the inner loops over thread
  * indices into a single loop (with predication to turn off

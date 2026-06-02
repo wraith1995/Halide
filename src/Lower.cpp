@@ -293,6 +293,10 @@ void lower_impl(const vector<Function> &output_funcs,
 
         // Must run before storage flattening, while producers are still Realize
         // nodes with canonical thread-loop names.
+        debug(1) << "Lowering GPU warp-async forks...\n";
+        s = lower_gpu_warp_async(s, env);
+        log("Lowering after GPU warp-async forks:", s);
+
         debug(1) << "Injecting GPU warp specialization...\n";
         s = inject_gpu_warp_specialization(s, env);
         log("Lowering after injecting GPU warp specialization:", s);
