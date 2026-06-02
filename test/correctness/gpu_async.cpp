@@ -454,6 +454,47 @@ int main(int argc, char **argv) {
         }
     }
 
+    // 17. Asymmetric warp groups: the producer stages a 64-wide tile with only 32
+    //     threads (an inner serial loop covers the rest), while the consumer reads it
+    //     with 64. In the rectangular warp-group model blockDim.x is the max (64) and
+    //     the smaller group's padded lanes still execute the barriers (which sit
+    //     outside the per-tile thread guard), so the 2*max participant count stays
+    //     correct — asymmetric WORK already lowers. The cost is launching the padded
+    //     lanes; the flat-partition optimization (plan §9.1) would remove it.
+    {
+        Var x("x"), y("y"), xo("xo"), xi("xi"), pxo("pxo"), pxi("pxi");
+        auto algo = [](Func &p, Func &c, Var x, Var y) {
+            p(x, y) = x * 3 + y;
+            c(x, y) = p(x, y) * 2;
+        };
+
+        Func p_ref("p_ref"), c_ref("c_ref");
+        algo(p_ref, c_ref, x, y);
+        Buffer<int> ref = c_ref.realize({W, H});
+
+        Func p("p"), c("consumer");
+        algo(p, c, x, y);
+        c.compute_root()
+            .split(x, xo, xi, 64)
+            .reorder(xi, xo, y)
+            .gpu_blocks(y)
+            .gpu_threads(xi);
+        p.compute_at(c, xo)
+            .store_in(MemoryType::GPUShared)
+            .split(x, pxo, pxi, 32)
+            .gpu_threads(pxi)
+            .hoist_storage(c, y)
+            .ring_buffer(2)
+            .async();
+        Buffer<int> got = c.realize({W, H}, target);
+        got.copy_to_host();
+        if (!compare(got, ref, "asymmetric_groups")) {
+            num_failures++;
+        } else {
+            printf("[asymmetric_groups] ok\n");
+        }
+    }
+
     if (num_failures > 0) {
         printf("FAILED: %d scenario(s)\n", num_failures);
         return 1;
