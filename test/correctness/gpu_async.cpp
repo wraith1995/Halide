@@ -289,7 +289,31 @@ int main(int argc, char **argv) {
         },
         100, 8);
 
-    // 12. Chain of two async shared-memory producers feeding the consumer.
+    // 12. Ring-buffered serial loop: storage hoisted to the block level with 2
+    //     shared slots indexed by (serial iteration % 2). This is the storage
+    //     Phase 2 overlap needs; here it must still be correct at depth 1.
+    check2d(
+        "ring_buffer_serial",
+        [](Func &p, Func &c, Var x, Var y) {
+            p(x, y) = x * 2 + y;
+            c(x, y) = p(x, y) * 3 + 1;
+        },
+        [](Func &p, Func &c, Var x, Var y) {
+            Var xo("xo"), xi("xi");
+            c.compute_root()
+                .split(x, xo, xi, 32)
+                .reorder(xi, xo, y)
+                .gpu_blocks(y)
+                .gpu_threads(xi);
+            p.compute_at(c, xo)
+                .store_in(MemoryType::GPUShared)
+                .hoist_storage(c, y)
+                .ring_buffer(2)
+                .async();
+        },
+        128, 8);
+
+    // 13. Chain of two async shared-memory producers feeding the consumer.
     //     Written inline so both producers in the chain can be scheduled.
     {
         Var x("x"), y("y"), xo("xo"), yo("yo"), xi("xi"), yi("yi");

@@ -70,7 +70,6 @@ tests(
     func_tuple_update_types_mismatch.cpp
     fuse_vectorized_var_with_rvar.cpp
     gpu_warp_spec_requires_cuda.cpp
-    gpu_warp_spec_ring_buffer.cpp
     hoist_storage_extern.cpp
     hoist_storage_without_compute_at.cpp
     implicit_args.cpp

@@ -774,9 +774,7 @@ protected:
         Stmt body = mutate(op->body);
         Function f = env.find(op->name)->second;
         Region bounds = op->bounds;
-        // GPU warp-specialized producers ring-buffer in shared memory via a
-        // separate device path; the host ring-buffering transform skips them.
-        if (f.schedule().ring_buffer().defined() && !is_gpu_warp_specialized(f)) {
+        if (f.schedule().ring_buffer().defined()) {
             // For the ring buffering we expand the storage by adding another dimension of
             // the range of [0, ring_buffer.extent].
             bounds.emplace_back(0, f.schedule().ring_buffer());
@@ -793,7 +791,9 @@ protected:
             // Adds an extra index for to the all of the references of f.
             body = UpdateIndices(op->name, current_index)(body);
 
-            if (f.schedule().async()) {
+            // GPU warp-specialized producers ring-buffer in shared memory and
+            // synchronize via GPU barriers, not the host semaphore path below.
+            if (f.schedule().async() && !is_gpu_warp_specialized(f)) {
                 Expr sema_var = Variable::make(type_of<halide_semaphore_t *>(), f.name() + ".folding_semaphore.ring_buffer");
                 Expr release_producer = Call::make(Int(32), "halide_semaphore_release", {sema_var, 1}, Call::Extern);
                 Stmt release = Evaluate::make(release_producer);
@@ -813,7 +813,8 @@ protected:
         Stmt mutated = mutate(op->body);
         mutated = HoistedStorage::make(op->name, mutated);
 
-        if (f.schedule().async() && f.schedule().ring_buffer().defined()) {
+        if (f.schedule().async() && f.schedule().ring_buffer().defined() &&
+            !is_gpu_warp_specialized(f)) {
             // Make a semaphore on the stack
             Expr sema_space = Call::make(type_of<halide_semaphore_t *>(), "halide_make_semaphore",
                                          {2}, Call::Extern);
@@ -1051,14 +1052,6 @@ void validate_gpu_async_producers(const map<string, Function> &env, const Target
             << "stored in GPU shared memory (async() + store_in(MemoryType::GPUShared)), "
             << "which lowers to GPU warp specialization. This is currently only "
             << "supported on the CUDA target.\n";
-
-        // Not-yet-implemented combinations. These guard features that later
-        // phases will add, so users get a clear message rather than silent
-        // miscompilation.
-        user_assert(!f.schedule().ring_buffer().defined())
-            << "Func " << f.name() << " combines ring_buffer() with GPU warp "
-            << "specialization (async() + store_in(MemoryType::GPUShared)). Ring "
-            << "buffering for GPU warp-specialized producers is not yet implemented.\n";
     }
 }
 
