@@ -1922,10 +1922,10 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     int wg_dim = -1;
     int num_producers = 0;  // producers occupy wg [0, num_producers); consumer is wg >= num_producers
     Expr thread_count;
-    // Dev gate for the Fork-aware (flat-partition) lowering. When off, emit the proven
-    // rectangular wg-dim split. When on, leave the Fork for the Fork-aware fuser and use
-    // per-edge barrier counts. Toggle: HL_GPU_WARP_FORK_FUSE=1.
-    bool fork_fuse = false;
+    // The Fork-aware (flat-partition) lowering is the default: leave the Fork for the
+    // Fork-aware fuser and use per-edge barrier counts. Set HL_GPU_WARP_FORK_FUSE=0 to
+    // fall back to the older rectangular wg-dim split (escape hatch).
+    bool fork_fuse = true;
     // Per-group warp-aligned thread counts (fork_fuse path), set per fork: producer i's
     // threads and the consumer's. A producer<->consumer edge barrier is reached only by
     // those two groups (flat partition), so its count is the sum of the two.
@@ -2158,7 +2158,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
 
 public:
     LowerGPUWarpAsyncFork(const std::map<std::string, Function> &env)
-        : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") == "1") {
+        : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") != "0") {
     }
 };
 
