@@ -1683,6 +1683,11 @@ public:
 class InjectGPUWarpSpecialization : public IRMutator {
     const std::map<std::string, Function> &env;
     DeviceAPI device_api = DeviceAPI::None;
+    // When true, do not specialize producers in this subtree. Set when a producer
+    // falls back while other warp-spec producers are present in the same region,
+    // so multiple producers in one block fall back together (rather than one
+    // specializing while the others run on all warp groups).
+    bool disable = false;
     using IRMutator::visit;
 
     Stmt visit(const For *op) override {
@@ -1693,7 +1698,7 @@ class InjectGPUWarpSpecialization : public IRMutator {
 
     Stmt visit(const Realize *op) override {
         auto it = env.find(op->name);
-        if (it == env.end() || !is_gpu_warp_specialized(it->second)) {
+        if (disable || it == env.end() || !is_gpu_warp_specialized(it->second)) {
             return IRMutator::visit(op);
         }
 
@@ -1705,11 +1710,17 @@ class InjectGPUWarpSpecialization : public IRMutator {
         ContainsNestedWarpSpec nested(env, op->name);
         op->body.accept(&nested);
         if (mtd.max_dim < 0 || wg_dim > 2 || nested.found || device_api == DeviceAPI::None) {
+            // Multiple warp-spec producers in one region (nested.found) all fall
+            // back together: a single specialized producer alongside a fallen-back
+            // one would double-write the fallen-back producer's shared buffer.
+            ScopedValue<bool> d(disable, disable || nested.found);
             return IRMutator::visit(op);
         }
 
+        // Exactly one warp-spec producer here; specialize it. Don't specialize
+        // anything further down this subtree.
+        ScopedValue<bool> d(disable, true);
         Stmt body = WrapWarpGroups(op->name, device_api, wg_dim)(op->body);
-        // Recurse to handle other warp-specialized producers elsewhere.
         body = mutate(body);
         return Realize::make(op->name, op->types, op->memory_type,
                              op->bounds, op->condition, body);
