@@ -1904,6 +1904,22 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         }
     }
 
+    // Peel leading HoistedStorage nodes off a fork branch. compute_with-fused cluster
+    // members (which are not async themselves, so their storage isn't lifted by the
+    // async fork) land here, duplicated inside each branch. They must instead live at
+    // block level, around the warp groups: otherwise the producer and consumer warp
+    // groups get distinct shared allocations and the consumer reads unwritten memory.
+    static Stmt peel_hoisted(Stmt s, std::vector<std::string> &order,
+                             std::set<std::string> &seen) {
+        while (const HoistedStorage *h = s.as<HoistedStorage>()) {
+            if (seen.insert(h->name).second) {
+                order.push_back(h->name);
+            }
+            s = h->body;
+        }
+        return s;
+    }
+
     Stmt visit(const Fork *op) override {
         if (!active) {
             return IRMutator::visit(op);
@@ -1924,15 +1940,23 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         // Producer i takes wg == i; the consumer (last branch) takes the rest. The
         // barrier ids are keyed by semaphore name, so the wg a producer lands on is
         // independent of which barriers coordinate it.
+        std::vector<std::string> lifted;
+        std::set<std::string> lifted_seen;
         Stmt body;
         for (int i = 0; i < num_groups; i++) {
+            Stmt branch = peel_hoisted(branches[i], lifted, lifted_seen);
             Expr cond = (i < num_producers) ? (wgv == i) : (wgv >= num_producers);
-            Stmt guarded = IfThenElse::make(cond, mutate(branches[i]));
+            Stmt guarded = IfThenElse::make(cond, mutate(branch));
             body = body.defined() ? Block::make(body, guarded) : guarded;
         }
         // For stores an inclusive max, so max = num_groups - 1 gives extent num_groups.
-        return For::make(wg, 0, num_groups - 1, ForType::GPUThread,
-                         Partition::Never, device_api, body);
+        Stmt result = For::make(wg, 0, num_groups - 1, ForType::GPUThread,
+                                Partition::Never, device_api, body);
+        // Re-emit the lifted storage at block level (outermost peeled first).
+        for (auto it = lifted.rbegin(); it != lifted.rend(); ++it) {
+            result = HoistedStorage::make(*it, result);
+        }
+        return result;
     }
 
     Stmt visit(const Acquire *op) override {
