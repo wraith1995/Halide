@@ -250,7 +250,46 @@ int main(int argc, char **argv) {
         },
         W, H);
 
-    // 10. Chain of two async shared-memory producers feeding the consumer.
+    // 10. Serial loop inside the block: each block (a y-row) loops serially over
+    //     x-chunks, staging each chunk through the shared producer. This is the
+    //     structure Phase 2 will software-pipeline; here it must be correct at
+    //     depth 1 (warp-specialized per serial iteration).
+    check2d(
+        "serial_loop_in_block",
+        [](Func &p, Func &c, Var x, Var y) {
+            p(x, y) = x * 2 + y;
+            c(x, y) = p(x, y) * 3 + 1;
+        },
+        [](Func &p, Func &c, Var x, Var y) {
+            Var xo("xo"), xi("xi");
+            c.compute_root()
+                .split(x, xo, xi, 32)
+                .reorder(xi, xo, y)
+                .gpu_blocks(y)
+                .gpu_threads(xi);
+            p.compute_at(c, xo).store_in(MemoryType::GPUShared).gpu_threads(x).async();
+        },
+        128, 8);
+
+    // 11. Same, with a non-chunk-aligned width (serial-loop tails).
+    check2d(
+        "serial_loop_tails",
+        [](Func &p, Func &c, Var x, Var y) {
+            p(x, y) = x - y;
+            c(x, y) = p(x, y) + 5;
+        },
+        [](Func &p, Func &c, Var x, Var y) {
+            Var xo("xo"), xi("xi");
+            c.compute_root()
+                .split(x, xo, xi, 32)
+                .reorder(xi, xo, y)
+                .gpu_blocks(y)
+                .gpu_threads(xi);
+            p.compute_at(c, xo).store_in(MemoryType::GPUShared).gpu_threads(x).async();
+        },
+        100, 8);
+
+    // 12. Chain of two async shared-memory producers feeding the consumer.
     //     Written inline so both producers in the chain can be scheduled.
     {
         Var x("x"), y("y"), xo("xo"), yo("yo"), xi("xi"), yi("yi");
