@@ -495,6 +495,45 @@ int main(int argc, char **argv) {
         }
     }
 
+    // 18. 2D thread groups through the ring path. Producer and consumer both use
+    //     gpu_threads(x, y) (an 8x8 = 64-thread tile), staged via ring_buffer(2).
+    //     Under the Fork-aware fuser this exercises the multi-dim decompose in
+    //     FlattenBranchThreads (flat id -> x = local%8, y = local/8) and a >1-warp
+    //     group (64 lanes); blockDim should be 128 = 64 producer + 64 consumer.
+    {
+        Var x("x"), y("y"), xo("xo"), xi("xi"), yo("yo"), yi("yi");
+        auto algo = [](Func &p, Func &c, Var x, Var y) {
+            p(x, y) = x + 2 * y;
+            c(x, y) = p(x, y) * 3;
+        };
+
+        Func p_ref("p_ref"), c_ref("c_ref");
+        algo(p_ref, c_ref, x, y);
+        Buffer<int> ref = c_ref.realize({W, H});
+
+        Func p("p"), c("consumer");
+        algo(p, c, x, y);
+        c.compute_root()
+            .split(x, xo, xi, 8)
+            .split(y, yo, yi, 8)
+            .reorder(xi, yi, xo, yo)
+            .gpu_blocks(yo)
+            .gpu_threads(xi, yi);
+        p.compute_at(c, xo)
+            .store_in(MemoryType::GPUShared)
+            .gpu_threads(x, y)
+            .hoist_storage(c, yo)
+            .ring_buffer(2)
+            .async();
+        Buffer<int> got = c.realize({W, H}, target);
+        got.copy_to_host();
+        if (!compare(got, ref, "ring_buffer_2d")) {
+            num_failures++;
+        } else {
+            printf("[ring_buffer_2d] ok\n");
+        }
+    }
+
     if (num_failures > 0) {
         printf("FAILED: %d scenario(s)\n", num_failures);
         return 1;
