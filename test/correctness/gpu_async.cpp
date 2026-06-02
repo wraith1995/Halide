@@ -369,6 +369,47 @@ int main(int argc, char **argv) {
         }
     }
 
+    // 15. Two *ring-buffered* async shared-memory producers feeding one consumer.
+    //     Unlike #13, both producers use ring_buffer(2), so this is the path that
+    //     exercises the N-ary warp-async fork (2 producer warp groups + 1 consumer,
+    //     each producer with its own block of per-slot named barriers) — the
+    //     GEMM-shaped double-buffered staging.
+    {
+        Var x("x"), y("y"), xo("xo"), xi("xi");
+        auto algo = [](Func &a, Func &b, Func &c, Var x, Var y) {
+            a(x, y) = x + y;
+            b(x, y) = x - y;
+            c(x, y) = a(x, y) * 2 + b(x, y);
+        };
+
+        Func a_ref("a_ref"), b_ref("b_ref"), c_ref("c_ref");
+        algo(a_ref, b_ref, c_ref, x, y);
+        Buffer<int> ref = c_ref.realize({W, H});
+
+        Func a("As"), b("Bs"), c("consumer");
+        algo(a, b, c, x, y);
+        c.compute_root()
+            .split(x, xo, xi, 32)
+            .reorder(xi, xo, y)
+            .gpu_blocks(y)
+            .gpu_threads(xi);
+        for (Func *p : {&a, &b}) {
+            p->compute_at(c, xo)
+                .store_in(MemoryType::GPUShared)
+                .gpu_threads(x)
+                .hoist_storage(c, y)
+                .ring_buffer(2)
+                .async();
+        }
+        Buffer<int> got = c.realize({W, H}, target);
+        got.copy_to_host();
+        if (!compare(got, ref, "ring_buffer_two_producers")) {
+            num_failures++;
+        } else {
+            printf("[ring_buffer_two_producers] ok\n");
+        }
+    }
+
     if (num_failures > 0) {
         printf("FAILED: %d scenario(s)\n", num_failures);
         return 1;
