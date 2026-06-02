@@ -313,7 +313,34 @@ int main(int argc, char **argv) {
         },
         128, 8);
 
-    // 13. Chain of two async shared-memory producers feeding the consumer.
+    // 13. Two parallel async shared-memory producers feeding one consumer.
+    {
+        Var x("x"), y("y"), xo("xo"), yo("yo"), xi("xi"), yi("yi");
+        auto algo = [](Func &p1, Func &p2, Func &c, Var x, Var y) {
+            p1(x, y) = x + y;
+            p2(x, y) = x - y;
+            c(x, y) = p1(x, y) * 2 + p2(x, y);
+        };
+
+        Func p1r("p1r"), p2r("p2r"), cr("cr");
+        algo(p1r, p2r, cr, x, y);
+        Buffer<int> ref = cr.realize({W, H});
+
+        Func p1("p1"), p2("p2"), c("consumer");
+        algo(p1, p2, c, x, y);
+        c.compute_root().gpu_tile(x, y, xo, yo, xi, yi, 16, 16);
+        p1.compute_at(c, xo).store_in(MemoryType::GPUShared).gpu_threads(x, y).async();
+        p2.compute_at(c, xo).store_in(MemoryType::GPUShared).gpu_threads(x, y).async();
+        Buffer<int> got = c.realize({W, H}, target);
+        got.copy_to_host();
+        if (!compare(got, ref, "parallel_producers")) {
+            num_failures++;
+        } else {
+            printf("[parallel_producers] ok\n");
+        }
+    }
+
+    // 14. Chain of two async shared-memory producers feeding the consumer.
     //     Written inline so both producers in the chain can be scheduled.
     {
         Var x("x"), y("y"), xo("xo"), yo("yo"), xi("xi"), yi("yi");
