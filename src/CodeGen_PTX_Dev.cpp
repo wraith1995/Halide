@@ -319,6 +319,19 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         internal_assert(mode && (*mode == 0 || *mode == 1))
             << "gpu_named_barrier() mode must be the constant 0 (wait) or 1 (arrive).\n";
 
+        // P1b: a warp-spec producer that issued cp.async copies into a shared ring slot
+        // must commit + wait for them before its full-release barrier, so the consumer
+        // sees the data. The overlap comes from the producer running ahead (ring_buffer):
+        // it issues slot k+1's cp.async while the consumer computes slot k.
+        if (emitted_cp_async) {
+            builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                module.get(), llvm::Intrinsic::nvvm_cp_async_commit_group));
+            builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                                    module.get(), llvm::Intrinsic::nvvm_cp_async_wait_group),
+                                builder->getInt32(0));
+            emitted_cp_async = false;
+        }
+
         Value *barrier_id = codegen(op->args[0]);
         Value *thread_count = codegen(op->args[1]);
         llvm::Intrinsic::ID id = (*mode == 1)
