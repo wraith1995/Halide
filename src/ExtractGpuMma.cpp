@@ -130,7 +130,7 @@ struct GpuMma : public IRMutator {
     Expr base_c, cm, cn;
 
     Stmt visit(const For *op) override {
-        const int64_t *ext = as_const_int(simplify(op->extent()));
+        auto ext = as_const_int(simplify(op->extent()));
         if (is_gpu(op->for_type) && is_const_zero(op->min) && ext && *ext == 32) {
             ScopedValue<string> s(lane, op->name);
             return IRMutator::visit(op);
@@ -280,7 +280,7 @@ Stmt extract_gpu_mma(const Stmt &s, const Target &t) {
         t.get_cuda_capability_lower_bound() < 80) {
         return s;  // P-G: older GPUs keep the ordinary fma reduction.
     }
-    return GpuMma().mutate(s);
+    return GpuMma()(s);
 }
 
 }  // namespace Internal
