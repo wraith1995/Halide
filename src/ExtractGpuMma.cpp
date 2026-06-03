@@ -9,6 +9,7 @@
 #include "Util.h"
 
 #include <initializer_list>
+#include <map>
 #include <set>
 #include <utility>
 
@@ -99,12 +100,20 @@ struct MmaFinder : public IRVisitor {
     // The ProducerConsumer name wrapping the init/reduce and epilogue. This is the
     // Func name ("prod"), which differs from the storage name `acc` ("prod.0").
     string cur_pc, pc_name;
+    // Constant loop extents, so we can read the reduction (k) extent.
+    std::map<string, int> loop_extent;
     using IRVisitor::visit;
     void visit(const ProducerConsumer *op) override {
         string old = cur_pc;
         cur_pc = op->name;
         IRVisitor::visit(op);
         cur_pc = old;
+    }
+    void visit(const For *op) override {
+        if (auto e = as_const_int(simplify(op->extent()))) {
+            loop_extent[op->name] = (int)*e;
+        }
+        IRVisitor::visit(op);
     }
     void visit(const Store *s) override {
         if (s->name == acc) {
@@ -132,6 +141,7 @@ struct GpuMma : public IRMutator {
     bool matched = false;
     string acc_name;  // storage name, e.g. "prod.0"
     string pc_name;   // ProducerConsumer (Func) name, e.g. "prod"
+    int k_extent = 16;  // reduction depth; one mma per 16, accumulated across ko
     // A: out[m,n] += A[m,k]*B[k,n]; indices As[base_a + m*da_m + k*da_k] etc.
     string a_name, b_name, c_name;
     Buffer<> a_image, b_image;
@@ -191,6 +201,12 @@ struct GpuMma : public IRMutator {
         if (k_var.empty() || m_var.empty() || f.pc_name.empty()) {
             return IRMutator::visit(op);
         }
+        // The reduction depth must be a whole number of 16-deep mma k-tiles.
+        auto kit = f.loop_extent.find(k_var);
+        if (kit == f.loop_extent.end() || kit->second % MMA_K != 0) {
+            return IRMutator::visit(op);
+        }
+        int k_ext = kit->second;
         // Epilogue loop var (the r in `for r in 0..3`): the accumulator-load index
         // of the epilogue is `acc[(lane*4+r)%16]`, so its only non-lane var is r.
         string r_var;
@@ -227,6 +243,7 @@ struct GpuMma : public IRMutator {
         ScopedValue<bool> m1(matched, true);
         ScopedValue<string> m2(acc_name, op->name);
         ScopedValue<string> m2b(pc_name, f.pc_name);
+        ScopedValue<int> m2c(k_extent, k_ext);
         ScopedValue<string> m3(a_name, f.la->name), m4(b_name, f.lb->name),
             m5(c_name, f.epilogue->name);
         ScopedValue<Buffer<>> m6(a_image, f.la->image), m7(b_image, f.lb->image);
@@ -250,23 +267,39 @@ struct GpuMma : public IRMutator {
         Expr gid = ln / 4, tid2 = (ln % 4) * 2;
 
         if (op->is_producer) {
-            // Gather the A (4 regs = 8 halfs) and B (2 regs = 4 halfs) fragments per
-            // the mma.m16n8k16 .f16 layout, then one mma into the D registers.
-            vector<Expr> a = {
-                load_a(gid, tid2), load_a(gid, tid2 + 1),
-                load_a(gid + 8, tid2), load_a(gid + 8, tid2 + 1),
-                load_a(gid, tid2 + 8), load_a(gid, tid2 + 9),
-                load_a(gid + 8, tid2 + 8), load_a(gid + 8, tid2 + 9)};
-            vector<Expr> b = {
-                load_b(tid2, gid), load_b(tid2 + 1, gid),
-                load_b(tid2 + 8, gid), load_b(tid2 + 9, gid)};
-            Expr afrag = Shuffle::make_concat(a);
-            Expr bfrag = Shuffle::make_concat(b);
-            Expr cinit = Broadcast::make(make_zero(Float(32)), 4);
-            Expr d = Call::make(Float(32, 4), "gpu_mma_f16_f32",
-                                {afrag, bfrag, cinit}, Call::Intrinsic);
-            return Store::make(acc_name, d, Ramp::make(make_const(Int(32), 0), make_const(Int(32), 1), 4),
-                               Parameter(), const_true(4), ModulusRemainder());
+            // D[4 f32] accumulator carried across the k-tiles. One mma per 16-deep
+            // k-tile, feeding the running D back as the mma C input. The A (4 regs =
+            // 8 halfs) and B (2 regs = 4 halfs) fragments follow the mma.m16n8k16
+            // .f16 layout; `kb` is the absolute k base of the current tile.
+            Expr ramp4 = Ramp::make(make_const(Int(32), 0), make_const(Int(32), 1), 4);
+            auto mma_step = [&](const Expr &kb) {
+                vector<Expr> a = {
+                    load_a(gid, kb + tid2), load_a(gid, kb + tid2 + 1),
+                    load_a(gid + 8, kb + tid2), load_a(gid + 8, kb + tid2 + 1),
+                    load_a(gid, kb + tid2 + 8), load_a(gid, kb + tid2 + 9),
+                    load_a(gid + 8, kb + tid2 + 8), load_a(gid + 8, kb + tid2 + 9)};
+                vector<Expr> b = {
+                    load_b(kb + tid2, gid), load_b(kb + tid2 + 1, gid),
+                    load_b(kb + tid2 + 8, gid), load_b(kb + tid2 + 9, gid)};
+                Expr cin = Load::make(Float(32, 4), acc_name, ramp4, Buffer<>(),
+                                      Parameter(), const_true(4), ModulusRemainder());
+                Expr d = Call::make(Float(32, 4), "gpu_mma_f16_f32",
+                                    {Shuffle::make_concat(a), Shuffle::make_concat(b), cin},
+                                    Call::Intrinsic);
+                return Store::make(acc_name, d, ramp4, Parameter(), const_true(4),
+                                   ModulusRemainder());
+            };
+            Stmt init = Store::make(acc_name, Broadcast::make(make_zero(Float(32)), 4),
+                                    ramp4, Parameter(), const_true(4), ModulusRemainder());
+            int ntiles = k_extent / MMA_K;
+            if (ntiles == 1) {
+                return Block::make(init, mma_step(make_const(Int(32), 0)));
+            }
+            string ko = unique_name("mma$ko");
+            Stmt loop = For::make(ko, make_const(Int(32), 0), make_const(Int(32), ntiles - 1),
+                                  ForType::Serial, Partition::Auto, DeviceAPI::None,
+                                  mma_step(Variable::make(Int(32), ko) * MMA_K));
+            return Block::make(init, loop);
         }
 
         // Consumer: scatter the 4 D registers to C at the accumulator-fragment coords
