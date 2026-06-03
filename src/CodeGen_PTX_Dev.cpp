@@ -83,6 +83,10 @@ protected:
     void codegen_vector_reduce(const VectorReduce *op, const Expr &init) override;
     // @}
 
+    // P1: set when a cp.async copy (vectorized global->shared) was emitted since the last
+    // gpu_thread_barrier, so the barrier commits + waits for it (synchronous cp.async).
+    bool emitted_cp_async = false;
+
     std::string mcpu_target() const override;
     std::string mcpu_tune() const override;
     std::string mattrs() const override;
@@ -274,6 +278,18 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         auto fence_type_ptr = as_const_int(op->args[0]);
         internal_assert(fence_type_ptr) << "gpu_thread_barrier() parameter is not a constant integer.\n";
 
+        // P1: if cp.async copies are in flight, commit the group and wait for all of them
+        // before the block sync, so the shared data is ready (synchronous cp.async). Each
+        // thread waits its own group; the barrier then makes the shared writes visible.
+        if (emitted_cp_async) {
+            builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                module.get(), llvm::Intrinsic::nvvm_cp_async_commit_group));
+            builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                                    module.get(), llvm::Intrinsic::nvvm_cp_async_wait_group),
+                                builder->getInt32(0));
+            emitted_cp_async = false;
+        }
+
         llvm::Function *barrier;
         if ((barrier = module->getFunction("llvm.nvvm.barrier.cta.sync.aligned.all")) && barrier->getIntrinsicID() != 0) {
             // LLVM 20.1.6 and above: https://github.com/llvm/llvm-project/pull/140615
@@ -415,6 +431,37 @@ void CodeGen_PTX_Dev::visit(const Load *op) {
 }
 
 void CodeGen_PTX_Dev::visit(const Store *op) {
+    // P1: a vectorized (4-wide, 16 B) contiguous copy from global to shared lowers to
+    // `cp.async.cg.shared.global.16`, which copies global->shared directly (bypassing
+    // registers) — the codegen of a vectorized shared<-global copy, gated on sm_80+.
+    // Detect `Store(shared, Load(global))` with matching unit-stride 4-wide ramps. The
+    // following gpu_thread_barrier commits + waits (synchronous; ring_buffer adds overlap).
+    if (!emit_atomic_stores && target.get_cuda_capability_lower_bound() >= 80 &&
+        is_const_one(op->predicate) && op->value.type().bits() == 32) {
+        const Ramp *r = op->index.as<Ramp>();
+        const Load *ld = op->value.as<Load>();
+        const Ramp *lr = ld ? ld->index.as<Ramp>() : nullptr;
+        if (r && ld && lr && is_const_one(ld->predicate) &&
+            is_const_one(r->stride) && is_const_one(lr->stride) &&
+            r->lanes == 4 && lr->lanes == 4) {
+            Value *dst = codegen_buffer_pointer(op->name, op->value.type().element_of(), r->base);
+            Value *src = codegen_buffer_pointer(ld->name, ld->type.element_of(), lr->base);
+            // cp.async copies global (as1) -> shared (as3). dst must be shared; src must be
+            // global (cast a generic as0 pointer to as1; skip a shared->shared copy).
+            unsigned src_as = src->getType()->getPointerAddressSpace();
+            if (dst->getType()->getPointerAddressSpace() == 3 && src_as != 3) {
+                if (src_as != 1) {
+                    src = builder->CreateAddrSpaceCast(src, llvm::PointerType::get(*context, 1));
+                }
+                llvm::Function *cp = llvm::Intrinsic::getOrInsertDeclaration(
+                    module.get(), llvm::Intrinsic::nvvm_cp_async_cg_shared_global_16);
+                builder->CreateCall(cp, {dst, src});
+                emitted_cp_async = true;
+                return;
+            }
+        }
+    }
+
     // Issue atomic store if we are inside an Atomic node.
     if (emit_atomic_stores) {
         user_assert(is_const_one(op->predicate)) << "Atomic update does not support predicated store.\n";
