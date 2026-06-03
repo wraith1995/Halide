@@ -96,7 +96,16 @@ struct MmaFinder : public IRVisitor {
     const Store *reduce = nullptr;
     const Store *epilogue = nullptr;
     const Load *la = nullptr, *lb = nullptr;
+    // The ProducerConsumer name wrapping the init/reduce and epilogue. This is the
+    // Func name ("prod"), which differs from the storage name `acc` ("prod.0").
+    string cur_pc, pc_name;
     using IRVisitor::visit;
+    void visit(const ProducerConsumer *op) override {
+        string old = cur_pc;
+        cur_pc = op->name;
+        IRVisitor::visit(op);
+        cur_pc = old;
+    }
     void visit(const Store *s) override {
         if (s->name == acc) {
             const Load *A, *B;
@@ -104,6 +113,7 @@ struct MmaFinder : public IRVisitor {
                 reduce = s;
                 la = A;
                 lb = B;
+                pc_name = cur_pc;
             }
         } else if (const Load *l = s->value.as<Load>(); l && l->name == acc) {
             epilogue = s;
@@ -120,7 +130,8 @@ struct GpuMma : public IRMutator {
 
     // Geometry of the current match (set when we rewrite an accumulator alloc).
     bool matched = false;
-    string acc_name;
+    string acc_name;  // storage name, e.g. "prod.0"
+    string pc_name;   // ProducerConsumer (Func) name, e.g. "prod"
     // A: out[m,n] += A[m,k]*B[k,n]; indices As[base_a + m*da_m + k*da_k] etc.
     string a_name, b_name, c_name;
     Buffer<> a_image, b_image;
@@ -177,7 +188,7 @@ struct GpuMma : public IRMutator {
                 m_var = v;
             }
         }
-        if (k_var.empty() || m_var.empty()) {
+        if (k_var.empty() || m_var.empty() || f.pc_name.empty()) {
             return IRMutator::visit(op);
         }
         // Epilogue loop var (the r in `for r in 0..3`): the accumulator-load index
@@ -215,6 +226,7 @@ struct GpuMma : public IRMutator {
         // Commit the match; recurse so the inner ProducerConsumer nodes rewrite.
         ScopedValue<bool> m1(matched, true);
         ScopedValue<string> m2(acc_name, op->name);
+        ScopedValue<string> m2b(pc_name, f.pc_name);
         ScopedValue<string> m3(a_name, f.la->name), m4(b_name, f.lb->name),
             m5(c_name, f.epilogue->name);
         ScopedValue<Buffer<>> m6(a_image, f.la->image), m7(b_image, f.lb->image);
@@ -231,7 +243,7 @@ struct GpuMma : public IRMutator {
     }
 
     Stmt visit(const ProducerConsumer *op) override {
-        if (!matched || op->name != acc_name) {
+        if (!matched || op->name != pc_name) {
             return IRMutator::visit(op);
         }
         Expr ln = Variable::make(Int(32), lane);
