@@ -8,6 +8,7 @@
 #include "Target.h"
 #include "Util.h"
 
+#include <cstdlib>
 #include <initializer_list>
 #include <map>
 #include <set>
@@ -272,19 +273,52 @@ struct GpuMma : public IRMutator {
             // 8 halfs) and B (2 regs = 4 halfs) fragments follow the mma.m16n8k16
             // .f16 layout; `kb` is the absolute k base of the current tile.
             Expr ramp4 = Ramp::make(make_const(Int(32), 0), make_const(Int(32), 1), 4);
+            // Operand source: scalar per-lane fragment gather (validated, the fallback) vs.
+            // ldmatrix loading the whole shared tile in one warp instruction (the goal).
+            // Env-gated per-operand so each can be isolated, and the trans/addr unknowns
+            // swept on hardware against the M0 oracle. HL_MMA_ALDM/BLDM=1 enable ldmatrix;
+            // HL_MMA_AT/BT=1 use .trans; HL_MMA_BADDR picks a B row-address mode.
+            bool a_ldm = get_env_variable("HL_MMA_ALDM") == "1";
+            bool b_ldm = get_env_variable("HL_MMA_BLDM") == "1";
+            string a_var = get_env_variable("HL_MMA_AT") == "1" ? "gpu_ldmatrix_x4_trans"
+                                                                : "gpu_ldmatrix_x4";
+            string b_var = get_env_variable("HL_MMA_BT") == "1" ? "gpu_ldmatrix_x2_trans"
+                                                                : "gpu_ldmatrix_x2";
+            int b_addr = atoi(get_env_variable("HL_MMA_BADDR").c_str());
+            auto ld_load = [&](const string &nm, Buffer<> im, Parameter pm, const Expr &idx) {
+                return Load::make(Float(16), nm, idx, im, pm, const_true(), ModulusRemainder());
+            };
             auto mma_step = [&](const Expr &kb) {
-                vector<Expr> a = {
-                    load_a(gid, kb + tid2), load_a(gid, kb + tid2 + 1),
-                    load_a(gid + 8, kb + tid2), load_a(gid + 8, kb + tid2 + 1),
-                    load_a(gid, kb + tid2 + 8), load_a(gid, kb + tid2 + 9),
-                    load_a(gid + 8, kb + tid2 + 8), load_a(gid + 8, kb + tid2 + 9)};
-                vector<Expr> b = {
-                    load_b(kb + tid2, gid), load_b(kb + tid2 + 1, gid),
-                    load_b(kb + tid2 + 8, gid), load_b(kb + tid2 + 9, gid)};
+                Expr afrag, bfrag;
+                if (a_ldm) {
+                    // x4: lane L -> A row (L%16), k col-block (L/16)*8. ldmatrix reads 8
+                    // contiguous halfs from there (needs da_k==1, or .trans for da_m==1).
+                    Expr addr = base_a + (ln % 16) * da_m + (kb + (ln / 16) * 8) * da_k;
+                    afrag = Call::make(Float(16, 8), a_var, {ld_load(a_name, a_image, a_param, addr)},
+                                       Call::Intrinsic);
+                } else {
+                    afrag = Shuffle::make_concat({
+                        load_a(gid, kb + tid2), load_a(gid, kb + tid2 + 1),
+                        load_a(gid + 8, kb + tid2), load_a(gid + 8, kb + tid2 + 1),
+                        load_a(gid, kb + tid2 + 8), load_a(gid, kb + tid2 + 9),
+                        load_a(gid + 8, kb + tid2 + 8), load_a(gid + 8, kb + tid2 + 9)});
+                }
+                if (b_ldm) {
+                    Expr addr = (b_addr == 1)
+                                    ? base_b + kb * db_k + (ln % 8) * db_n
+                                    : (b_addr == 2)
+                                          ? base_b + kb * db_k + (ln % 8) * db_n + (ln / 8) * 8 * db_k
+                                          : base_b + (kb + (ln % 16)) * db_k;
+                    bfrag = Call::make(Float(16, 4), b_var, {ld_load(b_name, b_image, b_param, addr)},
+                                       Call::Intrinsic);
+                } else {
+                    bfrag = Shuffle::make_concat({
+                        load_b(kb + tid2, gid), load_b(kb + tid2 + 1, gid),
+                        load_b(kb + tid2 + 8, gid), load_b(kb + tid2 + 9, gid)});
+                }
                 Expr cin = Load::make(Float(32, 4), acc_name, ramp4, Buffer<>(),
                                       Parameter(), const_true(4), ModulusRemainder());
-                Expr d = Call::make(Float(32, 4), "gpu_mma_f16_f32",
-                                    {Shuffle::make_concat(a), Shuffle::make_concat(b), cin},
+                Expr d = Call::make(Float(32, 4), "gpu_mma_f16_f32", {afrag, bfrag, cin},
                                     Call::Intrinsic);
                 return Store::make(acc_name, d, ramp4, Parameter(), const_true(4),
                                    ModulusRemainder());
