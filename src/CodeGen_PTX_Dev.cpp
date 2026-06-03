@@ -138,6 +138,15 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
 
     debug(2) << "In CodeGen_PTX_Dev::add_kernel\n";
 
+    // Dev aid: dump the lowered device-side Stmt for a kernel (e.g. to design
+    // codegen pattern-matches). HL_DUMP_KERNEL_IR=1 dumps all; =<substr> filters.
+    if (std::string f = get_env_variable("HL_DUMP_KERNEL_IR"); !f.empty()) {
+        if (f == "1" || name.find(f) != std::string::npos) {
+            debug(0) << "=== KERNEL IR: " << name << " ===\n"
+                     << stmt << "\n=== end " << name << " ===\n";
+        }
+    }
+
     // Now deduce the types of the arguments to our function
     vector<llvm::Type *> arg_types(args.size());
     for (size_t i = 0; i < args.size(); i++) {
