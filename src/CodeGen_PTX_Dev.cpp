@@ -17,6 +17,7 @@
 #include "Simplify.h"
 #include "Solve.h"
 #include "Target.h"
+#include "Util.h"
 
 #include <fstream>
 
@@ -437,6 +438,7 @@ void CodeGen_PTX_Dev::visit(const Store *op) {
     // Detect `Store(shared, Load(global))` with matching unit-stride 4-wide ramps. The
     // following gpu_thread_barrier commits + waits (synchronous; ring_buffer adds overlap).
     if (!emit_atomic_stores && target.get_cuda_capability_lower_bound() >= 80 &&
+        get_env_variable("HL_NO_CP_ASYNC").empty() &&
         is_const_one(op->predicate) && op->value.type().bits() == 32) {
         const Ramp *r = op->index.as<Ramp>();
         const Load *ld = op->value.as<Load>();
