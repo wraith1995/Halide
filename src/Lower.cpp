@@ -26,6 +26,7 @@
 #include "DebugToFile.h"
 #include "Deinterleave.h"
 #include "EarlyFree.h"
+#include "ExtractGpuMma.h"
 #include "ExtractTileOperations.h"
 #include "FindCalls.h"
 #include "FindIntrinsics.h"
@@ -426,6 +427,10 @@ void lower_impl(const vector<Function> &output_funcs,
     }
 
     if (t.has_feature(Target::CUDA)) {
+        debug(1) << "Extracting GPU tensor-core (mma) operations...\n";
+        s = extract_gpu_mma(s, t);
+        log("Lowering after extracting GPU mma:", s);
+
         debug(1) << "Injecting warp shuffles...\n";
         s = lower_warp_shuffles(s, t);
         log("Lowering after injecting warp shuffles:", s);

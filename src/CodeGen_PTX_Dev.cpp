@@ -394,22 +394,23 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         return;
     }
 
-    // gpu_mma_f16_f32(a: UInt(32,4), b: UInt(32,2), c: Float(32,4)) -> Float(32,4):
-    // one mma.sync.aligned.m16n8k16.row.col.f32.f32. a/b lanes are i32-packed
-    // <2 x half> fragments (as produced by ldmatrix); c/d are the 4 fp32 accumulators
-    // this lane holds of the 16x8 output tile.
+    // gpu_mma_f16_f32(a: Float(16,8), b: Float(16,4), c: Float(32,4)) -> Float(32,4):
+    // one mma.sync.aligned.m16n8k16.row.col.f32.f32. a (8 halfs) is the A fragment as
+    // 4 <2 x half> regs; b (4 halfs) the B fragment as 2 regs; c/d are the 4 fp32
+    // accumulators this lane holds of the 16x8 output tile. The mma fragment layout
+    // (which half goes where) is built by the recognition pass, not here.
     if (op->name == "gpu_mma_f16_f32") {
         internal_assert(op->args.size() == 3);
-        Value *a = codegen(op->args[0]);
-        Value *b = codegen(op->args[1]);
-        Value *c = codegen(op->args[2]);
-        llvm::Type *v2h = get_vector_type(llvm::Type::getHalfTy(*context), 2);
+        Value *a = codegen(op->args[0]);  // <8 x half>
+        Value *b = codegen(op->args[1]);  // <4 x half>
+        Value *c = codegen(op->args[2]);  // <4 x float>
         std::vector<Value *> args;
+        // Pack consecutive half pairs into the <2 x half> mma operand registers.
         for (int i = 0; i < 4; i++) {
-            args.push_back(builder->CreateBitCast(builder->CreateExtractElement(a, i), v2h));
+            args.push_back(builder->CreateShuffleVector(a, {2 * i, 2 * i + 1}));
         }
         for (int i = 0; i < 2; i++) {
-            args.push_back(builder->CreateBitCast(builder->CreateExtractElement(b, i), v2h));
+            args.push_back(builder->CreateShuffleVector(b, {2 * i, 2 * i + 1}));
         }
         for (int i = 0; i < 4; i++) {
             args.push_back(builder->CreateExtractElement(c, i));
