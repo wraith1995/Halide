@@ -117,6 +117,7 @@ target_sources(
     ExprUsesVar.h
     Extern.h
     ExternFuncArgument.h
+    ExtractGpuMma.h
     ExtractTileOperations.h
     FastIntegerDivide.h
     FindCalls.h
@@ -299,6 +300,7 @@ target_sources(
     EmulateFloat16Math.cpp
     Error.cpp
     Expr.cpp
+    ExtractGpuMma.cpp
     ExtractTileOperations.cpp
     FastIntegerDivide.cpp
     FindCalls.cpp

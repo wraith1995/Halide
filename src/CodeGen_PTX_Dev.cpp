@@ -138,6 +138,15 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
 
     debug(2) << "In CodeGen_PTX_Dev::add_kernel\n";
 
+    // Dev aid: dump the lowered device-side Stmt for a kernel (e.g. to design
+    // codegen pattern-matches). HL_DUMP_KERNEL_IR=1 dumps all; =<substr> filters.
+    if (std::string f = get_env_variable("HL_DUMP_KERNEL_IR"); !f.empty()) {
+        if (f == "1" || name.find(f) != std::string::npos) {
+            debug(0) << "=== KERNEL IR: " << name << " ===\n"
+                     << stmt << "\n=== end " << name << " ===\n";
+        }
+    }
+
     // Now deduce the types of the arguments to our function
     vector<llvm::Type *> arg_types(args.size());
     for (size_t i = 0; i < args.size(); i++) {
@@ -341,6 +350,87 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         internal_assert(barrier) << "Could not find PTX named-barrier intrinsic.\n";
         builder->CreateCall(barrier, {barrier_id, thread_count});
         value = ConstantInt::get(i32_t, 0);
+        return;
+    }
+
+    // P2: tensor-core primitives emitted by the GPU-MMA recognition pass.
+    // These are warp-collective: every lane of a 32-lane warp executes the same
+    // call, contributing its register fragment; the hardware coordinates.
+    //
+    // gpu_ldmatrix_{x4,x4_trans,x2,x2_trans}(Load(shared)) -> Float(16, 2*nregs): load a
+    // tile from shared (addrspace 3) into the per-lane mma operand fragment, in ONE warp
+    // instruction (the hardware does the lane permutation) — replacing the per-lane scalar
+    // fragment build. The arg is a Load from the shared alloc at this lane's ROW base
+    // address; we take its address (not its value) and hand it to ldmatrix. The i32 results
+    // are bitcast to halfs so the fragment drops straight into gpu_mma_f16_f32.
+    if (starts_with(op->name, "gpu_ldmatrix_")) {
+        internal_assert(op->args.size() == 1);
+        const Load *ld = op->args[0].as<Load>();
+        internal_assert(ld) << "gpu_ldmatrix arg must be a Load from a shared alloc.\n";
+        Value *ptr = codegen_buffer_pointer(ld->name, ld->type.element_of(), ld->index);
+        if (ptr->getType()->getPointerAddressSpace() != 3) {
+            ptr = builder->CreateAddrSpaceCast(ptr, llvm::PointerType::get(*context, 3));
+        }
+        llvm::Intrinsic::ID id;
+        int nregs;
+        if (op->name == "gpu_ldmatrix_x4") {
+            id = llvm::Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x4_b16;
+            nregs = 4;
+        } else if (op->name == "gpu_ldmatrix_x4_trans") {
+            id = llvm::Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x4_trans_b16;
+            nregs = 4;
+        } else if (op->name == "gpu_ldmatrix_x2_trans") {
+            id = llvm::Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x2_trans_b16;
+            nregs = 2;
+        } else {
+            internal_assert(op->name == "gpu_ldmatrix_x2");
+            id = llvm::Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x2_b16;
+            nregs = 2;
+        }
+        llvm::Function *fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), id, {ptr->getType()});
+        Value *res = builder->CreateCall(fn, {ptr});
+        // ldmatrix returns {i32 x nregs}; bitcast each i32 to <2 x half> and concat.
+        llvm::Type *v2h = get_vector_type(llvm::Type::getHalfTy(*context), 2);
+        llvm::Type *vt = get_vector_type(llvm::Type::getHalfTy(*context), 2 * nregs);
+        value = llvm::UndefValue::get(vt);
+        for (int i = 0; i < nregs; i++) {
+            Value *e = (nregs == 1) ? res : builder->CreateExtractValue(res, i);
+            Value *h2 = builder->CreateBitCast(e, v2h);
+            value = builder->CreateInsertElement(value, builder->CreateExtractElement(h2, (uint64_t)0), 2 * i);
+            value = builder->CreateInsertElement(value, builder->CreateExtractElement(h2, 1), 2 * i + 1);
+        }
+        return;
+    }
+
+    // gpu_mma_f16_f32(a: Float(16,8), b: Float(16,4), c: Float(32,4)) -> Float(32,4):
+    // one mma.sync.aligned.m16n8k16.row.col.f32.f32. a (8 halfs) is the A fragment as
+    // 4 <2 x half> regs; b (4 halfs) the B fragment as 2 regs; c/d are the 4 fp32
+    // accumulators this lane holds of the 16x8 output tile. The mma fragment layout
+    // (which half goes where) is built by the recognition pass, not here.
+    if (op->name == "gpu_mma_f16_f32") {
+        internal_assert(op->args.size() == 3);
+        Value *a = codegen(op->args[0]);  // <8 x half>
+        Value *b = codegen(op->args[1]);  // <4 x half>
+        Value *c = codegen(op->args[2]);  // <4 x float>
+        std::vector<Value *> args;
+        // Pack consecutive half pairs into the <2 x half> mma operand registers.
+        for (int i = 0; i < 4; i++) {
+            args.push_back(builder->CreateShuffleVector(a, {2 * i, 2 * i + 1}));
+        }
+        for (int i = 0; i < 2; i++) {
+            args.push_back(builder->CreateShuffleVector(b, {2 * i, 2 * i + 1}));
+        }
+        for (int i = 0; i < 4; i++) {
+            args.push_back(builder->CreateExtractElement(c, i));
+        }
+        llvm::Function *fn = llvm::Intrinsic::getOrInsertDeclaration(
+            module.get(), llvm::Intrinsic::nvvm_mma_m16n8k16_row_col_f32_f32);
+        Value *res = builder->CreateCall(fn, args);
+        llvm::Type *vt = get_vector_type(llvm::Type::getFloatTy(*context), 4);
+        value = llvm::UndefValue::get(vt);
+        for (int i = 0; i < 4; i++) {
+            value = builder->CreateInsertElement(value, builder->CreateExtractValue(res, i), i);
+        }
         return;
     }
 
