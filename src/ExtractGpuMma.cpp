@@ -278,12 +278,16 @@ struct GpuMma : public IRMutator {
             // Env-gated per-operand so each can be isolated, and the trans/addr unknowns
             // swept on hardware against the M0 oracle. HL_MMA_ALDM/BLDM=1 enable ldmatrix;
             // HL_MMA_AT/BT=1 use .trans; HL_MMA_BADDR picks a B row-address mode.
-            bool a_ldm = get_env_variable("HL_MMA_ALDM") == "1";
-            bool b_ldm = get_env_variable("HL_MMA_BLDM") == "1";
+            // Validated A100 config (K=16 oracle): A = ldmatrix.x4 non-trans (needs As
+            // k-contiguous in shared), B = ldmatrix.x2.trans, B row-addr mode 0. HL_MMA_LDM=1
+            // turns on ldmatrix for both with these defaults; the per-operand knobs override.
+            bool ldm_all = get_env_variable("HL_MMA_LDM") == "1";
+            bool a_ldm = ldm_all || get_env_variable("HL_MMA_ALDM") == "1";
+            bool b_ldm = ldm_all || get_env_variable("HL_MMA_BLDM") == "1";
             string a_var = get_env_variable("HL_MMA_AT") == "1" ? "gpu_ldmatrix_x4_trans"
                                                                 : "gpu_ldmatrix_x4";
-            string b_var = get_env_variable("HL_MMA_BT") == "1" ? "gpu_ldmatrix_x2_trans"
-                                                                : "gpu_ldmatrix_x2";
+            string b_var = get_env_variable("HL_MMA_BT") == "0" ? "gpu_ldmatrix_x2"
+                                                                : "gpu_ldmatrix_x2_trans";
             int b_addr = atoi(get_env_variable("HL_MMA_BADDR").c_str());
             auto ld_load = [&](const string &nm, Buffer<> im, Parameter pm, const Expr &idx) {
                 return Load::make(Float(16), nm, idx, im, pm, const_true(), ModulusRemainder());
