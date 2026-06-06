@@ -413,7 +413,8 @@ Stmt Provide::make(const std::string &name, const std::vector<Expr> &values, con
 Stmt Allocate::make(const std::string &name, Type type, MemoryType memory_type,
                     const std::vector<Expr> &extents,
                     Expr condition, Stmt body,
-                    Expr new_expr, const std::string &free_function, int padding) {
+                    Expr new_expr, const std::string &free_function, int padding,
+                    SwizzleLayout swizzle) {
     for (const auto &extent : extents) {
         internal_assert(extent.defined()) << "Allocate of undefined extent\n";
         internal_assert(extent.type().is_scalar() == 1) << "Allocate of vector extent\n";
@@ -433,6 +434,7 @@ Stmt Allocate::make(const std::string &name, Type type, MemoryType memory_type,
     node->free_function = free_function;
     node->condition = std::move(condition);
     node->padding = padding;
+    node->swizzle = swizzle;
     node->body = std::move(body);
     return node;
 }

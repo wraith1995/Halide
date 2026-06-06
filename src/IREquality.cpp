@@ -453,6 +453,7 @@ struct Comparer {
                 cmp_if_defined(&Allocate::new_expr);
                 cmp(&Allocate::condition);
                 cmp(&Allocate::extents);
+                cmp(&Allocate::swizzle);
                 cmp(&Allocate::body);
                 break;
             case IRNodeType::Free:

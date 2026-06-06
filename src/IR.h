@@ -480,12 +480,18 @@ struct Allocate : public StmtNode<Allocate> {
     // have undetermined values, but are guaranteed safe to load.
     int padding;
 
+    // An optional non-affine storage swizzle composed onto the affine layout,
+    // applied at the codegen address seam (currently GPU shared memory only).
+    // The default (bits == 0) is the identity. See SwizzleLayout.
+    SwizzleLayout swizzle;
+
     Stmt body;
 
     static Stmt make(const std::string &name, Type type, MemoryType memory_type,
                      const std::vector<Expr> &extents,
                      Expr condition, Stmt body,
-                     Expr new_expr = Expr(), const std::string &free_function = std::string(), int padding = 0);
+                     Expr new_expr = Expr(), const std::string &free_function = std::string(), int padding = 0,
+                     SwizzleLayout swizzle = SwizzleLayout());
 
     /** A routine to check if the extents are all constants, and if so verify
      * the total size is less than 2^31 - 1. If the result is constant, but

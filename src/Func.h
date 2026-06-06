@@ -2602,6 +2602,19 @@ public:
      * on MemoryType for more detail. */
     Func &store_in(MemoryType memory_type);
 
+    /** Compose a non-affine storage swizzle onto this Func's affine (stride)
+     * layout to avoid GPU shared-memory bank conflicts. Only meaningful for a
+     * Func stored in MemoryType::GPUShared. The swizzle is a self-inverse XOR
+     * permutation applied at the codegen address seam: the logical index stays
+     * affine, and because the swizzle lives on the allocation, every accessor
+     * (producer and consumer) observes the same map. The named-mode overload
+     * resolves to concrete bit parameters from this Func's element size; the
+     * SwizzleLayout overload gives exact (bits, base, shift) control. */
+    // @{
+    Func &swizzle_storage(Swizzle mode);
+    Func &swizzle_storage(SwizzleLayout layout);
+    // @}
+
     /** Trace all loads from this Func by emitting calls to
      * halide_trace. If the Func is inlined, this has no
      * effect. */

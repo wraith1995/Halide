@@ -1282,6 +1282,11 @@ void IRPrinter::visit(const Allocate *op) {
     if (op->memory_type != MemoryType::Auto) {
         stream << kw(" in ") << type(op->memory_type);
     }
+    if (op->swizzle.defined()) {
+        stream << kw(" swizzled") << "(bits=" << op->swizzle.bits
+               << ", base=" << op->swizzle.base
+               << ", shift=" << op->swizzle.shift << ")";
+    }
     if (!is_const_one(op->condition)) {
         stream << " if ";
         print(op->condition);

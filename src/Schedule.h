@@ -631,6 +631,13 @@ public:
     MemoryType &memory_type();
     // @}
 
+    /** The non-affine storage swizzle (if any) composed onto this Func's affine
+     * layout. The default is the identity. See \ref Func::swizzle_storage. */
+    // @{
+    SwizzleLayout swizzle() const;
+    SwizzleLayout &swizzle();
+    // @}
+
     /** You may explicitly bound some of the dimensions of a function,
      * or constrain them to lie on multiples of a given factor. See
      * \ref Func::bound and \ref Func::align_bounds and \ref Func::align_extent. */
