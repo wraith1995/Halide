@@ -74,6 +74,36 @@ Buffer<T> run_blur(const Buffer<T> &input, bool swizzled, Swizzle mode) {
     return result;
 }
 
+// Vectorized staging: the producer's store into shared and the consumer's load
+// from shared are both 4-wide 32-bit, which triggers the dense v4 shared path in
+// CodeGen_PTX_Dev (Store/Load reinterpreted as a single 128-bit access at index/4).
+// The swizzle must rescale its element-unit params to those coarser units and keep
+// the access contiguous (granule == 16 B == the v4 width for 4-byte elements).
+template<typename T>
+Buffer<T> run_vectorized(const Buffer<T> &input, bool swizzled, Swizzle mode) {
+    Var x, y, xo, yo, xi, yi;
+    Func clamped("clamped"), prod("prod"), cons("cons");
+    clamped(x, y) = input(clamp(x, 0, input.width() - 1), clamp(y, 0, input.height() - 1));
+    prod(x, y) = clamped(x, y) + cast<T>(1);
+    // Read prod contiguously in x (so the consumer load vectorizes 4-wide).
+    cons(x, y) = prod(x, y) + prod(x, y + 1);
+
+    cons.gpu_tile(x, y, xo, yo, xi, yi, 64, 8, TailStrategy::GuardWithIf)
+        .vectorize(xi, 4, TailStrategy::GuardWithIf);
+    prod.compute_at(cons, xo)
+        .store_in(MemoryType::GPUShared)
+        .gpu_threads(y)
+        .vectorize(x, 4);
+    if (swizzled) {
+        prod.swizzle_storage(mode);
+    }
+
+    Buffer<T> result(input.width(), input.height());
+    cons.realize(result);
+    result.copy_to_host();
+    return result;
+}
+
 template<typename T>
 bool compare(const Buffer<T> &a, const Buffer<T> &b, const char *label) {
     if (a.width() != b.width() || a.height() != b.height()) {
@@ -140,6 +170,25 @@ int main(int argc, char **argv) {
         Buffer<uint32_t> ref = run_blur<uint32_t>(in, false, Swizzle::None);
         Buffer<uint32_t> got = run_blur<uint32_t>(in, true, Swizzle::XOR_128B);
         ok &= compare<uint32_t>(got, ref, "blur u32 XOR_128B");
+    }
+
+    // Vectorized staging: exercises the dense v4 (128-bit) shared store/load path
+    // under swizzle, for both integer and float 32-bit elements.
+    {
+        Buffer<uint32_t> in = make_input<uint32_t>(256, 64);
+        Buffer<uint32_t> ref = run_vectorized<uint32_t>(in, false, Swizzle::None);
+        for (Swizzle m : {Swizzle::XOR_32B, Swizzle::XOR_64B, Swizzle::XOR_128B}) {
+            Buffer<uint32_t> got = run_vectorized<uint32_t>(in, true, m);
+            char label[96];
+            snprintf(label, sizeof(label), "vectorized u32 mode=%d", (int)m);
+            ok &= compare<uint32_t>(got, ref, label);
+        }
+    }
+    {
+        Buffer<float> in = make_input<float>(256, 64);
+        Buffer<float> ref = run_vectorized<float>(in, false, Swizzle::None);
+        Buffer<float> got = run_vectorized<float>(in, true, Swizzle::XOR_128B);
+        ok &= compare<float>(got, ref, "vectorized f32 XOR_128B");
     }
 
     // Raw SwizzleLayout (control field disjoint from target field => bijection).
