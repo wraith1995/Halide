@@ -135,10 +135,15 @@ public:
         vector<int> storage_permutation;
         vector<Stmt> bound_asserts;
         bool is_ring_buffered = false;
+        // The non-affine storage swizzle (if any) is carried from the schedule
+        // onto the Allocate, so every accessor of this buffer observes the same
+        // map at the codegen address seam. See SwizzleLayout / Func::swizzle_storage.
+        SwizzleLayout swizzle;
         {
             auto iter = env.find(op->name);
             internal_assert(iter != env.end()) << "Realize node refers to function not in environment.\n";
             Function f = iter->second.first;
+            swizzle = f.schedule().swizzle();
             is_ring_buffered = f.schedule().ring_buffer().defined();
             const vector<StorageDim> &storage_dims = f.schedule().storage_dims();
             const vector<string> &args = f.args();
@@ -211,7 +216,8 @@ public:
         stmt = LetStmt::make(op->name + ".buffer", builder.build(), stmt);
 
         // Make the allocation node
-        stmt = Allocate::make(op->name, op->types[0], op->memory_type, allocation_extents, condition, stmt);
+        stmt = Allocate::make(op->name, op->types[0], op->memory_type, allocation_extents, condition, stmt,
+                              Expr(), std::string(), 0, swizzle);
 
         // Wrap it into storage bound asserts.
         if (!bound_asserts.empty()) {

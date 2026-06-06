@@ -619,7 +619,7 @@ protected:
                 is_pure(i->condition)) {
                 Stmt s = Allocate::make(op->name, op->type, op->memory_type,
                                         op->extents, op->condition, i->then_case,
-                                        op->new_expr, op->free_function, op->padding);
+                                        op->new_expr, op->free_function, op->padding, op->swizzle);
                 return IfThenElse::make(i->condition, s);
             }
         }
@@ -628,7 +628,7 @@ protected:
         } else {
             return Allocate::make(op->name, op->type, op->memory_type,
                                   op->extents, op->condition, body,
-                                  op->new_expr, op->free_function, op->padding);
+                                  op->new_expr, op->free_function, op->padding, op->swizzle);
         }
     }
 
