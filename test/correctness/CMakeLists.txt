@@ -158,6 +158,7 @@ tests(
     gpu_object_lifetime_3.cpp
     gpu_param_allocation.cpp
     gpu_reuse_shared_memory.cpp
+    gpu_shared_swizzle.cpp
     gpu_specialize.cpp
     gpu_store_in_register_with_no_lanes_loop.cpp
     gpu_sum_scan.cpp
