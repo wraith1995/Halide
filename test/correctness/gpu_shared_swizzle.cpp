@@ -104,6 +104,34 @@ Buffer<T> run_vectorized(const Buffer<T> &input, bool swizzled, Swizzle mode) {
     return result;
 }
 
+// Like run_vectorized, but with a provably 4-element-aligned base (align_storage +
+// exact tile division, no tail mins). This makes the dense v4 path actually fire:
+// the store/load lower to a single st.shared.v4 / ld.shared.v4 whose address is the
+// swizzled (rescaled-to-u128-units) base. Confirms the v4 optimization is *preserved*
+// under swizzle, not just that swizzle is correct when it falls back to element-wise.
+template<typename T>
+Buffer<T> run_vectorized_aligned(const Buffer<T> &input, bool swizzled, Swizzle mode) {
+    Var x, y, xo, yo, xi, yi;
+    Func prod("prod"), cons("cons");
+    prod(x, y) = input(x, y) + cast<T>(1);
+    cons(x, y) = prod(x, y);
+
+    cons.gpu_tile(x, y, xo, yo, xi, yi, 64, 8).vectorize(xi, 4);
+    prod.compute_at(cons, xo)
+        .store_in(MemoryType::GPUShared)
+        .gpu_threads(y)
+        .vectorize(x, 4)
+        .align_storage(x, 64);
+    if (swizzled) {
+        prod.swizzle_storage(mode);
+    }
+
+    Buffer<T> result(input.width(), input.height());
+    cons.realize(result);
+    result.copy_to_host();
+    return result;
+}
+
 template<typename T>
 bool compare(const Buffer<T> &a, const Buffer<T> &b, const char *label) {
     if (a.width() != b.width() || a.height() != b.height()) {
@@ -189,6 +217,19 @@ int main(int argc, char **argv) {
         Buffer<float> ref = run_vectorized<float>(in, false, Swizzle::None);
         Buffer<float> got = run_vectorized<float>(in, true, Swizzle::XOR_128B);
         ok &= compare<float>(got, ref, "vectorized f32 XOR_128B");
+    }
+
+    // Aligned vectorized staging: actually fires the dense st.shared.v4/ld.shared.v4
+    // path under swizzle (exercises the u128-rescale in the codegen hook).
+    {
+        Buffer<uint32_t> in = make_input<uint32_t>(256, 64);
+        Buffer<uint32_t> ref = run_vectorized_aligned<uint32_t>(in, false, Swizzle::None);
+        for (Swizzle m : {Swizzle::XOR_32B, Swizzle::XOR_64B, Swizzle::XOR_128B}) {
+            Buffer<uint32_t> got = run_vectorized_aligned<uint32_t>(in, true, m);
+            char label[96];
+            snprintf(label, sizeof(label), "vectorized-aligned(v4) u32 mode=%d", (int)m);
+            ok &= compare<uint32_t>(got, ref, label);
+        }
     }
 
     // Raw SwizzleLayout (control field disjoint from target field => bijection).
