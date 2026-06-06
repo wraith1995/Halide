@@ -200,6 +200,23 @@ int main(int argc, char **argv) {
         ok &= compare<uint32_t>(got, ref, "blur u32 XOR_128B");
     }
 
+    // Tails: partial tiles (sizes not a multiple of the 16x16 tile, incl. tiny
+    // and odd extents) exercise predicated boundary accesses. The swizzle is a
+    // bijection over the full padded shared allocation applied identically to the
+    // producer write and consumer read, so the tail only changes *which* elements
+    // are touched, not the address map -> results stay bit-identical.
+    {
+        const int whs[][2] = {{100, 70}, {130, 77}, {255, 255}, {17, 17}, {16, 16}};
+        for (auto &wh : whs) {
+            Buffer<uint32_t> in = make_input<uint32_t>(wh[0], wh[1]);
+            Buffer<uint32_t> ref = run_blur<uint32_t>(in, false, Swizzle::None);
+            Buffer<uint32_t> got = run_blur<uint32_t>(in, true, Swizzle::XOR_128B);
+            char label[96];
+            snprintf(label, sizeof(label), "blur-tail u32 %dx%d", wh[0], wh[1]);
+            ok &= compare<uint32_t>(got, ref, label);
+        }
+    }
+
     // Vectorized staging: exercises the dense v4 (128-bit) shared store/load path
     // under swizzle, for both integer and float 32-bit elements.
     {
