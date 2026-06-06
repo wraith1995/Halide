@@ -205,7 +205,7 @@ protected:
             return Allocate::make(op->name, op->type, op->memory_type,
                                   op->extents, op->condition,
                                   op->body, op->new_expr, op->free_function,
-                                  std::max(it->second, op->padding));
+                                  std::max(it->second, op->padding), op->swizzle);
         }
     }
 

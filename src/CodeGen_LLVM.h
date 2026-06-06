@@ -329,6 +329,15 @@ protected:
     llvm::Value *codegen_buffer_pointer(llvm::Value *base_address, Type type, llvm::Value *index);
     // @}
 
+    /** Hook for backends to remap a buffer's element index to a physical index
+     * (e.g. a GPU shared-memory bank-conflict swizzle), keyed by buffer name and
+     * applied at the address seam in the name-based codegen_buffer_pointer
+     * overloads. The default is the identity. The returned value must be in the
+     * same units as the input index. */
+    virtual llvm::Value *codegen_swizzled_index(const std::string &buffer, Type type, llvm::Value *index) {
+        return index;
+    }
+
     /** Return type string for LLVM type using LLVM IR intrinsic type mangling.
      * E.g. ".i32 or ".f32" for scalars, ".p0" for pointers,
      * ".nxv4i32" for a scalable vector of four 32-bit integers,

@@ -1953,7 +1953,14 @@ Expr promote_64(const Expr &e) {
 Value *CodeGen_LLVM::codegen_buffer_pointer(const string &buffer, Halide::Type type, Expr index) {
     // Find the base address from the symbol table
     Value *base_address = symbol_table.get(buffer);
-    return codegen_buffer_pointer(base_address, type, std::move(index));
+    // Promote index to 64-bit on targets that use 64-bit pointers (matching the
+    // base_address+Expr overload), then give backends a chance to remap it.
+    const llvm::DataLayout &d = module->getDataLayout();
+    if (promote_indices() && d.getPointerSize() == 8) {
+        index = promote_64(index);
+    }
+    Value *index_val = codegen_swizzled_index(buffer, type, codegen(std::move(index)));
+    return codegen_buffer_pointer(base_address, type, index_val);
 }
 
 Value *CodeGen_LLVM::codegen_buffer_pointer(Value *base_address, Halide::Type type, Expr index) {
@@ -1968,6 +1975,7 @@ Value *CodeGen_LLVM::codegen_buffer_pointer(Value *base_address, Halide::Type ty
 Value *CodeGen_LLVM::codegen_buffer_pointer(const string &buffer, Halide::Type type, Value *index) {
     // Find the base address from the symbol table
     Value *base_address = symbol_table.get(buffer);
+    index = codegen_swizzled_index(buffer, type, index);
     return codegen_buffer_pointer(base_address, type, index);
 }
 
