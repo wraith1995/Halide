@@ -488,6 +488,11 @@ void Stage::set_dim_type(const VarOrRVar &var, ForType t) {
         if (dim_match(dim, var)) {
             found = true;
             dim.for_type = t;
+            // Re-labeling a dim's for-type resets where its vector is realized
+            // to the default (registers). gpu_lanes/gpu_warps re-stamp a GPU
+            // realization afterwards; every other directive leaves it Register
+            // (byte-identical to before the realization field existed).
+            dim.realization = Internal::GPUVectorScope::Register;
 
             // If it's an rvar and the for type is parallel, we need to
             // validate that this doesn't introduce a race condition,
@@ -564,6 +569,27 @@ void Stage::set_dim_device_api(const VarOrRVar &var, DeviceAPI device_api) {
                    << ", could not find dimension "
                    << var.name()
                    << " to set to device API " << static_cast<int>(device_api)
+                   << " in vars for function\n"
+                   << dump_argument_list();
+    }
+}
+
+void Stage::set_dim_realization(const VarOrRVar &var, Internal::GPUVectorScope realization) {
+    definition.schedule().touched() = true;
+    bool found = false;
+    vector<Dim> &dims = definition.schedule().dims();
+    for (auto &dim : dims) {
+        if (dim_match(dim, var)) {
+            found = true;
+            dim.realization = realization;
+        }
+    }
+
+    if (!found) {
+        user_error << "In schedule for " << name()
+                   << ", could not find dimension "
+                   << var.name()
+                   << " to set GPU vector realization"
                    << " in vars for function\n"
                    << dump_argument_list();
     }
@@ -1920,6 +1946,12 @@ Stage &Stage::gpu_threads(const VarOrRVar &tx, const VarOrRVar &ty, const VarOrR
 Stage &Stage::gpu_lanes(const VarOrRVar &tx, DeviceAPI device_api) {
     set_dim_device_api(tx, device_api);
     set_dim_type(tx, ForType::GPULane);
+    // A gpu_lanes axis is a vector realized across the warp's lanes: the
+    // canonical (Vectorized, Warp) form. The for-type stays GPULane (loop
+    // structure, D1); the realization records where the vector lives so the
+    // unified recognizer (V2) keys on it. vectorize(x).gpu_lanes(x) collapses
+    // to the same thing (gpu_lanes wins the for-type and re-stamps Warp).
+    set_dim_realization(tx, Internal::GPUVectorScope::Warp);
     return *this;
 }
 

@@ -78,6 +78,7 @@ class Stage {
     std::vector<Var> dim_vars;
 
     void set_dim_type(const VarOrRVar &var, Internal::ForType t);
+    void set_dim_realization(const VarOrRVar &var, Internal::GPUVectorScope realization);
     void set_dim_device_api(const VarOrRVar &var, DeviceAPI device_api);
     void split(const std::string &old, const std::string &outer, const std::string &inner,
                const Expr &factor, bool exact, TailStrategy tail);
