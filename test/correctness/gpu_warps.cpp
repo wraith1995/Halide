@@ -68,10 +68,13 @@ int main(int argc, char **argv) {
                c.groups, c.threads_per_group, c.explicit_warps, per_block);
     }
 
-    // Shared-memory consumer: each warp group stages a tile into shared and reads a
-    // neighbour (x+1), forcing an intra-group barrier between the store and the read.
-    // A derived-size gpu_warps axis lowers as a thread sub-dimension (no guarded peel),
-    // so the standard pipeline inserts a correct whole-CTA barrier every lane reaches.
+    // Shared-memory consumer: the block cooperatively stages a tile into shared, then
+    // each thread reads its even-sibling's staged value ((x/2)*2 — affine, stays in the
+    // tile, no boundary or %2 bounds artifact), which forces a barrier between the store
+    // and the read. The block tile is partitioned across warp groups for the compute.
+    // Since a derived-size gpu_warps axis lowers as a thread sub-dimension (no guarded
+    // peel), the staging and the consume keep their thread loops at block level and the
+    // standard pipeline inserts a correct whole-CTA barrier that every lane reaches.
     {
         const int G = 2, T = 32, blocks = 4;
         const int per_block = G * T;
@@ -81,12 +84,11 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; i++) {
             in(i) = i * 3 + 5;
         }
-        Func in_b = BoundaryConditions::repeat_edge(in);
 
         Func staged("staged"), cons("cons");
-        Var x("x"), xo("xo"), xb("xb"), wg("wg"), tx("tx");
-        staged(x) = in_b(x);
-        cons(x) = staged(x) + staged(x + 1);
+        Var x("x"), xo("xo"), xb("xb"), wg("wg"), tx("tx"), swg("swg"), stx("stx");
+        staged(x) = in(x);
+        cons(x) = staged(x) + staged((x / 2) * 2);
 
         cons.compute_root()
             .split(x, xo, xb, per_block)
@@ -94,19 +96,24 @@ int main(int argc, char **argv) {
             .gpu_blocks(xo)
             .gpu_warps(wg)
             .gpu_threads(tx);
-        staged.compute_at(cons, wg).store_in(MemoryType::GPUShared).gpu_threads(x);
+        // Stage the whole block tile cooperatively, with the SAME group x thread layout.
+        staged.compute_at(cons, xo)
+            .store_in(MemoryType::GPUShared)
+            .split(x, swg, stx, T)
+            .gpu_warps(swg)
+            .gpu_threads(stx);
 
         Buffer<int> out = cons.realize({n}, target);
         out.copy_to_host();
         for (int i = 0; i < n; i++) {
-            int xp = (i + 1 < n) ? (i + 1) : (n - 1);  // repeat_edge
-            int correct = (i * 3 + 5) + (xp * 3 + 5);
+            int sib = (i / 2) * 2;
+            int correct = (i * 3 + 5) + (sib * 3 + 5);
             if (out(i) != correct) {
                 printf("gpu_warps shared-staging: out(%d) = %d instead of %d\n", i, out(i), correct);
                 return 1;
             }
         }
-        printf("gpu_warps shared-staging (stencil, %d groups x %d threads): OK\n", G, T);
+        printf("gpu_warps shared-staging (block tile, %d groups x %d threads): OK\n", G, T);
     }
 
     printf("Success!\n");
