@@ -1862,10 +1862,49 @@ public:
     }
 };
 
-// Convert a device warp-spec Fork into a flat 1D thread partition: branch g (a warp
-// group) runs on a contiguous, warp-aligned thread range [base_g, base_g+size_g),
-// summed across branches. Replaces the Fork with one gpu_thread loop of extent
-// Sum(size_g) on dim 0; ExtractBlockSize then reads that sum as blockDim.x.
+// Partition a block's flat thread-id space across an ordered list of warp groups
+// (`branches`): group g runs on a contiguous, warp-aligned range
+// [base_g, base_g+size_g), with base summed across the list (sum-between groups,
+// max-within a group via ThreadExtents). Each branch's gpu_thread loops are
+// reconstructed from (flat_id - base_g) and guarded to its range. Returns one
+// gpu_thread loop of extent Sum(size_g) on dim 0; ExtractBlockSize reads that sum
+// as blockDim.x.
+//
+// Source-agnostic by design (the Step-2 fuser redesign): the branch list may come
+// from an async Fork (role-asymmetric, different bodies) or — once gpu_warps lands —
+// a data-symmetric group split (identical bodies, different group index). The
+// per-group sizing/guard/flat-id math is identical for both; only how the branches
+// are produced differs.
+Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
+                           DeviceAPI device_api) {
+    const std::string ftid = unique_name("warp_flat") + gpu_thread_name(0);
+    Expr fv = Variable::make(Int(32), ftid);
+    Expr base = 0;
+    Stmt body;
+    for (const Stmt &branch : branches) {
+        ThreadExtents te;
+        branch.accept(&te);
+        Expr stride[3], maxe[3], prod = 1;
+        for (int i = 0; i < 3; i++) {
+            stride[i] = prod;
+            maxe[i] = te.extent[i].defined() ? te.extent[i] : Expr(1);
+            prod = simplify(prod * maxe[i]);
+        }
+        Expr size = simplify(((prod + (warp_size - 1)) / warp_size) * warp_size);  // warp-aligned group size
+        Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)(branch);
+        // Group range guard: only this group's warp range runs the branch (incl. its
+        // cross-group barriers), so per-edge barrier counts (= sum of two groups) hold.
+        fb = IfThenElse::make(fv >= base && fv < simplify(base + size), fb);
+        body = body.defined() ? Block::make(body, fb) : fb;
+        base = simplify(base + size);
+    }
+    // For stores an inclusive max; max = total-1 gives extent total.
+    return For::make(ftid, 0, simplify(base - 1), ForType::GPUThread,
+                     Partition::Never, device_api, body);
+}
+
+// Convert a device warp-spec Fork into a flat 1D thread partition by collecting its
+// branches and handing them to partition_warp_groups (the source-agnostic core).
 class FlattenWarpSpecForks : public IRMutator {
     DeviceAPI device_api = DeviceAPI::None;
     const int warp_size;
@@ -1895,30 +1934,7 @@ private:
     Stmt visit(const Fork *op) override {
         std::vector<Stmt> branches;
         flatten(op, branches);
-        const std::string ftid = unique_name("warp_flat") + gpu_thread_name(0);
-        Expr fv = Variable::make(Int(32), ftid);
-        Expr base = 0;
-        Stmt body;
-        for (const Stmt &branch : branches) {
-            ThreadExtents te;
-            branch.accept(&te);
-            Expr stride[3], maxe[3], prod = 1;
-            for (int i = 0; i < 3; i++) {
-                stride[i] = prod;
-                maxe[i] = te.extent[i].defined() ? te.extent[i] : Expr(1);
-                prod = simplify(prod * maxe[i]);
-            }
-            Expr size = simplify(((prod + (warp_size - 1)) / warp_size) * warp_size);  // warp-aligned group size
-            Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)(branch);
-            // Group range guard: only this group's warp range runs the branch (incl. its
-            // cross-group barriers), so per-edge barrier counts (= sum of two groups) hold.
-            fb = IfThenElse::make(fv >= base && fv < simplify(base + size), fb);
-            body = body.defined() ? Block::make(body, fb) : fb;
-            base = simplify(base + size);
-        }
-        // For stores an inclusive max; max = total-1 gives extent total.
-        return For::make(ftid, 0, simplify(base - 1), ForType::GPUThread,
-                         Partition::Never, device_api, body);
+        return partition_warp_groups(branches, warp_size, device_api);
     }
 };
 
