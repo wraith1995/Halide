@@ -44,6 +44,7 @@
 #include "LICM.h"
 #include "LoopCarry.h"
 #include "LowerParallelTasks.h"
+#include "LowerWarpGroupTiles.h"
 #include "LowerWarpShuffles.h"
 #include "Memoization.h"
 #include "OffloadGPULoops.h"
@@ -366,6 +367,12 @@ void lower_impl(const vector<Function> &output_funcs,
     s = vectorize_loops(s, env);
     s = simplify(s);
     log("Lowering after vectorizing:", s);
+
+    if (t.has_gpu_feature()) {
+        debug(1) << "Recognizing warp-group tile reduces (wgmma)...\n";
+        s = lower_warp_group_tiles(s, t);
+        log("Lowering after recognizing warp-group tile reduces:", s);
+    }
 
     if (t.has_gpu_feature() ||
         t.has_feature(Target::Vulkan)) {
