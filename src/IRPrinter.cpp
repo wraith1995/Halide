@@ -1145,6 +1145,10 @@ void IRPrinter::visit(const For *op) {
     if (op->realization != GPUVectorScope::Register) {
         stream << paren(op->realization == GPUVectorScope::Warp ? "<warp>" : "<warp_group>");
     }
+    // Only annotate a gpu_warps axis (warps_per_group >= 0), so existing dumps stay identical.
+    if (op->warps_per_group >= 0) {
+        stream << paren("<gpu_warps=" + std::to_string(op->warps_per_group) + ">");
+    }
     stream << paren(" (");
     stream << var(op->name) << paren(", ");
     print_no_parens(op->min);

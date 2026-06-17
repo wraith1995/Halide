@@ -472,7 +472,7 @@ std::pair<Serialize::Stmt, Offset<void>> Serializer::serialize_stmt(FlatBufferBu
                                                    max_serialized.first, max_serialized.second,
                                                    for_type, partition_policy, device_api,
                                                    body_serialized.first, body_serialized.second,
-                                                   realization)
+                                                   realization, for_stmt->warps_per_group)
                                   .Union());
     }
     case IRNodeType::Store: {
@@ -1256,7 +1256,7 @@ Offset<Serialize::Dim> Serializer::serialize_dim(FlatBufferBuilder &builder, con
     const auto dim_type_serialized = serialize_dim_type(dim.dim_type);
     const auto partition_policy_serialized = serialize_partition(dim.partition_policy);
     const auto realization_serialized = serialize_gpu_vector_scope(dim.realization);
-    return Serialize::CreateDim(builder, var_serialized, for_type_serialized, device_api_serialized, dim_type_serialized, partition_policy_serialized, realization_serialized);
+    return Serialize::CreateDim(builder, var_serialized, for_type_serialized, device_api_serialized, dim_type_serialized, partition_policy_serialized, realization_serialized, dim.warps_per_group);
 }
 
 Offset<Serialize::FuseLoopLevel> Serializer::serialize_fuse_loop_level(FlatBufferBuilder &builder, const FuseLoopLevel &fuse_loop_level) {

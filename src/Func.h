@@ -79,6 +79,7 @@ class Stage {
 
     void set_dim_type(const VarOrRVar &var, Internal::ForType t);
     void set_dim_realization(const VarOrRVar &var, Internal::GPUVectorScope realization);
+    void set_dim_warps_per_group(const VarOrRVar &var, int warps_per_group);
     void set_dim_device_api(const VarOrRVar &var, DeviceAPI device_api);
     void split(const std::string &old, const std::string &outer, const std::string &inner,
                const Expr &factor, bool exact, TailStrategy tail);
@@ -412,6 +413,13 @@ public:
     Stage &gpu_threads(const VarOrRVar &thread_x, const VarOrRVar &thread_y, const VarOrRVar &thread_z, DeviceAPI device_api = DeviceAPI::Default_GPU);
 
     Stage &gpu_lanes(const VarOrRVar &thread_x, DeviceAPI device_api = DeviceAPI::Default_GPU);
+
+    /** Mark a loop as a GPU warp-group work-distribution axis: its iterations
+     * are warp groups partitioned by SUM across the block (sit between
+     * gpu_blocks and gpu_threads). warps_per_group is the per-group warp count:
+     * 0 (default) derives it from the enclosed thread tile; an explicit N sets
+     * the wgmma collective scope. See research/gpu_warps_model.md. */
+    Stage &gpu_warps(const VarOrRVar &warp_group, int warps_per_group = 0, DeviceAPI device_api = DeviceAPI::Default_GPU);
 
     Stage &gpu_single_thread(DeviceAPI device_api = DeviceAPI::Default_GPU);
 
@@ -1949,6 +1957,13 @@ public:
      * permits lightweight communication of data from one lane to
      * another. */
     Func &gpu_lanes(const VarOrRVar &thread_x, DeviceAPI device_api = DeviceAPI::Default_GPU);
+
+    /** Mark a loop as a GPU warp-group work-distribution axis (a SUM partition
+     * of the block's warps, between gpu_blocks and gpu_threads). warps_per_group
+     * is the per-group warp count: 0 (default) derives it from the enclosed
+     * thread tile; an explicit N sets the wgmma collective scope. See
+     * research/gpu_warps_model.md. */
+    Func &gpu_warps(const VarOrRVar &warp_group, int warps_per_group = 0, DeviceAPI device_api = DeviceAPI::Default_GPU);
 
     /** Tell Halide to run this stage using a single gpu thread and
      * block. This is not an efficient use of your GPU, but it can be

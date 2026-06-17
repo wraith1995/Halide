@@ -426,6 +426,7 @@ struct Comparer {
                 cmp(&For::device_api);
                 cmp(&For::partition_policy);
                 cmp(&For::realization);
+                cmp(&For::warps_per_group);
                 cmp(&For::min);
                 cmp(&For::max);
                 cmp(&For::body);

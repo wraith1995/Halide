@@ -996,12 +996,21 @@ struct For : public StmtNode<For> {
      * Register, which preserves today's lowering. */
     GPUVectorScope realization = GPUVectorScope::Register;
 
+    /** If >= 0, this loop is a gpu_warps work-distribution axis: its iterations
+     * are warp groups, partitioned by SUM across the block's flat thread id
+     * (not max, like gpu_threads). The value is warps_per_group: 0 = derive the
+     * group's warp count from the enclosed thread tile, N>0 = N warps/group
+     * (the wgmma scope knob). -1 = not a gpu_warps axis (the default), which
+     * preserves today's lowering. See research/gpu_warps_model.md. */
+    int warps_per_group = -1;
+
     static Stmt make(const std::string &name,
                      Expr min, Expr max,
                      ForType for_type, Partition partition_policy,
                      DeviceAPI device_api,
                      Stmt body,
-                     GPUVectorScope realization = GPUVectorScope::Register);
+                     GPUVectorScope realization = GPUVectorScope::Register,
+                     int warps_per_group = -1);
 
     bool is_unordered_parallel() const {
         return Halide::Internal::is_unordered_parallel(for_type);

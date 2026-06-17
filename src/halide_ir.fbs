@@ -155,6 +155,7 @@ table For {
     device_api: DeviceAPI;
     body: Stmt;
     realization: GPUVectorScope;
+    warps_per_group: int = -1;
 }
 
 table ModulusRemainder {
@@ -580,6 +581,7 @@ table Dim {
     dim_type: DimType;
     partition_policy: Partition;
     realization: GPUVectorScope;
+    warps_per_group: int = -1;
 }
 
 enum LoopAlignStrategy: ubyte {

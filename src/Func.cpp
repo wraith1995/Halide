@@ -595,6 +595,27 @@ void Stage::set_dim_realization(const VarOrRVar &var, Internal::GPUVectorScope r
     }
 }
 
+void Stage::set_dim_warps_per_group(const VarOrRVar &var, int warps_per_group) {
+    definition.schedule().touched() = true;
+    bool found = false;
+    vector<Dim> &dims = definition.schedule().dims();
+    for (auto &dim : dims) {
+        if (dim_match(dim, var)) {
+            found = true;
+            dim.warps_per_group = warps_per_group;
+        }
+    }
+
+    if (!found) {
+        user_error << "In schedule for " << name()
+                   << ", could not find dimension "
+                   << var.name()
+                   << " to mark as a gpu_warps axis"
+                   << " in vars for function\n"
+                   << dump_argument_list();
+    }
+}
+
 std::string Stage::dump_argument_list() const {
     return dump_dim_list(definition.schedule().dims());
 }
@@ -1955,6 +1976,20 @@ Stage &Stage::gpu_lanes(const VarOrRVar &tx, DeviceAPI device_api) {
     return *this;
 }
 
+Stage &Stage::gpu_warps(const VarOrRVar &wg, int warps_per_group, DeviceAPI device_api) {
+    user_assert(warps_per_group >= 0)
+        << "gpu_warps warps_per_group must be >= 0 (0 = derive from the thread tile): "
+        << warps_per_group << "\n";
+    set_dim_device_api(wg, device_api);
+    // A gpu_warps axis sits in the thread tier (between blocks and threads); it
+    // reuses the GPUThread for-type for loop structure, and the warps_per_group
+    // marker (>= 0) tells the fuser to partition its iterations as warp groups by
+    // SUM rather than max. See research/gpu_warps_model.md.
+    set_dim_type(wg, ForType::GPUThread);
+    set_dim_warps_per_group(wg, warps_per_group);
+    return *this;
+}
+
 Stage &Stage::gpu_blocks(const VarOrRVar &bx, DeviceAPI device_api) {
     set_dim_device_api(bx, device_api);
     set_dim_type(bx, ForType::GPUBlock);
@@ -2847,6 +2882,12 @@ Func &Func::gpu_threads(const VarOrRVar &tx, const VarOrRVar &ty, const VarOrRVa
 Func &Func::gpu_lanes(const VarOrRVar &tx, DeviceAPI device_api) {
     invalidate_cache();
     Stage(func, func.definition(), 0).gpu_lanes(tx, device_api);
+    return *this;
+}
+
+Func &Func::gpu_warps(const VarOrRVar &wg, int warps_per_group, DeviceAPI device_api) {
+    invalidate_cache();
+    Stage(func, func.definition(), 0).gpu_warps(wg, warps_per_group, device_api);
     return *this;
 }
 

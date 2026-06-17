@@ -94,7 +94,7 @@ protected:
                 user_warning << "HL_PERMIT_FAILED_UNROLL is allowing us to unroll a non-constant loop into a serial loop. Did you mean to do this?\n";
                 body = mutate(body);
                 return For::make(op->name, op->min, op->max,
-                                 ForType::Serial, op->partition_policy, op->device_api, std::move(body), op->realization);
+                                 ForType::Serial, op->partition_policy, op->device_api, std::move(body), op->realization, op->warps_per_group);
             }
 
             user_assert(e)
@@ -104,7 +104,7 @@ protected:
             body = mutate(body);
 
             return For::make(op->name, op->min, (op->min + e) - 1,
-                             op->for_type, op->partition_policy, op->device_api, std::move(body), op->realization);
+                             op->for_type, op->partition_policy, op->device_api, std::move(body), op->realization, op->warps_per_group);
         } else {
             return IRMutator::visit(op);
         }

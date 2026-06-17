@@ -468,6 +468,14 @@ struct Dim {
      * research/gpu_resource_mapping_impl_plan.md (V0). */
     GPUVectorScope realization = GPUVectorScope::Register;
 
+    /** If >= 0, this dim is a gpu_warps work-distribution axis (a SUM partition
+     * of the block's warps; see For::warps_per_group). The value is
+     * warps_per_group: 0 = derive from the thread tile, N>0 = explicit. -1
+     * (default) = not a gpu_warps axis. Kept last (with realization) so
+     * positional aggregate initializers of Dim default it. See
+     * research/gpu_warps_model.md. */
+    int warps_per_group = -1;
+
     /** Can this loop be evaluated in any order (including in
      * parallel)? Equivalently, are there no data hazards between
      * evaluations of the Func at distinct values of this var? */

@@ -561,7 +561,7 @@ Stmt Deserializer::deserialize_stmt(Serialize::Stmt type_code, const void *stmt)
         const DeviceAPI device_api = deserialize_device_api(for_stmt->device_api());
         const auto body = deserialize_stmt(for_stmt->body_type(), for_stmt->body());
         const GPUVectorScope realization = deserialize_gpu_vector_scope(for_stmt->realization());
-        return For::make(name, min, max, for_type, partition_policy, device_api, body, realization);
+        return For::make(name, min, max, for_type, partition_policy, device_api, body, realization, for_stmt->warps_per_group());
     }
     case Serialize::Stmt::Store: {
         const auto *store_stmt = (const Serialize::Store *)stmt;
@@ -1167,6 +1167,7 @@ Dim Deserializer::deserialize_dim(const Serialize::Dim *dim) {
     hl_dim.dim_type = dim_type;
     hl_dim.partition_policy = partition_policy;
     hl_dim.realization = realization;
+    hl_dim.warps_per_group = dim->warps_per_group();
     return hl_dim;
 }
 
