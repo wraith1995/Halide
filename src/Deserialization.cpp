@@ -82,6 +82,8 @@ private:
 
     ForType deserialize_for_type(Serialize::ForType for_type);
 
+    GPUVectorScope deserialize_gpu_vector_scope(Serialize::GPUVectorScope scope);
+
     DeviceAPI deserialize_device_api(Serialize::DeviceAPI device_api);
 
     Partition deserialize_partition(Serialize::Partition partition);
@@ -215,6 +217,20 @@ ForType Deserializer::deserialize_for_type(Serialize::ForType for_type) {
     default:
         user_error << "unknown for type " << (int)for_type << "\n";
         return ForType::Serial;
+    }
+}
+
+GPUVectorScope Deserializer::deserialize_gpu_vector_scope(Serialize::GPUVectorScope scope) {
+    switch (scope) {
+    case Serialize::GPUVectorScope::Register:
+        return GPUVectorScope::Register;
+    case Serialize::GPUVectorScope::Warp:
+        return GPUVectorScope::Warp;
+    case Serialize::GPUVectorScope::WarpGroup:
+        return GPUVectorScope::WarpGroup;
+    default:
+        user_error << "unknown GPU vector scope " << (int)scope << "\n";
+        return GPUVectorScope::Register;
     }
 }
 
@@ -544,7 +560,8 @@ Stmt Deserializer::deserialize_stmt(Serialize::Stmt type_code, const void *stmt)
         const Partition partition_policy = deserialize_partition(for_stmt->partition_policy());
         const DeviceAPI device_api = deserialize_device_api(for_stmt->device_api());
         const auto body = deserialize_stmt(for_stmt->body_type(), for_stmt->body());
-        return For::make(name, min, max, for_type, partition_policy, device_api, body);
+        const GPUVectorScope realization = deserialize_gpu_vector_scope(for_stmt->realization());
+        return For::make(name, min, max, for_type, partition_policy, device_api, body, realization);
     }
     case Serialize::Stmt::Store: {
         const auto *store_stmt = (const Serialize::Store *)stmt;
@@ -1142,12 +1159,14 @@ Dim Deserializer::deserialize_dim(const Serialize::Dim *dim) {
     const auto device_api = deserialize_device_api(dim->device_api());
     const auto dim_type = deserialize_dim_type(dim->dim_type());
     const auto partition_policy = deserialize_partition(dim->partition_policy());
+    const auto realization = deserialize_gpu_vector_scope(dim->realization());
     auto hl_dim = Dim();
     hl_dim.var = var;
     hl_dim.for_type = for_type;
     hl_dim.device_api = device_api;
     hl_dim.dim_type = dim_type;
     hl_dim.partition_policy = partition_policy;
+    hl_dim.realization = realization;
     return hl_dim;
 }
 

@@ -985,11 +985,17 @@ struct For : public StmtNode<For> {
     Stmt body;
     Partition partition_policy;
 
+    /** Where a vectorized op in this loop is physically realized
+     * (registers / warp / warp group). Orthogonal to for_type; defaults to
+     * Register, which preserves today's lowering. */
+    GPUVectorScope realization = GPUVectorScope::Register;
+
     static Stmt make(const std::string &name,
                      Expr min, Expr max,
                      ForType for_type, Partition partition_policy,
                      DeviceAPI device_api,
-                     Stmt body);
+                     Stmt body,
+                     GPUVectorScope realization = GPUVectorScope::Register);
 
     bool is_unordered_parallel() const {
         return Halide::Internal::is_unordered_parallel(for_type);

@@ -419,7 +419,7 @@ Stmt build_loop_nest(
             const Dim &dim = stage_s.dims()[container.dim_idx];
             Expr min = Variable::make(Int(32), container.name + ".loop_min");
             Expr max = Variable::make(Int(32), container.name + ".loop_max");
-            stmt = For::make(container.name, min, max, dim.for_type, dim.partition_policy, dim.device_api, stmt);
+            stmt = For::make(container.name, min, max, dim.for_type, dim.partition_policy, dim.device_api, stmt, dim.realization);
         }
     }
 

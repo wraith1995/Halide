@@ -345,7 +345,8 @@ Stmt For::make(const std::string &name,
                Expr min, Expr max,
                ForType for_type, Partition partition_policy,
                DeviceAPI device_api,
-               Stmt body) {
+               Stmt body,
+               GPUVectorScope realization) {
     internal_assert(min.defined()) << "For of undefined\n";
     internal_assert(max.defined()) << "For of undefined\n";
     internal_assert(min.type() == Int(32)) << "For with non-integer min\n";
@@ -360,6 +361,7 @@ Stmt For::make(const std::string &name,
     node->partition_policy = partition_policy;
     node->device_api = device_api;
     node->body = std::move(body);
+    node->realization = realization;
     return node;
 }
 

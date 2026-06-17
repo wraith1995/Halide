@@ -129,7 +129,7 @@ class CanonicalizeGPUVars : public IRMutator {
             body.same_as(op->body)) {
             return op;
         } else {
-            return For::make(name, min, max, op->for_type, op->partition_policy, op->device_api, body);
+            return For::make(name, min, max, op->for_type, op->partition_policy, op->device_api, body, op->realization);
         }
     }
 

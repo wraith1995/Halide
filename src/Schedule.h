@@ -460,6 +460,14 @@ struct Dim {
     /** The strategy for loop partitioning. */
     Partition partition_policy;
 
+    /** Where a vectorized op on this loop is physically realized
+     * (registers / warp / warp group). Orthogonal to for_type; Register is
+     * the default and preserves today's behavior. Kept last among the data
+     * members so the positional aggregate initializers of Dim (which omit it)
+     * fall back to this default. See
+     * research/gpu_resource_mapping_impl_plan.md (V0). */
+    GPUVectorScope realization = GPUVectorScope::Register;
+
     /** Can this loop be evaluated in any order (including in
      * parallel)? Equivalently, are there no data hazards between
      * evaluations of the Func at distinct values of this var? */

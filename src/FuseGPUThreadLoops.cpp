@@ -417,7 +417,7 @@ protected:
 
         return For::make(op->name, new_min, new_max,
                          op->for_type, op->partition_policy,
-                         op->device_api, body);
+                         op->device_api, body, op->realization);
     }
 
     Stmt visit(const Block *op) override {
@@ -1106,7 +1106,7 @@ protected:
                 allocations.swap(old);
             }
 
-            return For::make(op->name, mutate(op->min), mutate(op->max), op->for_type, op->partition_policy, op->device_api, body);
+            return For::make(op->name, mutate(op->min), mutate(op->max), op->for_type, op->partition_policy, op->device_api, body, op->realization);
         }
     }
 
@@ -1443,7 +1443,7 @@ protected:
             if (body.same_as(op->body)) {
                 return op;
             } else {
-                return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body);
+                return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization);
             }
         } else {
             return IRMutator::visit(op);
@@ -1523,7 +1523,7 @@ protected:
             internal_assert(op);
             Expr adjusted = Variable::make(Int(32), op->name) + op->min;
             Stmt body = substitute(op->name, adjusted, op->body);
-            stmt = For::make(op->name, 0, simplify(op->max - op->min), op->for_type, op->partition_policy, op->device_api, body);
+            stmt = For::make(op->name, 0, simplify(op->max - op->min), op->for_type, op->partition_policy, op->device_api, body, op->realization);
         }
         return stmt;
     }
@@ -1570,7 +1570,7 @@ protected:
         }
 
         return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api,
-                         IfThenElse::make(condition, op->body, Stmt()));
+                         IfThenElse::make(condition, op->body, Stmt()), op->realization);
     }
 
 public:

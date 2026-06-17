@@ -1140,7 +1140,12 @@ void IRPrinter::visit(const ProducerConsumer *op) {
 void IRPrinter::visit(const For *op) {
     ScopedBinding<> bind(known_type, op->name);
     paren_depth++;
-    stream << get_indent() << paren(op->for_type) << type(op->device_api) << paren(" (");
+    stream << get_indent() << paren(op->for_type) << type(op->device_api);
+    // Only annotate a non-default realization, so existing dumps stay identical.
+    if (op->realization != GPUVectorScope::Register) {
+        stream << paren(op->realization == GPUVectorScope::Warp ? "<warp>" : "<warp_group>");
+    }
+    stream << paren(" (");
     stream << var(op->name) << paren(", ");
     print_no_parens(op->min);
     stream << paren(", ");

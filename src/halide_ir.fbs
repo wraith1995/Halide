@@ -86,6 +86,12 @@ enum ForType: byte {
     GPULane,
 }
 
+enum GPUVectorScope: byte {
+    Register,
+    Warp,
+    WarpGroup,
+}
+
 enum Partition: byte {
     Auto,
     Never,
@@ -148,6 +154,7 @@ table For {
     partition_policy: Partition;
     device_api: DeviceAPI;
     body: Stmt;
+    realization: GPUVectorScope;
 }
 
 table ModulusRemainder {
@@ -572,6 +579,7 @@ table Dim {
     device_api: DeviceAPI;
     dim_type: DimType;
     partition_policy: Partition;
+    realization: GPUVectorScope;
 }
 
 enum LoopAlignStrategy: ubyte {

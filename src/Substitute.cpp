@@ -94,7 +94,7 @@ public:
             new_body.same_as(op->body)) {
             return op;
         } else {
-            return For::make(op->name, new_min, new_max, op->for_type, op->partition_policy, op->device_api, new_body);
+            return For::make(op->name, new_min, new_max, op->for_type, op->partition_policy, op->device_api, new_body, op->realization);
         }
     }
 };

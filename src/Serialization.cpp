@@ -58,6 +58,8 @@ private:
 
     Serialize::ForType serialize_for_type(const ForType &for_type);
 
+    Serialize::GPUVectorScope serialize_gpu_vector_scope(const GPUVectorScope &scope);
+
     Serialize::DeviceAPI serialize_device_api(const DeviceAPI &device_api);
 
     Serialize::Partition serialize_partition(const Partition &partition);
@@ -185,6 +187,20 @@ Serialize::ForType Serializer::serialize_for_type(const ForType &for_type) {
     default:
         user_error << "Unsupported for type\n";
         return Serialize::ForType::Serial;
+    }
+}
+
+Serialize::GPUVectorScope Serializer::serialize_gpu_vector_scope(const GPUVectorScope &scope) {
+    switch (scope) {
+    case GPUVectorScope::Register:
+        return Serialize::GPUVectorScope::Register;
+    case GPUVectorScope::Warp:
+        return Serialize::GPUVectorScope::Warp;
+    case GPUVectorScope::WarpGroup:
+        return Serialize::GPUVectorScope::WarpGroup;
+    default:
+        user_error << "Unsupported GPU vector scope\n";
+        return Serialize::GPUVectorScope::Register;
     }
 }
 
@@ -449,12 +465,14 @@ std::pair<Serialize::Stmt, Offset<void>> Serializer::serialize_stmt(FlatBufferBu
         const Serialize::Partition partition_policy = serialize_partition(for_stmt->partition_policy);
         const Serialize::DeviceAPI device_api = serialize_device_api(for_stmt->device_api);
         const auto body_serialized = serialize_stmt(builder, for_stmt->body);
+        const Serialize::GPUVectorScope realization = serialize_gpu_vector_scope(for_stmt->realization);
         return std::make_pair(Serialize::Stmt::For,
                               Serialize::CreateFor(builder, name_serialized,
                                                    min_serialized.first, min_serialized.second,
                                                    max_serialized.first, max_serialized.second,
                                                    for_type, partition_policy, device_api,
-                                                   body_serialized.first, body_serialized.second)
+                                                   body_serialized.first, body_serialized.second,
+                                                   realization)
                                   .Union());
     }
     case IRNodeType::Store: {
@@ -1237,7 +1255,8 @@ Offset<Serialize::Dim> Serializer::serialize_dim(FlatBufferBuilder &builder, con
     const auto device_api_serialized = serialize_device_api(dim.device_api);
     const auto dim_type_serialized = serialize_dim_type(dim.dim_type);
     const auto partition_policy_serialized = serialize_partition(dim.partition_policy);
-    return Serialize::CreateDim(builder, var_serialized, for_type_serialized, device_api_serialized, dim_type_serialized, partition_policy_serialized);
+    const auto realization_serialized = serialize_gpu_vector_scope(dim.realization);
+    return Serialize::CreateDim(builder, var_serialized, for_type_serialized, device_api_serialized, dim_type_serialized, partition_policy_serialized, realization_serialized);
 }
 
 Offset<Serialize::FuseLoopLevel> Serializer::serialize_fuse_loop_level(FlatBufferBuilder &builder, const FuseLoopLevel &fuse_loop_level) {

@@ -427,6 +427,20 @@ enum class ForType {
     GPULane,
 };
 
+/** Where a vectorized op is physically realized on a GPU. Orthogonal to
+ * ForType (which describes loop structure): a loop may be Vectorized and,
+ * separately, carry a realization that says whether the vector lives in one
+ * thread's registers, across a warp's lanes, or across a warp group's
+ * threads. Register is today's behavior and the default. One matcher reads a
+ * vectorized op and selects the collective instruction by
+ * (op-kind x realization x target); the realization is never an instruction
+ * directive. See research/gpu_collective_vectorization.md. */
+enum class GPUVectorScope {
+    Register,   // in one thread's registers (today: ld/st.v4, dp4a, cp.async, fma)
+    Warp,       // across a warp's lanes (shfl, redux, ldmatrix, mma.sync)
+    WarpGroup,  // across a warp group's threads (wgmma, tcgen05)
+};
+
 /** Check if for_type executes for loop iterations in parallel and unordered. */
 bool is_unordered_parallel(ForType for_type);
 

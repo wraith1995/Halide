@@ -206,7 +206,8 @@ Stmt IRMutator::visit(const For *op) {
         return op;
     }
     return For::make(op->name, std::move(min), std::move(max),
-                     op->for_type, op->partition_policy, op->device_api, std::move(body));
+                     op->for_type, op->partition_policy, op->device_api, std::move(body),
+                     op->realization);
 }
 
 Stmt IRMutator::visit(const Store *op) {
