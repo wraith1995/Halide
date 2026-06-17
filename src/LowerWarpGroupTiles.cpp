@@ -118,6 +118,30 @@ Expr frag_col_n(const Expr &lane, int i) {
     return (l % 4) * 2 + (i % 2) + 8 * (i / 4);
 }
 
+// Collect the output buffer's per-dimension stride expressions from a (lets-resolved)
+// store index: the index is built from `_halide_buffer_get_stride(buf, d)` terms, so we
+// pick them up by dimension. The epilogue rewrite multiplies the fragment's tile-local
+// (m,n) by these to flatten to the global output offset (so M/N tiling + arbitrary
+// output strides Just Work; dim-0 defaults to 1 when it is folded away as contiguous).
+class StrideCollector : public IRVisitor {
+    using IRVisitor::visit;
+    void visit(const Call *op) override {
+        if (op->name.find("buffer_get_stride") != std::string::npos && op->args.size() == 2) {
+            if (auto d = as_const_int(op->args[1])) {
+                strides[(int)*d] = Expr(op);
+            }
+        }
+        IRVisitor::visit(op);
+    }
+
+public:
+    std::map<int, Expr> strides;
+    Expr dim(int d) const {
+        auto it = strides.find(d);
+        return it == strides.end() ? Expr(1) : it->second;
+    }
+};
+
 // Rewrite recognized WarpGroup tile reduces into the wgmma collective: each of
 // the (unrolled) per-thread reduce stores becomes a store of one wgmma fragment
 // register to the global slot the hardware map assigns, at a NON-AFFINE index
@@ -132,11 +156,31 @@ class RewriteWarpGroupTiles : public IRMutator {
     int frag_index = 0;
     std::map<std::string, Expr> lets;
 
+    // The output-tile epilogue base + strides, captured once per group from the first
+    // (frag 0) store: out_base = the block tile corner (store index with the thread/warp
+    // vars zeroed -> keeps the gpu_blocks offset + mins), out_stride_{m,n} = the output
+    // buffer strides. The fragment store index is then out_base + frag_row_m*stride_m +
+    // frag_col_n*stride_n -- so M/N output tiling over gpu_blocks Just Works.
+    bool out_captured = false;
+    Expr out_base, out_stride_m, out_stride_n;
+
     Stmt visit(const LetStmt *op) override {
         lets[op->name] = op->value;
         Stmt s = IRMutator::visit(op);
         lets.erase(op->name);
         return s;
+    }
+
+    // Fully expand CSE'd lets in an expr.
+    Expr resolve_lets(Expr e) {
+        for (int it = 0; it < 64; it++) {
+            Expr prev = e;
+            e = substitute(lets, e);
+            if (e.same_as(prev)) {
+                break;
+            }
+        }
+        return e;
     }
 
     // The shared element offset of the operand tile at vector lane `lane` (k=lane),
@@ -146,13 +190,7 @@ class RewriteWarpGroupTiles : public IRMutator {
     // K>16 accumulation -- the vectorized k tile is a core-matrix gather, so the chunk
     // stride is the affine address delta over 16 k-steps).
     Expr tile_origin_at_lane(Expr base, int lane) {
-        for (int iter = 0; iter < 32; iter++) {
-            Expr prev = base;
-            base = substitute(lets, base);
-            if (base.same_as(prev)) {
-                break;
-            }
-        }
+        base = resolve_lets(base);
         Expr z = simplify(ZeroVars().run(simplify(base)));
         if (z.type().lanes() > 1) {
             z = extract_lane(z, lane);
@@ -172,7 +210,8 @@ class RewriteWarpGroupTiles : public IRMutator {
                 group_var = op->name;
                 warps_per_group = op->warps_per_group;
                 is_group = true;
-                frag_index = 0;  // reset the fragment register counter per group
+                frag_index = 0;       // reset the fragment register counter per group
+                out_captured = false;  // re-capture the epilogue base/strides per group
             } else {
                 thread_var = op->name;
             }
@@ -216,7 +255,8 @@ class RewriteWarpGroupTiles : public IRMutator {
                      << " -> wgmma frag, buffer=" << op->name
                      << ", reduce_k=" << reduce_k << " n_chunks=" << n_chunks << "\n"
                      << "    A=" << a.buffer << " idx=" << a.base_index << "\n"
-                     << "    B=" << b.buffer << " idx=" << b.base_index << "\n";
+                     << "    B=" << b.buffer << " idx=" << b.base_index << "\n"
+                     << "    out store idx=" << simplify(resolve_lets(op->index)) << "\n";
         }
         int i = frag_index++;
         if (i >= 8) {
@@ -248,11 +288,29 @@ class RewriteWarpGroupTiles : public IRMutator {
                                {i, n_chunks, load_a, stride_a, load_b, stride_b},
                                Call::Intrinsic);
 
-        // The index: the global slot the hardware map assigns to (lane, reg i).
-        // M0 ASSUMPTION (single block at origin, dense 64x16 output, m
-        // contiguous): C offset = m + n*64. Generalize later by reading the
-        // output strides + block/min from the original store index.
-        Expr index = simplify(frag_row_m(lane, i) + frag_col_n(lane, i) * 64);
+        // Capture the output-tile epilogue base + strides once per group (frag 0 is the
+        // store whose natural in-tile offset is 0 at the zeroed thread var, so zeroing the
+        // thread/warp vars leaves exactly the block tile corner + buffer mins). The strides
+        // come straight off the output buffer, so M/N tiling over gpu_blocks + arbitrary
+        // output strides are handled by construction.
+        if (!out_captured) {
+            Expr ri = resolve_lets(op->index);
+            StrideCollector sc;
+            ri.accept(&sc);
+            out_stride_m = sc.dim(0);
+            out_stride_n = sc.dim(1);
+            out_base = simplify(substitute(thread_var, make_zero(Int(32)),
+                                           substitute(group_var, make_zero(Int(32)), ri)));
+            out_captured = true;
+        }
+
+        // The index: the hardware (m,n) the fragment map assigns to (lane, reg i),
+        // tile-local, flattened through the output strides and offset to the block tile
+        // corner. (Single tile at origin, dense m-contiguous output -> frag_row_m +
+        // frag_col_n*stride_n, matching the M0 form with stride_n = the output's M.)
+        Expr index = simplify(out_base +
+                              frag_row_m(lane, i) * out_stride_m +
+                              frag_col_n(lane, i) * out_stride_n);
 
         return Store::make(op->name, frag, index, op->param, const_true(),
                            ModulusRemainder());
