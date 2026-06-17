@@ -84,6 +84,17 @@ protected:
     void codegen_vector_reduce(const VectorReduce *op, const Expr &init) override;
     // @}
 
+    /** Emit one Hopper wgmma.mma_async (m64n16k16, fp16->f32) for the M0 WarpGroup tile
+     * reduce: accumulate the product of the shared tiles described by desc_a/desc_b into the
+     * 8 per-thread f32 accumulator registers (acc, read-modify-write). scale_d selects
+     * accumulate (true, k>0) vs overwrite (false, k==0). Emitted as inline PTX asm (no LLVM
+     * intrinsic exists); the caller wraps the k-loop in wgmma.fence / commit_group /
+     * wait_group. Returns the updated {8 x f32} accumulator. See research/gpu_recognizer_design.md
+     * §5a. NOTE: M0 scaffold; the fragment lane<->element map + descriptor bits are confirmed
+     * against the f64 oracle on H100. */
+    llvm::Value *emit_wgmma_m64n16k16(llvm::Value *acc, llvm::Value *desc_a,
+                                      llvm::Value *desc_b, bool scale_d);
+
     // P1: set when a cp.async copy (vectorized global->shared) was emitted since the last
     // gpu_thread_barrier, so the barrier commits + waits for it (synchronous cp.async).
     bool emitted_cp_async = false;
@@ -612,6 +623,42 @@ class RewriteLoadsAs32Bit : public IRMutator {
         }
     }
 };
+
+llvm::Value *CodeGen_PTX_Dev::emit_wgmma_m64n16k16(llvm::Value *acc, llvm::Value *desc_a,
+                                                   llvm::Value *desc_b, bool scale_d) {
+    // The per-thread accumulator fragment is {f32 x 8} (m64n16k16 f32 -> N/2 = 8 regs/thread).
+    llvm::Type *f32 = llvm::Type::getFloatTy(*context);
+    llvm::Type *i64 = llvm::Type::getInt64Ty(*context);
+    llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(8, f32));
+
+    // wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 {d0..d7}, descA, descB, scaleD, 1, 1, 0, 0;
+    // 8 read-modify-write f32 accumulators (outputs $0..$7 tied to inputs), descA=$16, descB=$17.
+    const std::string scale = scale_d ? "1" : "0";
+    const std::string asm_str =
+        "wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 "
+        "{$0,$1,$2,$3,$4,$5,$6,$7}, $16, $17, " +
+        scale + ", 1, 1, 0, 0;";
+    const std::string constraints =
+        "=f,=f,=f,=f,=f,=f,=f,=f,"  // 8 outputs: the updated accumulators
+        "0,1,2,3,4,5,6,7,"          // tied inputs: the prior accumulators (read-modify-write)
+        "l,l";                      // descA, descB (64-bit shared matrix descriptors)
+
+    std::vector<llvm::Type *> arg_tys(8, f32);
+    arg_tys.push_back(i64);
+    arg_tys.push_back(i64);
+    llvm::FunctionType *fn_ty = llvm::FunctionType::get(acc_ty, arg_tys, false);
+    // wgmma has side effects (mutates the async accumulator state) -> must not be DCE'd/reordered.
+    llvm::InlineAsm *ia = llvm::InlineAsm::get(fn_ty, asm_str, constraints, /*hasSideEffects*/ true);
+
+    std::vector<llvm::Value *> args;
+    args.reserve(10);
+    for (int i = 0; i < 8; i++) {
+        args.push_back(builder->CreateExtractValue(acc, i));
+    }
+    args.push_back(desc_a);
+    args.push_back(desc_b);
+    return builder->CreateCall(ia, args);
+}
 
 void CodeGen_PTX_Dev::codegen_vector_reduce(const VectorReduce *op, const Expr &init) {
     // Unified collective recognizer, reduce family: decompose on the vector's realization
