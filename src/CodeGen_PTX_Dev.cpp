@@ -309,26 +309,33 @@ void CodeGen_PTX_Dev::init_module() {
 }
 
 void CodeGen_PTX_Dev::visit(const Call *op) {
-    if (op->is_intrinsic() && op->name == "wgmma_m64n16k16_f32") {
-        // Hopper tile reduce, emitted by lower_warp_group_tiles. Args:
-        // [reg_index (0..7), n_chunks, Load(A_shared, base), strideA, Load(B_shared, base),
-        // strideB]. The contraction is K = n_chunks*16; each chunk is one wgmma.mma_async,
-        // all accumulating into the same {f32 x 8} D fragment (scaleD carry). The collective
-        // is emitted ONCE per kernel (all 8 per-thread fragment calls extract from the cached
-        // accumulator). See gpu_recognizer_design.md S5b.
-        internal_assert(op->args.size() == 6)
-            << "wgmma_m64n16k16_f32 expects (reg, n_chunks, LoadA, strideA, LoadB, strideB)\n";
-        auto reg = as_const_int(op->args[0]);
-        auto n_chunks = as_const_int(op->args[1]);
-        const Load *la = op->args[2].as<Load>();
-        auto stride_a = as_const_int(op->args[3]);
-        const Load *lb = op->args[4].as<Load>();
-        auto stride_b = as_const_int(op->args[5]);
+    if (op->is_intrinsic() && (op->name == "wgmma_m64n16k16_f32" ||
+                               op->name == "wgmma_m64n16k16_f32_frag8")) {
+        // Hopper tile reduce, emitted by lower_warp_group_tiles. Two forms share the same
+        // emit; they differ only in how the cached {f32 x 8} D fragment is returned:
+        //   scalar "wgmma_m64n16k16_f32"      (reg, n_chunks, LoadA, strideA, LoadB, strideB)
+        //                                      -> extract one fragment register (unroll path).
+        //   vector "wgmma_m64n16k16_f32_frag8"(n_chunks, LoadA, strideA, LoadB, strideB)
+        //                                      -> the whole fragment as a <8 x f32> vector
+        //                                         (vector-native path; PROTOTYPE for 1.x).
+        // K = n_chunks*16; each chunk is one wgmma.mma_async accumulating into the same D
+        // (scaleD carry). The collective is emitted ONCE per kernel. See §5b/§5c.
+        bool vec = (op->name == "wgmma_m64n16k16_f32_frag8");
+        int b = vec ? 0 : 1;  // arg base: scalar form has reg at [0]
+        internal_assert(op->args.size() == (vec ? 5u : 6u))
+            << "wgmma_m64n16k16_f32 arg count mismatch\n";
+        auto reg = vec ? std::optional<int64_t>(0) : as_const_int(op->args[0]);
+        auto n_chunks = as_const_int(op->args[b + 0]);
+        const Load *la = op->args[b + 1].as<Load>();
+        auto stride_a = as_const_int(op->args[b + 2]);
+        const Load *lb = op->args[b + 3].as<Load>();
+        auto stride_b = as_const_int(op->args[b + 4]);
         internal_assert(reg && n_chunks && la && stride_a && lb && stride_b)
-            << "wgmma_m64n16k16_f32 args must be (const int, const int, Load, const int, Load, const int)\n";
+            << "wgmma_m64n16k16_f32 args malformed\n";
         if (getenv("HL_DEBUG_WGMMA")) {
-            debug(0) << "[wgtile] codegen wgmma frag reg=" << *reg << " n_chunks=" << *n_chunks
-                     << " strideA=" << *stride_a << " strideB=" << *stride_b << "\n";
+            debug(0) << "[wgtile] codegen wgmma " << (vec ? "frag8(vec)" : "reg")
+                     << " n_chunks=" << *n_chunks << " strideA=" << *stride_a
+                     << " strideB=" << *stride_b << "\n";
         }
 
         if (cached_wgmma_acc == nullptr) {
@@ -374,7 +381,20 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
             cached_wgmma_acc = acc;
         }
-        value = builder->CreateExtractValue(cached_wgmma_acc, (unsigned)*reg);
+        if (vec) {
+            // Vector-native: return the whole fragment as a <8 x f32>. The recognizer stores
+            // it with an 8-lane non-affine scatter index (one vector op, no unroll/reconstruct);
+            // codegen scalarizes the scatter to 8 st.global at the hardware fragment positions.
+            llvm::Type *f32 = llvm::Type::getFloatTy(*context);
+            llvm::Value *v = llvm::UndefValue::get(llvm::FixedVectorType::get(f32, 8));
+            for (int j = 0; j < 8; j++) {
+                v = builder->CreateInsertElement(v, builder->CreateExtractValue(cached_wgmma_acc, j),
+                                                 (uint64_t)j);
+            }
+            value = v;
+        } else {
+            value = builder->CreateExtractValue(cached_wgmma_acc, (unsigned)*reg);
+        }
         return;
     }
 

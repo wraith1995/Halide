@@ -315,10 +315,6 @@ class RewriteWarpGroupTiles : public IRMutator {
                                  Buffer<>(), Parameter(), const_true(), ModulusRemainder());
         Expr load_b = Load::make(b.elem_type, b.buffer, base_b,
                                  Buffer<>(), Parameter(), const_true(), ModulusRemainder());
-        Expr frag = Call::make(op->value.type(), "wgmma_m64n16k16_f32",
-                               {i, n_chunks, load_a, stride_a, load_b, stride_b},
-                               Call::Intrinsic);
-
         // Capture the output-tile epilogue base + strides once per group (frag 0 is the
         // store whose natural in-tile offset is 0 at the zeroed thread var, so zeroing the
         // thread/warp vars leaves exactly the block tile corner + buffer mins). The strides
@@ -335,15 +331,37 @@ class RewriteWarpGroupTiles : public IRMutator {
             out_captured = true;
         }
 
-        // The index: the hardware (m,n) the fragment map assigns to (lane, reg i),
-        // tile-local, flattened through the output strides and offset to the block tile
-        // corner. (Single tile at origin, dense m-contiguous output -> frag_row_m +
-        // frag_col_n*stride_n, matching the M0 form with stride_n = the output's M.)
-        Expr index = simplify(out_base +
-                              frag_row_m(lane, i) * out_stride_m +
-                              frag_col_n(lane, i) * out_stride_n);
+        // The global slot the hardware fragment map assigns to (lane, reg f): the tile-local
+        // hardware (m,n), flattened through the output strides + offset to the block tile corner.
+        auto frag_slot = [&](int f) {
+            return simplify(out_base + frag_row_m(lane, f) * out_stride_m +
+                            frag_col_n(lane, f) * out_stride_n);
+        };
 
-        return Store::make(op->name, frag, index, op->param, const_true(),
+        // PROTOTYPE (1.x, HL_WGMMA_VECFRAG): the vector-native form -- emit the whole fragment
+        // as ONE width-8 vector store with a non-affine per-lane scatter index, so we lower a
+        // single vector group instead of reconstructing the tile from 8 unrolled scalar stores.
+        // Codegen scalarizes the scatter to 8 st.global at the hardware fragment positions.
+        if (getenv("HL_WGMMA_VECFRAG")) {
+            if (i > 0) {
+                return Evaluate::make(0);  // the other 7 frags are folded into the frag-0 vector store
+            }
+            Expr frag_vec = Call::make(op->value.type().with_lanes(8), "wgmma_m64n16k16_f32_frag8",
+                                       {n_chunks, load_a, stride_a, load_b, stride_b}, Call::Intrinsic);
+            std::vector<Expr> idx_lanes;
+            for (int f = 0; f < 8; f++) {
+                idx_lanes.push_back(frag_slot(f));
+            }
+            Expr index_vec = Shuffle::make_concat(idx_lanes);
+            return Store::make(op->name, frag_vec, index_vec, op->param, const_true(8),
+                               ModulusRemainder());
+        }
+
+        // Default (scalar) path: register i of the fragment, one scalar store per unrolled frag.
+        Expr frag = Call::make(op->value.type(), "wgmma_m64n16k16_f32",
+                               {i, n_chunks, load_a, stride_a, load_b, stride_b},
+                               Call::Intrinsic);
+        return Store::make(op->name, frag, frag_slot(i), op->param, const_true(),
                            ModulusRemainder());
     }
 
