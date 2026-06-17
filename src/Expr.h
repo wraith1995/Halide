@@ -490,6 +490,21 @@ enum class GPUVectorScope {
     WarpGroup,  // across a warp group's threads (wgmma, tcgen05)
 };
 
+/** The set of threads that must rendezvous at a synchronization point. A
+ * schedule-derived, target-independent property (the same thread -> warp ->
+ * warp-group -> block -> cluster ladder as GPUVectorScope / the gpu_warps and
+ * gpu_clusters tiers). A SyncRequirement carries a SyncScope; the mechanism
+ * (whole-CTA barrier / named barrier / mbarrier / cluster barrier / ...) is
+ * matched from (scope x target x situation), never directed. A coarser scope's
+ * mechanism may satisfy a finer requirement when every thread of the coarser
+ * scope reaches it. See research/gpu_sync_model.md. */
+enum class SyncScope {
+    Warp,       // lanes of one warp (often implicit / __syncwarp)
+    WarpGroup,  // warps of one gpu_warps group (partial/named barrier)
+    Block,      // the whole CTA (today's __syncthreads)
+    Cluster,    // CTAs of a cluster, sm_90+ (cluster barrier / DSMEM)
+};
+
 /** Check if for_type executes for loop iterations in parallel and unordered. */
 bool is_unordered_parallel(ForType for_type);
 

@@ -1292,8 +1292,13 @@ protected:
     }
 
     Stmt make_barrier(int mask) {
-        return Evaluate::make(Call::make(Int(32), Call::gpu_thread_barrier,
-                                         {IntImm::make(Int(32), mask)},
+        // Emit a target-independent Block-scope synchronization requirement (the
+        // produce/consume dependency spans the whole CTA here). lower_sync_requirements
+        // picks the mechanism — today a whole-CTA gpu_thread_barrier, byte-identical to
+        // emitting it directly. See research/gpu_sync_model.md.
+        return Evaluate::make(Call::make(Int(32), Call::sync_requirement,
+                                         {IntImm::make(Int(32), (int)SyncScope::Block),
+                                          IntImm::make(Int(32), mask)},
                                          Call::Intrinsic));
     }
 
@@ -2270,6 +2275,38 @@ public:
     }
 };
 
+// Lower the target-independent sync_requirement markers (emitted by the barrier
+// analysis) to concrete barrier mechanisms, by (scope x target). Today only Block
+// scope is emitted, lowered to a whole-CTA gpu_thread_barrier — byte-identical to
+// emitting the barrier directly. Finer scopes (WarpGroup named barriers, Cluster
+// barriers, async mbarrier) slot in here as the sync model grows; the requirement
+// (who/where/what-memory) stays portable and codegen never sees a sync_requirement.
+// See research/gpu_sync_model.md.
+class LowerSyncRequirements : public IRMutator {
+    using IRMutator::visit;
+
+    Expr visit(const Call *op) override {
+        if (op->is_intrinsic(Call::sync_requirement)) {
+            internal_assert(op->args.size() == 2)
+                << "sync_requirement expects (scope, fence).\n";
+            auto scope = as_const_int(op->args[0]);
+            internal_assert(scope) << "sync_requirement scope must be a constant.\n";
+            switch ((SyncScope)*scope) {
+            case SyncScope::Block:
+                // Whole-CTA barrier; every GPU backend lowers gpu_thread_barrier.
+                return Call::make(Int(32), Call::gpu_thread_barrier,
+                                  {mutate(op->args[1])}, Call::Intrinsic);
+            default:
+                internal_error
+                    << "lower_sync_requirements: SyncScope " << *scope
+                    << " not yet handled by the mechanism selector.\n";
+                return op;
+            }
+        }
+        return IRMutator::visit(op);
+    }
+};
+
 }  // namespace
 
 Stmt inject_gpu_warp_specialization(Stmt s, const std::map<std::string, Function> &env) {
@@ -2287,6 +2324,9 @@ Stmt fuse_gpu_thread_loops(Stmt s, const Target &t) {
     s = NormalizeIfStatements()(s);
     s = FuseGPUThreadLoops(t.warp_size())(s);
     s = ZeroGPULoopMins()(s);
+    // Lower the schedule-derived sync_requirement markers to concrete barriers
+    // (scope x target). Block scope -> whole-CTA gpu_thread_barrier today.
+    s = LowerSyncRequirements()(s);
     return s;
 }
 

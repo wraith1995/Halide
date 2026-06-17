@@ -761,6 +761,13 @@ struct Call : public ExprNode<Call> {
         strict_sub,
         // Convert a list of Exprs to a string
         stringify,
+        // A target-independent synchronization requirement, lowered to a concrete
+        // barrier mechanism by lower_sync_requirements (scope x target x situation):
+        // sync_requirement(scope, fence) where scope is a SyncScope (Warp/WarpGroup/
+        // Block/Cluster) and fence is a CodeGen_GPU_Dev::MemoryFenceType mask. The
+        // schedule-derived "who must rendezvous, where, over what memory"; never
+        // reaches codegen. See research/gpu_sync_model.md.
+        sync_requirement,
         // Query properties of the compiled-for target (resolved at compile-time)
         target_arch_is,
         target_bits,
