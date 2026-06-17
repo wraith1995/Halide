@@ -104,10 +104,15 @@ protected:
     // Reset per add_kernel. See research/gpu_recognizer_design.md S5b.
     llvm::Value *cached_wgmma_acc = nullptr;
 
-    /** Build a 64-bit Hopper wgmma shared matrix descriptor for the shared
-     * allocation `buffer`. M0 first-guess encoding (address only; LBO/SBO/
-     * swizzle pinned on H100). */
-    llvm::Value *build_wgmma_descriptor(const std::string &buffer, Type elem_type);
+    /** Build a 64-bit Hopper wgmma shared matrix descriptor for the operand tile
+     * at `tile_origin` (element index) within shared allocation `buffer`. The
+     * start-address field is the tile's shared-window byte offset (the addrspace(3)
+     * pointer is the offset directly; dynamic shared starts at 0). lbo_bytes /
+     * sbo_bytes are the leading- / stride-dimension byte offsets of the core-matrix
+     * layout (M0 first guesses, pinned against the f64 oracle on H100). swizzle=0
+     * (no swizzle) for M0. See research/gpu_recognizer_design.md S5b. */
+    llvm::Value *build_wgmma_descriptor(const std::string &buffer, Type elem_type,
+                                        const Expr &tile_origin, int lbo_bytes, int sbo_bytes);
 
     /** Apply a shared-memory bank-conflict swizzle (recorded per allocation in
      * visit(Allocate)) to the element index, at the address seam. Identity for
@@ -321,8 +326,14 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             << "wgmma_m64n16k16_f32 args must be (const int, Load, Load)\n";
 
         if (cached_wgmma_acc == nullptr) {
-            llvm::Value *desc_a = build_wgmma_descriptor(la->name, la->type.element_of());
-            llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of());
+            // M0 first-guess core-matrix offsets for a 64x16 (A) / 16x16 (B) f16
+            // K-major tile (Colfax/CUTLASS canonical no-swizzle): LBO 128 B, SBO
+            // 256 B. la->index / lb->index carry the tile origin the recognizer
+            // captured (As@0, Bs@1024 elems). Pinned against the oracle on H100.
+            llvm::Value *desc_a = build_wgmma_descriptor(la->name, la->type.element_of(),
+                                                         la->index, /*lbo*/ 128, /*sbo*/ 256);
+            llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
+                                                         lb->index, /*lbo*/ 128, /*sbo*/ 256);
 
             // Zeroed {f32 x 8} accumulator (scaleD=0 overwrites on this single
             // k=16 step, so the zero init is just for a well-defined value).
@@ -682,17 +693,38 @@ class RewriteLoadsAs32Bit : public IRMutator {
     }
 };
 
-llvm::Value *CodeGen_PTX_Dev::build_wgmma_descriptor(const std::string &buffer, Type elem_type) {
-    // The shared base pointer of the operand tile (offset 0 = tile origin).
-    llvm::Value *base_ptr = codegen_buffer_pointer(buffer, elem_type, Expr(0));
+llvm::Value *CodeGen_PTX_Dev::build_wgmma_descriptor(const std::string &buffer, Type elem_type,
+                                                    const Expr &tile_origin, int lbo_bytes, int sbo_bytes) {
+    // Pointer to the operand tile origin. The shared base is null in addrspace(3)
+    // (see visit(Allocate)), so the addrspace(3) pointer's integer value IS the
+    // shared-window byte offset of the tile -- exactly the descriptor's start
+    // address. (Dynamic shared starts at offset 0; no cvta needed for M0. If
+    // static shared is ever reserved before the dynamic region this needs a
+    // cvta.generic.to.shared instead.)
+    llvm::Value *base_ptr = codegen_buffer_pointer(buffer, elem_type, tile_origin);
     llvm::Value *addr = builder->CreatePtrToInt(base_ptr, i64_t);
-    // M0 first-guess encoding (research/gpu_recognizer_design.md S5a/S5b): the
-    // matrix start address in bits [0:14) as (addr >> 4). Leading-byte-offset,
-    // stride-byte-offset, base-offset and swizzle-mode fields are left 0 here --
-    // they are hardware-pinned and get filled in / corrected against the f64
-    // oracle on H100. TODO(H100): real LBO/SBO/swizzle.
-    llvm::Value *enc = builder->CreateLShr(addr, llvm::ConstantInt::get(i64_t, 4));
-    return builder->CreateAnd(enc, llvm::ConstantInt::get(i64_t, 0x3FFF));
+
+    // Hopper wgmma shared matrix descriptor (PTX ISA 8.0, "Matrix Descriptor"):
+    //   bits [0:14)  start address  (byte addr >> 4)
+    //   bits [16:30) leading-dim byte offset (LBO >> 4)
+    //   bits [32:46) stride-dim byte offset  (SBO >> 4)
+    //   bits [49:52) matrix base offset (0 for M0, no swizzle)
+    //   bits [62:64) swizzle mode (0 = none)
+    auto enc14 = [&](llvm::Value *v) {
+        llvm::Value *sh = builder->CreateLShr(v, llvm::ConstantInt::get(i64_t, 4));
+        return builder->CreateAnd(sh, llvm::ConstantInt::get(i64_t, 0x3FFF));
+    };
+    llvm::Value *desc = enc14(addr);
+    auto or_field = [&](uint64_t value14, int shift) {
+        uint64_t f = ((value14 >> 4) & 0x3FFFull) << shift;
+        if (f) {
+            desc = builder->CreateOr(desc, llvm::ConstantInt::get(i64_t, f));
+        }
+    };
+    or_field((uint64_t)lbo_bytes, 16);
+    or_field((uint64_t)sbo_bytes, 32);
+    // base offset (bits [49:52)) and swizzle (bits [62:64)) stay 0 for M0.
+    return desc;
 }
 
 llvm::Value *CodeGen_PTX_Dev::emit_wgmma_m64n16k16(llvm::Value *acc, llvm::Value *desc_a,
