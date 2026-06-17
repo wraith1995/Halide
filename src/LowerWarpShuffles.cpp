@@ -438,7 +438,7 @@ class LowerWarpShuffles : public IRMutator {
                 allocation_info.pop(alloc->name);
                 body = Allocate::make(alloc->name, alloc->type, alloc->memory_type,
                                       {new_size}, alloc->condition,
-                                      body, alloc->new_expr, alloc->free_function, alloc->padding);
+                                      body, alloc->new_expr, alloc->free_function, alloc->padding, alloc->swizzle);
             }
             allocations.clear();
 
@@ -454,7 +454,7 @@ class LowerWarpShuffles : public IRMutator {
                 const Allocate *alloc = s.as<Allocate>();
                 body = Allocate::make(alloc->name, alloc->type, alloc->memory_type,
                                       alloc->extents, alloc->condition,
-                                      body, alloc->new_expr, alloc->free_function, alloc->padding);
+                                      body, alloc->new_expr, alloc->free_function, alloc->padding, alloc->swizzle);
             }
             allocations.clear();
 

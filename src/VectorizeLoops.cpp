@@ -958,7 +958,7 @@ protected:
         // loads). Add an assert to enforce it.
         internal_assert(op->padding == 0) << "Vectorization of padded allocations not yet implemented";
 
-        return Allocate::make(op->name, op->type, op->memory_type, new_extents, op->condition, body, new_expr, op->free_function);
+        return Allocate::make(op->name, op->type, op->memory_type, new_extents, op->condition, body, new_expr, op->free_function, op->padding, op->swizzle);
     }
 
     Stmt visit(const Atomic *op) override {

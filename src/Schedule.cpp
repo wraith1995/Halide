@@ -239,6 +239,7 @@ struct FuncScheduleContents {
     std::vector<Bound> estimates;
     std::map<std::string, Internal::FunctionPtr> wrappers;
     MemoryType memory_type = MemoryType::Auto;
+    SwizzleLayout swizzle;
     bool memoized = false;
     bool async = false;
     // Number of GPU warps dedicated to producing this Func when it is scheduled
@@ -365,6 +366,7 @@ FuncSchedule FuncSchedule::deep_copy(
     copy.contents->bounds = contents->bounds;
     copy.contents->estimates = contents->estimates;
     copy.contents->memory_type = contents->memory_type;
+    copy.contents->swizzle = contents->swizzle;
     copy.contents->memoized = contents->memoized;
     copy.contents->memoize_eviction_key = contents->memoize_eviction_key;
     copy.contents->async = contents->async;
@@ -387,6 +389,14 @@ MemoryType FuncSchedule::memory_type() const {
 
 MemoryType &FuncSchedule::memory_type() {
     return contents->memory_type;
+}
+
+SwizzleLayout FuncSchedule::swizzle() const {
+    return contents->swizzle;
+}
+
+SwizzleLayout &FuncSchedule::swizzle() {
+    return contents->swizzle;
 }
 
 bool &FuncSchedule::memoized() {

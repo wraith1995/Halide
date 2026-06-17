@@ -324,7 +324,7 @@ private:
         } else {
             stmt = Allocate::make(op->name, op->type, op->memory_type,
                                   new_extents, condition, body, new_expr,
-                                  op->free_function, op->padding);
+                                  op->free_function, op->padding, op->swizzle);
         }
 
         tasks.push_back(stmt);

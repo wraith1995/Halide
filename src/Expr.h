@@ -405,6 +405,55 @@ enum class MemoryType {
     AMXTile,
 };
 
+/** A bank-conflict-avoidance swizzle composed onto an allocation's affine
+ * (stride) layout. Given the logical (affine) element index i, the physical
+ * element index is:
+ *
+ *     phys = i ^ (((i >> shift) & ((1 << bits) - 1)) << base)
+ *
+ * a self-inverse XOR permutation of aligned blocks (the CUTLASS Swizzle<B,M,S>
+ * family). All fields are in element units. `bits == 0` is the identity (no
+ * swizzle). The swizzle is applied only at the codegen address seam; the IR
+ * index expression stays affine, so it remains a single shared invariant that
+ * every accessor of the allocation observes. See \ref Func::swizzle_storage. */
+struct SwizzleLayout {
+    int bits = 0;   ///< Number of address bits permuted (0 = identity).
+    int base = 0;   ///< Low bit where the XOR field is injected; granule = elem << base.
+    int shift = 0;  ///< Low bit of the field read to form the XOR.
+
+    bool defined() const {
+        return bits > 0;
+    }
+    bool operator==(const SwizzleLayout &o) const {
+        return bits == o.bits && base == o.base && shift == o.shift;
+    }
+    bool operator!=(const SwizzleLayout &o) const {
+        return !(*this == o);
+    }
+    // Provided so the generic IREquality comparator can order Allocate nodes.
+    bool operator<(const SwizzleLayout &o) const {
+        if (bits != o.bits) {
+            return bits < o.bits;
+        }
+        if (base != o.base) {
+            return base < o.base;
+        }
+        return shift < o.shift;
+    }
+};
+
+/** Named shared-memory swizzle modes used with \ref Func::swizzle_storage to
+ * avoid GPU shared-memory bank conflicts. Resolved to a concrete \ref
+ * SwizzleLayout (in element units) using the Func's element size. The granule
+ * is a 16-byte (128-bit) bank line; the suffix is the number of distinct bank
+ * lines permuted. Use the raw SwizzleLayout overload for exact (B,M,S) control. */
+enum class Swizzle {
+    None,
+    XOR_32B,
+    XOR_64B,
+    XOR_128B,
+};
+
 namespace Internal {
 
 /** An enum describing a type of loop traversal. Used in schedules,

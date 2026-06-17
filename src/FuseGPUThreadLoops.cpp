@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <tuple>
 #include <utility>
 
 #include "AsyncProducers.h"
@@ -252,6 +253,10 @@ protected:
         MemoryType memory_type;  // Should be GPUShared or Heap
         bool striped_over_threads;
         bool size_computed_on_host;
+        // A swizzled allocation is kept as its own standalone Allocate (never
+        // coalesced or type-clustered), so the codegen swizzle hook can key on
+        // its name and the XOR applies to its own logical index. See SwizzleLayout.
+        SwizzleLayout swizzle;
     };
 
     struct AllocGroup {
@@ -260,12 +265,17 @@ protected:
             : name(alloc.name),
               widest_type(alloc.type),
               max_size(alloc.size),
-              memory_type(alloc.memory_type) {
+              memory_type(alloc.memory_type),
+              swizzle(alloc.swizzle) {
             group.push_back(alloc);
         }
 
         void insert(const SharedAllocation &alloc) {
             internal_assert(alloc.memory_type == memory_type);
+            // Swizzled allocations are isolated upstream (find_best_fit returns -1
+            // for them and skips swizzled groups), so a group should never mix them.
+            internal_assert(!alloc.swizzle.defined() && !swizzle.defined())
+                << "Swizzled shared allocations must not be coalesced.\n";
             if (alloc.type.bytes() == widest_type.bytes()) {
                 max_size = max(max_size, alloc.size);
             } else if (alloc.type.bytes() > widest_type.bytes()) {
@@ -292,6 +302,7 @@ protected:
         Expr max_size;                   // In units of the widest type
         vector<SharedAllocation> group;  // Groups of allocs that should be coalesced together
         MemoryType memory_type;          // All allocations in the group have this memory type
+        SwizzleLayout swizzle;           // Non-identity only for isolated (uncoalesced) swizzled allocs
     };
 
 public:
@@ -499,6 +510,7 @@ protected:
         alloc.memory_type = op->memory_type;
         alloc.size_computed_on_host = false;
         alloc.striped_over_threads = in_threads;
+        alloc.swizzle = op->swizzle;
 
         if (alloc.memory_type == MemoryType::Auto) {
             if (in_threads) {
@@ -614,6 +626,12 @@ protected:
                       const SharedAllocation &alloc, int stage) {
         int free_idx = -1;
 
+        // Swizzled allocations are never coalesced -- they must reach codegen as
+        // their own named Allocate so the swizzle hook can key on the name.
+        if (alloc.swizzle.defined()) {
+            return -1;
+        }
+
         Expr alloc_size = simplify(alloc.size);
 
         // We prefer to coalesce dynamic-sized allocation with a dynamic-sized one and
@@ -635,6 +653,11 @@ protected:
                     continue;
                 }
 
+                // Never coalesce anything into a swizzled allocation's space.
+                if (mem_allocs[free_spaces[i]].swizzle.defined()) {
+                    continue;
+                }
+
                 if (!may_merge_allocs_of_different_type &&
                     mem_allocs[free_spaces[i]].group[0].type != alloc.type) {
                     continue;
@@ -653,6 +676,11 @@ protected:
                 internal_assert(mem_allocs[free_spaces[i]].is_free(stage));
 
                 if (mem_allocs[free_spaces[i]].memory_type != alloc.memory_type) {
+                    continue;
+                }
+
+                // Never coalesce anything into a swizzled allocation's space.
+                if (mem_allocs[free_spaces[i]].swizzle.defined()) {
                     continue;
                 }
 
@@ -770,7 +798,11 @@ public:
         // similar we get one big combined allocation per memory
         // type. For vulkan and direct3d, we also separate by
         // element type.
-        map<pair<MemoryType, Type>, vector<AllocGroup>> clustered_allocs;
+        // Key is (memory type, element type, discriminator). The discriminator is
+        // empty for normal allocations (so they cluster together as before) and the
+        // allocation's unique name for swizzled allocations (so each lands in its
+        // own cluster -> its own named Allocate, which the codegen swizzle hook keys on).
+        map<std::tuple<MemoryType, Type, string>, vector<AllocGroup>> clustered_allocs;
 
         {
             vector<AllocGroup> mem_allocs = allocate_funcs(allocations);
@@ -790,7 +822,8 @@ public:
 
             for (const auto &alloc : mem_allocs) {
                 Type t = may_merge_allocs_of_different_type ? UInt(8) : alloc.widest_type;
-                pair<MemoryType, Type> key{alloc.memory_type, t};
+                string disc = alloc.swizzle.defined() ? alloc.name : string();
+                std::tuple<MemoryType, Type, string> key{alloc.memory_type, t, disc};
                 clustered_allocs[key].push_back(alloc);
             }
         }
@@ -798,9 +831,9 @@ public:
         for (auto &p : clustered_allocs) {
             vector<AllocGroup> &cluster = p.second;
             // Heap or shared?
-            MemoryType memory_type = p.first.first;
+            MemoryType memory_type = std::get<0>(p.first);
             // Type of the combined Allocate node
-            Type alloc_type = p.first.second;
+            Type alloc_type = std::get<1>(p.first);
 
             // Figure out a name for the cluster, the total size of
             // the cluster (in terms of the alloc_type), and the
@@ -810,8 +843,13 @@ public:
             Expr total_size = 0;
             Type widest_type;
             int number_of_allocs = 0;
+            // Swizzled allocs are isolated into their own singleton cluster above.
+            SwizzleLayout cluster_swizzle;
             for (const auto &alloc : cluster) {
                 number_of_allocs += alloc.group.size();
+                if (alloc.swizzle.defined()) {
+                    cluster_swizzle = alloc.swizzle;
+                }
             }
             for (const auto &alloc : cluster) {
                 if (name.empty()) {
@@ -854,6 +892,14 @@ public:
                 total_size = size;
             }
 
+            // A swizzle's XOR can push an index up to (period - granule) higher, so
+            // the allocation must be padded up to a whole number of swizzle periods
+            // (1 << (base + bits) elements of alloc_type) or swizzle(i) could go OOB.
+            if (cluster_swizzle.defined()) {
+                int period = 1 << (cluster_swizzle.base + cluster_swizzle.bits);
+                total_size = simplify(((total_size + period - 1) / period) * period);
+            }
+
             const string total_size_name = name + ".size";
             Expr total_size_var = Variable::make(Int(32), total_size_name);
 
@@ -862,7 +908,8 @@ public:
                 global_allocations.push_back(GlobalAllocation{name, total_size, alloc_type});
             } else {
                 s = Allocate::make(name, alloc_type, memory_type,
-                                   {total_size_var}, const_true(), s);
+                                   {total_size_var}, const_true(), s,
+                                   Expr(), std::string(), 0, cluster_swizzle);
             }
 
             // Define a group offset for each group in the

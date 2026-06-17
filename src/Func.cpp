@@ -2471,6 +2471,66 @@ Func &Func::store_in(MemoryType t) {
     return *this;
 }
 
+namespace {
+// Resolve a named CUTLASS-style swizzle mode to concrete element-unit bit
+// parameters. The granule is a 16-byte (128-bit) bank line, so the number of
+// untouched low bits (base) depends on the element size: base = log2(16 /
+// elem_bytes). `bits` selects how many distinct bank lines are permuted (1/2/3
+// for 32B/64B/128B). The XOR control field sits at `shift = base + bits`, just
+// above the target field, so the two fields are disjoint -- which makes the map
+// a self-inverse bijection (required for correctness: a non-bijective layout
+// would alias two logical indices onto one physical slot). For half elements
+// XOR_128B resolves to (bits=3, base=3, shift=6), i.e. CuTe's Sw<3,3,3>. The
+// optimal `shift` for a specific tile follows its row stride; use the raw
+// SwizzleLayout overload for that.
+SwizzleLayout resolve_swizzle(Swizzle mode, int elem_bytes) {
+    if (mode == Swizzle::None) {
+        return SwizzleLayout();
+    }
+    user_assert(elem_bytes > 0 && (elem_bytes & (elem_bytes - 1)) == 0)
+        << "Func::swizzle_storage requires a power-of-two element size, but got "
+        << elem_bytes << " bytes.\n";
+    user_assert(elem_bytes <= 16)
+        << "Func::swizzle_storage requires an element size no larger than the "
+        << "16-byte swizzle granule, but got " << elem_bytes << " bytes.\n";
+    int base = 0;
+    for (int g = 16 / elem_bytes; g > 1; g >>= 1) {
+        base++;
+    }
+    int bits = (mode == Swizzle::XOR_128B) ? 3 : (mode == Swizzle::XOR_64B) ? 2 :
+                                                                              1;
+    return SwizzleLayout{bits, base, base + bits};
+}
+}  // namespace
+
+Func &Func::swizzle_storage(Swizzle mode) {
+    invalidate_cache();
+    const std::vector<Type> &types = func.output_types();
+    user_assert(!types.empty())
+        << "Func::swizzle_storage(Swizzle) requires the Func's type to be known; "
+        << "define " << name() << " first, or use the SwizzleLayout overload.\n";
+    func.schedule().swizzle() = resolve_swizzle(mode, types[0].bytes());
+    return *this;
+}
+
+Func &Func::swizzle_storage(SwizzleLayout layout) {
+    invalidate_cache();
+    if (layout.defined()) {
+        user_assert(layout.bits > 0 && layout.base >= 0 && layout.shift >= 0)
+            << "Invalid SwizzleLayout: bits/base/shift must be non-negative with bits > 0.\n";
+        // The XOR control field [shift, shift+bits) and target field
+        // [base, base+bits) must be disjoint, or the map is not a bijection
+        // (it would alias two logical indices onto one physical slot).
+        user_assert(layout.shift >= layout.base + layout.bits ||
+                    layout.shift + layout.bits <= layout.base)
+            << "Invalid SwizzleLayout: the control field [shift, shift+bits) and "
+            << "target field [base, base+bits) overlap, which is not a bijection. "
+            << "Use shift >= base + bits.\n";
+    }
+    func.schedule().swizzle() = layout;
+    return *this;
+}
+
 Func &Func::async() {
     invalidate_cache();
     func.schedule().async() = true;

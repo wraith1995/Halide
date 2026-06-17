@@ -88,6 +88,17 @@ protected:
     // gpu_thread_barrier, so the barrier commits + waits for it (synchronous cp.async).
     bool emitted_cp_async = false;
 
+    /** Apply a shared-memory bank-conflict swizzle (recorded per allocation in
+     * visit(Allocate)) to the element index, at the address seam. Identity for
+     * non-swizzled buffers. The IR index stays affine; only the emitted address
+     * is permuted, so producer and consumer of the same allocation agree. */
+    llvm::Value *codegen_swizzled_index(const std::string &buffer, Type type, llvm::Value *index) override;
+
+    /** Swizzle + element-size-in-bytes for each swizzled shared allocation, keyed
+     * by name. The byte size lets the hook rescale element-unit swizzle params to
+     * the units of a wider access (e.g. the 4-wide u128 store path). */
+    std::map<std::string, std::pair<SwizzleLayout, int>> shared_swizzles;
+
     std::string mcpu_target() const override;
     std::string mcpu_tune() const override;
     std::string mattrs() const override;
@@ -224,6 +235,7 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
 }
 
 void CodeGen_PTX_Dev::init_module() {
+    shared_swizzles.clear();
     // This class uses multiple inheritance. It's a GPU device code generator,
     // and also an llvm-based one. Both of these track strict_float presence,
     // but OffloadGPULoops only sets the GPU device code generator flag, so here
@@ -388,6 +400,9 @@ void CodeGen_PTX_Dev::visit(const Allocate *alloc) {
         // PTX uses zero in address space 3 as the base address for shared memory
         Value *shared_base = Constant::getNullValue(PointerType::get(*context, 3));
         sym_push(alloc->name, shared_base);
+        if (alloc->swizzle.defined()) {
+            shared_swizzles[alloc->name] = {alloc->swizzle, alloc->type.bytes()};
+        }
     } else {
         debug(2) << "Allocate " << alloc->name << " on device\n";
 
@@ -412,6 +427,59 @@ void CodeGen_PTX_Dev::visit(const Allocate *alloc) {
         sym_push(allocation_name, ptr);
     }
     codegen(alloc->body);
+}
+
+llvm::Value *CodeGen_PTX_Dev::codegen_swizzled_index(const std::string &buffer, Type type, llvm::Value *index) {
+    auto it = shared_swizzles.find(buffer);
+    if (it == shared_swizzles.end()) {
+        return index;
+    }
+    const SwizzleLayout &s = it->second.first;
+    const int alloc_bytes = it->second.second;
+    const int access_bytes = type.bytes();
+
+    // The swizzle params are in units of the allocation's element. If this access
+    // is wider (e.g. the 4-wide u128 store/load path), its index is in coarser
+    // units, so shift the params down by log2(access/alloc); the granule >= access
+    // invariant guarantees they stay non-negative. A narrower access shifts up.
+    int base = s.base;
+    int shift = s.shift;
+    if (access_bytes > alloc_bytes) {
+        int ratio = access_bytes / alloc_bytes, lg = 0;
+        while (ratio > 1) {
+            ratio >>= 1;
+            lg++;
+        }
+        internal_assert(base >= lg && shift >= lg)
+            << "Swizzled access (" << access_bytes << "B) is wider than the swizzle granule "
+            << "for " << buffer << "; granule must be >= the access width.\n";
+        base -= lg;
+        shift -= lg;
+    } else if (alloc_bytes > access_bytes) {
+        int ratio = alloc_bytes / access_bytes, lg = 0;
+        while (ratio > 1) {
+            ratio >>= 1;
+            lg++;
+        }
+        base += lg;
+        shift += lg;
+    }
+
+    // phys = i ^ (((i >> shift) & ((1 << bits) - 1)) << base), elementwise.
+    llvm::Type *ty = index->getType();
+    llvm::Type *scalar_ty = ty->getScalarType();
+    auto konst = [&](uint64_t v) -> llvm::Value * {
+        llvm::Constant *c = llvm::ConstantInt::get(scalar_ty, v);
+        if (ty->isVectorTy()) {
+            auto lanes = llvm::cast<llvm::FixedVectorType>(ty)->getNumElements();
+            c = llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(lanes), c);
+        }
+        return c;
+    };
+    llvm::Value *field = builder->CreateLShr(index, konst(shift));
+    field = builder->CreateAnd(field, konst((uint64_t(1) << s.bits) - 1));
+    field = builder->CreateShl(field, konst(base));
+    return builder->CreateXor(index, field);
 }
 
 void CodeGen_PTX_Dev::visit(const Free *f) {
