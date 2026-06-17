@@ -118,20 +118,39 @@ Expr frag_col_n(const Expr &lane, int i) {
     return (l % 4) * 2 + (i % 2) + 8 * (i / 4);
 }
 
-// Collect the output buffer's per-dimension stride expressions from a (lets-resolved)
-// store index: the index is built from `_halide_buffer_get_stride(buf, d)` terms, so we
-// pick them up by dimension. The epilogue rewrite multiplies the fragment's tile-local
-// (m,n) by these to flatten to the global output offset (so M/N tiling + arbitrary
-// output strides Just Work; dim-0 defaults to 1 when it is folded away as contiguous).
+// True if e references a host-side buffer-query call (_halide_buffer_get_*). These are
+// invalid inside a device kernel -- the device receives min/stride/extent as kernel-param
+// Variables (e.g. C.stride.1), so we must NOT expand those param lets when rebuilding a
+// device-side store index.
+bool has_buffer_query(const Expr &e) {
+    class V : public IRVisitor {
+        using IRVisitor::visit;
+        void visit(const Call *op) override {
+            if (op->name.find("_halide_buffer_get_") != std::string::npos) {
+                found = true;
+            }
+            IRVisitor::visit(op);
+        }
+
+    public:
+        bool found = false;
+    } v;
+    e.accept(&v);
+    return v.found;
+}
+
+// Collect the output buffer's per-dimension stride from a device store index: the strides
+// ride as kernel-param Variables named "<buf>.stride.<d>". The epilogue rewrite multiplies
+// the fragment's tile-local (m,n) by these to flatten to the global output offset (so M/N
+// tiling + arbitrary output strides Just Work; dim-0 defaults to 1 when contiguous/folded).
 class StrideCollector : public IRVisitor {
     using IRVisitor::visit;
-    void visit(const Call *op) override {
-        if (op->name.find("buffer_get_stride") != std::string::npos && op->args.size() == 2) {
-            if (auto d = as_const_int(op->args[1])) {
-                strides[(int)*d] = Expr(op);
-            }
+    void visit(const Variable *op) override {
+        size_t p = op->name.rfind(".stride.");
+        if (p != std::string::npos) {
+            int d = atoi(op->name.c_str() + p + 8);
+            strides[d] = Expr(op);
         }
-        IRVisitor::visit(op);
     }
 
 public:
@@ -171,11 +190,23 @@ class RewriteWarpGroupTiles : public IRMutator {
         return s;
     }
 
-    // Fully expand CSE'd lets in an expr.
-    Expr resolve_lets(Expr e) {
+    // Expand CSE'd lets in an expr. With device_only, skip lets whose value is a host
+    // buffer-query (min/stride/extent) -- those stay as kernel-param Variables so a rebuilt
+    // device-side index does not pull host-only calls into the kernel (CUDA_ERROR_INVALID_PTX).
+    Expr resolve_lets(Expr e, bool device_only = false) {
+        std::map<std::string, Expr> use = lets;
+        if (device_only) {
+            for (auto it = use.begin(); it != use.end();) {
+                if (has_buffer_query(it->second)) {
+                    it = use.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         for (int it = 0; it < 64; it++) {
             Expr prev = e;
-            e = substitute(lets, e);
+            e = substitute(use, e);
             if (e.same_as(prev)) {
                 break;
             }
@@ -294,7 +325,7 @@ class RewriteWarpGroupTiles : public IRMutator {
         // come straight off the output buffer, so M/N tiling over gpu_blocks + arbitrary
         // output strides are handled by construction.
         if (!out_captured) {
-            Expr ri = resolve_lets(op->index);
+            Expr ri = resolve_lets(op->index, /*device_only*/ true);
             StrideCollector sc;
             ri.accept(&sc);
             out_stride_m = sc.dim(0);
