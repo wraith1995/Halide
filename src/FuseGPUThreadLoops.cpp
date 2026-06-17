@@ -2070,8 +2070,14 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         // Flat partition: only the producing + consuming groups' lanes are in range.
         Expr count = fork_fuse ? simplify(producer_threads[b.producer] + consumer_threads)
                                : thread_count;
-        return Evaluate::make(Call::make(Int(32), Call::gpu_named_barrier,
-                                         {id, count, mode}, Call::Intrinsic));
+        // Emit a WarpGroup-scope sync requirement (only the producing + consuming
+        // groups rendezvous); LowerSyncRequirements lowers it to a partial named
+        // barrier — or, at sm_90, an mbarrier — at the single sync seam. mode 0 =
+        // wait, 1 = arrive. See research/gpu_sync_model.md.
+        return Evaluate::make(Call::make(Int(32), Call::sync_requirement,
+                                         {IntImm::make(Int(32), (int)SyncScope::WarpGroup),
+                                          id, count, IntImm::make(Int(32), mode)},
+                                         Call::Intrinsic));
     }
 
     Stmt visit(const LetStmt *op) override {
@@ -2295,15 +2301,27 @@ class LowerSyncRequirements : public IRMutator {
 
     Expr visit(const Call *op) override {
         if (op->is_intrinsic(Call::sync_requirement)) {
-            internal_assert(op->args.size() == 2)
-                << "sync_requirement expects (scope, fence).\n";
+            internal_assert(!op->args.empty()) << "sync_requirement needs a scope.\n";
             auto scope = as_const_int(op->args[0]);
             internal_assert(scope) << "sync_requirement scope must be a constant.\n";
             switch ((SyncScope)*scope) {
             case SyncScope::Block:
                 // Whole-CTA barrier; every GPU backend lowers gpu_thread_barrier.
+                // Args: (scope, fence).
+                internal_assert(op->args.size() == 2)
+                    << "Block sync_requirement expects (scope, fence).\n";
                 return Call::make(Int(32), Call::gpu_thread_barrier,
                                   {mutate(op->args[1])}, Call::Intrinsic);
+            case SyncScope::WarpGroup:
+                // Partial/named CTA barrier: only `count` threads (the producing +
+                // consuming warp groups of an async edge) rendezvous on named barrier
+                // `id`. mode 0 = wait, 1 = arrive. Args: (scope, id, count, mode). The
+                // mbarrier swap for sm_90 TMA drops in here, at the same seam.
+                internal_assert(op->args.size() == 4)
+                    << "WarpGroup sync_requirement expects (scope, id, count, mode).\n";
+                return Call::make(Int(32), Call::gpu_named_barrier,
+                                  {mutate(op->args[1]), mutate(op->args[2]), mutate(op->args[3])},
+                                  Call::Intrinsic);
             default:
                 internal_error
                     << "lower_sync_requirements: SyncScope " << *scope
