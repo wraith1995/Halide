@@ -353,14 +353,21 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             // NOTE: this wait_group 0 is the *unpipelined* placement (num_stages=1 in Triton
             // terms). The waits are emitted separably so a future loop-pipelining pass can
             // hoist them across a staging loop without touching this mma path.
+            // LBO (K-core-matrix stride = ki*mi = 64 elems = 128 B) is constant. SBO
+            // (the M-/N-core-matrix stride) is the operand's mo/no storage stride =
+            // ki*mi*ko_total = 8*K elems = 16*K bytes, because the [mo][ko][mi][ki]
+            // layout interleaves ALL of K between consecutive M-core-matrices. With
+            // K = 16*n_chunks that is 256*n_chunks bytes (256 for M0's K=16). TODO:
+            // read LBO/SBO off the producer's shared storage strides (auto-layout).
+            int sbo = 256 * (int)*n_chunks;
             emit_wgmma_asm("wgmma.fence.sync.aligned;");
             for (int c = 0; c < (int)*n_chunks; c++) {
                 Expr off_a = simplify(la->index + Expr((int)(*stride_a) * c));
                 Expr off_b = simplify(lb->index + Expr((int)(*stride_b) * c));
                 llvm::Value *desc_a = build_wgmma_descriptor(la->name, la->type.element_of(),
-                                                             off_a, /*lbo*/ 128, /*sbo*/ 256);
+                                                             off_a, /*lbo*/ 128, sbo);
                 llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
-                                                             off_b, /*lbo*/ 128, /*sbo*/ 256);
+                                                             off_b, /*lbo*/ 128, sbo);
                 acc = emit_wgmma_m64n16k16(acc, desc_a, desc_b, /*scale_d*/ c > 0);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
