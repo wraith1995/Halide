@@ -767,7 +767,11 @@ void CodeGen_PTX_Dev::codegen_vector_reduce(const VectorReduce *op, const Expr &
 }
 
 string CodeGen_PTX_Dev::mcpu_target() const {
-    if (target.has_feature(Target::CUDACapability86)) {
+    if (target.has_feature(Target::CUDACapability90)) {
+        // The architecture-specific "a" variant is required for the Hopper
+        // tensor-core / wgmma instructions (sm_90a), matching CUTLASS/nvcc.
+        return "sm_90a";
+    } else if (target.has_feature(Target::CUDACapability86)) {
         return "sm_86";
     } else if (target.has_feature(Target::CUDACapability80)) {
         return "sm_80";
@@ -795,7 +799,10 @@ string CodeGen_PTX_Dev::mcpu_tune() const {
 }
 
 string CodeGen_PTX_Dev::mattrs() const {
-    if (target.has_feature(Target::CUDACapability86)) {
+    if (target.has_feature(Target::CUDACapability90)) {
+        // PTX ISA 8.0 is the floor for the Hopper wgmma.mma_async family.
+        return "+ptx80";
+    } else if (target.has_feature(Target::CUDACapability86)) {
         return "+ptx71";
     } else if (target.has_feature(Target::CUDACapability80)) {
         return "+ptx70";

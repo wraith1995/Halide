@@ -108,6 +108,7 @@ struct Target {
         CUDACapability75 = halide_target_feature_cuda_capability75,
         CUDACapability80 = halide_target_feature_cuda_capability80,
         CUDACapability86 = halide_target_feature_cuda_capability86,
+        CUDACapability90 = halide_target_feature_cuda_capability90,
         OpenCL = halide_target_feature_opencl,
         CLDoubles = halide_target_feature_cl_doubles,
         CLHalf = halide_target_feature_cl_half,

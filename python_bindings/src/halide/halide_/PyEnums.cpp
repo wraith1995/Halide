@@ -140,6 +140,7 @@ void define_enums(py::module &m) {
         .value("CUDACapability75", Target::Feature::CUDACapability75)
         .value("CUDACapability80", Target::Feature::CUDACapability80)
         .value("CUDACapability86", Target::Feature::CUDACapability86)
+        .value("CUDACapability90", Target::Feature::CUDACapability90)
         .value("OpenCL", Target::Feature::OpenCL)
         .value("CLDoubles", Target::Feature::CLDoubles)
         .value("CLHalf", Target::Feature::CLHalf)
