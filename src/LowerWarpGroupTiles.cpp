@@ -1,6 +1,7 @@
 #include "LowerWarpGroupTiles.h"
 
 #include "CodeGen_GPU_Dev.h"
+#include "Deinterleave.h"
 #include "IRMutator.h"
 #include "IROperator.h"
 #include "IRPrinter.h"
@@ -42,11 +43,15 @@ const VectorReduce *find_vector_reduce(const Expr &e) {
 struct Operand {
     std::string buffer;
     Type elem_type;
-    Expr base_index;  // the k-contiguous row Load's ramp base (per-thread row)
+    Expr base_index;  // the operand Load's index (scalarized to the tile origin later)
 };
 
 // Match reduce_add(widening_mul(LoadA, LoadB)) (peeling the f16->f32 casts the
-// f32 accumulator inserts) and pull out the two shared operand buffers.
+// f32 accumulator inserts) and pull out the two shared operand buffers. We do NOT
+// require a contiguous-k ramp: the core-matrix operand layout reads the k tile as a
+// gather, and wgmma replaces the whole reduce wholesale (the IR's k-access pattern
+// is discarded), so only the buffer + tile origin matter. base_index is whatever
+// the Load index is (vector or scalar); tile_origin() scalarizes it.
 bool parse_operands(const VectorReduce *vr, Operand &a, Operand &b) {
     if (vr->op != VectorReduce::Add) {
         return false;
@@ -63,25 +68,31 @@ bool parse_operands(const VectorReduce *vr, Operand &a, Operand &b) {
         if (!l) {
             return false;
         }
-        const Ramp *r = l->index.as<Ramp>();
-        if (!r || !is_const_one(r->stride)) {
-            return false;
-        }
         o.buffer = l->name;
         o.elem_type = l->type.element_of();
-        o.base_index = r->base;
+        o.base_index = l->index;
         return true;
     };
     return as_load(mul->a, a) && as_load(mul->b, b);
 }
 
-// Replace every Variable with 0, leaving the constant (thread/loop-independent)
-// part of an index -- the tile-origin offset within the (possibly fused) shared
-// allocation. e.g. As base (tx%8)*128 -> 0; Bs base (tx/8)*16 + 1024 -> 1024.
+// Replace every Variable -- and every runtime buffer-accessor query (buffer min/
+// max/extent/stride: translation-invariant for an intra-allocation offset) -- with
+// 0, leaving the constant (thread/loop/buffer-independent) part of an index: the
+// tile-origin offset within the operand's shared allocation. e.g. As (k/8)*64 +
+// (k%8) + (m%8)*8 + (m/8)*128 -> 0. Buffer mins are zeroed because lets-substitution
+// can fold a coordinate var (C.s1.m) into a min-bearing expr that Variable-zeroing
+// alone would not reduce (e.g. (C.min.0 % 8)*8).
 class ZeroVars : public IRMutator {
     using IRMutator::visit;
     Expr visit(const Variable *op) override {
         return make_zero(op->type);
+    }
+    Expr visit(const Call *op) override {
+        if (op->name.find("_halide_buffer_get_") == 0) {
+            return make_zero(op->type);
+        }
+        return IRMutator::visit(op);
     }
 
 public:
@@ -129,7 +140,9 @@ class RewriteWarpGroupTiles : public IRMutator {
     }
 
     // The tile-origin offset of an operand within its shared allocation: resolve
-    // CSE'd lets, then zero all variables to keep the const part.
+    // CSE'd lets, zero all variables to keep the const part, then scalarize (the
+    // load index may be a vector gather over the core-matrix-tiled k -- the tile
+    // origin is the same constant across all lanes).
     Expr tile_origin(Expr base) {
         for (int iter = 0; iter < 32; iter++) {
             Expr prev = base;
@@ -138,7 +151,14 @@ class RewriteWarpGroupTiles : public IRMutator {
                 break;
             }
         }
-        return simplify(ZeroVars().run(simplify(base)));
+        Expr z = simplify(ZeroVars().run(simplify(base)));
+        // The vectorized k tile is a gather (k%8 + (k/8)*64 ...), so after zeroing the
+        // thread vars the index is still a 16-lane vector with no named lane var. Lane 0
+        // (k=0, all vars 0) is the tile origin -- the constant base of the allocation.
+        if (z.type().lanes() > 1) {
+            z = extract_lane(z, 0);
+        }
+        return simplify(z);
     }
 
     Stmt visit(const For *op) override {
@@ -181,7 +201,11 @@ class RewriteWarpGroupTiles : public IRMutator {
 
         if (getenv("HL_DEBUG_WGMMA")) {
             debug(0) << "[wgtile] rewriting tile store #" << frag_index
-                     << " -> wgmma frag, buffer=" << op->name << "\n";
+                     << " -> wgmma frag, buffer=" << op->name << "\n"
+                     << "    A=" << a.buffer << " idx=" << a.base_index << "\n"
+                     << "      origin_A=" << tile_origin(a.base_index) << "\n"
+                     << "    B=" << b.buffer << " idx=" << b.base_index << "\n"
+                     << "      origin_B=" << tile_origin(b.base_index) << "\n";
         }
         int i = frag_index++;
         if (i >= 8) {
