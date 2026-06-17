@@ -1208,7 +1208,16 @@ struct VectorReduce : public ExprNode<VectorReduce> {
     Expr value;
     Operator op;
 
-    static Expr make(Operator op, Expr vec, int lanes);
+    /** Where this vectorized reduce is physically realized (registers / warp /
+     * warp group), stamped from the enclosing GPU collective scope. The unified
+     * recognizer decomposes (op-kind x realization x target) into a primitive:
+     * Register -> dp4a/fma, Warp -> mma.sync, WarpGroup -> wgmma. Defaults to
+     * Register (today's per-thread behavior). The label rides on the node so it
+     * survives thread-loop fusion to codegen. See research/gpu_recognizer_design.md. */
+    GPUVectorScope realization = GPUVectorScope::Register;
+
+    static Expr make(Operator op, Expr vec, int lanes,
+                     GPUVectorScope realization = GPUVectorScope::Register);
 
     static const IRNodeType _node_type = IRNodeType::VectorReduce;
 };

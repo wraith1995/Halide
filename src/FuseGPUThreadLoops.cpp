@@ -2343,7 +2343,32 @@ Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env, co
     return LowerGPUWarpAsyncFork(env, t.warp_size())(s);
 }
 
+namespace {
+// Stamp each VectorReduce with the realization of its innermost enclosing GPU collective
+// loop (gpu_warps -> WarpGroup, gpu_lanes -> Warp), BEFORE thread-loop fusion erases that
+// scope. Pure annotation: the unified recognizer then reads the tag off the vector node at
+// codegen (uniform with dp4a), so no extraction pass is needed. See gpu_recognizer_design.md.
+class TagGPUVectorScope : public IRMutator {
+    GPUVectorScope scope = GPUVectorScope::Register;
+    using IRMutator::visit;
+
+    Stmt visit(const For *op) override {
+        ScopedValue<GPUVectorScope> s(
+            scope, op->realization != GPUVectorScope::Register ? op->realization : scope);
+        return IRMutator::visit(op);
+    }
+
+    Expr visit(const VectorReduce *op) override {
+        Expr value = mutate(op->value);
+        return VectorReduce::make(op->op, std::move(value), op->type.lanes(), scope);
+    }
+};
+}  // namespace
+
 Stmt fuse_gpu_thread_loops(Stmt s, const Target &t) {
+    // Tag vectorized collectives with their realization scope before fusion erases the
+    // gpu_warps/gpu_lanes loops; codegen reads the tag to decompose into the primitive.
+    s = TagGPUVectorScope()(s);
     // NormalizeIfStatements pushes the predicates between GPU blocks
     // into the innermost GPU block. FuseGPUThreadLoops would then
     // merge the predicate into the merged GPU thread.

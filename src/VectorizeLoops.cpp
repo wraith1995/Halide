@@ -827,7 +827,7 @@ protected:
             // Rebase the loop to zero and try again
             Expr var = Variable::make(Int(32), op->name);
             Stmt body = substitute(op->name, var + op->min, op->body);
-            Stmt transformed = For::make(op->name, 0, simplify(op->max - op->min), for_type, op->partition_policy, op->device_api, body);
+            Stmt transformed = For::make(op->name, 0, simplify(op->max - op->min), for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
             return mutate(transformed);
         }
 
@@ -902,7 +902,7 @@ protected:
                 for_type == op->for_type) {
                 return op;
             } else {
-                return For::make(op->name, min, max, for_type, op->partition_policy, op->device_api, body);
+                return For::make(op->name, min, max, for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
             }
         }
     }

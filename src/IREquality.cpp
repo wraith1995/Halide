@@ -404,6 +404,7 @@ struct Comparer {
                 break;
             case IRNodeType::VectorReduce:
                 cmp(&VectorReduce::op);
+                cmp(&VectorReduce::realization);
                 cmp(&VectorReduce::value);
                 break;
             case IRNodeType::LetStmt:

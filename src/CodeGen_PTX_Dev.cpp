@@ -88,12 +88,6 @@ protected:
     // gpu_thread_barrier, so the barrier commits + waits for it (synchronous cp.async).
     bool emitted_cp_async = false;
 
-    // The realization scope of the innermost enclosing GPU collective loop (Register if
-    // none). The unified collective recognizer keys on it: a vectorized reduce dispatches
-    // to dp4a/fma (Register), mma.sync (Warp), or wgmma (WarpGroup). Tracked in visit(For)
-    // from For::realization. See research/gpu_recognizer_design.md.
-    GPUVectorScope current_realization = GPUVectorScope::Register;
-
     /** Apply a shared-memory bank-conflict swizzle (recorded per allocation in
      * visit(Allocate)) to the element index, at the address seam. Identity for
      * non-swizzled buffers. The IR index stays affine; only the emitted address
@@ -388,12 +382,6 @@ string CodeGen_PTX_Dev::simt_intrinsic(const string &name) {
 }
 
 void CodeGen_PTX_Dev::visit(const For *loop) {
-    // Track the innermost collective realization for the recognizer. A non-Register
-    // loop establishes the scope; Register loops inherit the enclosing one.
-    ScopedValue<GPUVectorScope> r(current_realization,
-                                  loop->realization != GPUVectorScope::Register
-                                      ? loop->realization
-                                      : current_realization);
     if (is_gpu(loop->for_type)) {
         Expr simt_idx = Call::make(Int(32), simt_intrinsic(loop->name), std::vector<Expr>(), Call::Extern);
         internal_assert(is_const_zero(loop->min));
@@ -626,14 +614,15 @@ class RewriteLoadsAs32Bit : public IRMutator {
 };
 
 void CodeGen_PTX_Dev::codegen_vector_reduce(const VectorReduce *op, const Expr &init) {
-    // Unified collective recognizer, reduce family: dispatch on the realization of the
-    // enclosing GPU collective scope (research/gpu_recognizer_design.md §3). Register is
-    // the per-thread arm (dp4a/dp2a below, fma fallback); Warp -> mma.sync and WarpGroup
-    // -> wgmma are added as rows here (M-mma). Today only Register reduces reach codegen,
-    // so the dispatch is byte-identical.
-    if (current_realization != GPUVectorScope::Register) {
-        // TODO(recognizer): Warp -> mma.sync / redux; WarpGroup -> wgmma. Until those
-        // rows land, fall back to the generic reduction (unreached today).
+    // Unified collective recognizer, reduce family: decompose on the vector's realization
+    // (carried ON the node, stamped pre-fusion from the gpu_warps/gpu_lanes scope, so it
+    // survives thread fusion to here). See research/gpu_recognizer_design.md.
+    //   - WarpGroup -> wgmma (the new row; added at M-mma). No existing kernel produces a
+    //     WarpGroup reduce, so falling back here is new-but-inert today.
+    //   - Register and Warp fall through to the dp4a/dp2a table + fma fallback below — the
+    //     current behavior for both (the Warp arm gains mma.sync/redux later, branching here
+    //     before the table). Keeping Warp on the table keeps gpu_lanes reduces byte-identical.
+    if (op->realization == GPUVectorScope::WarpGroup) {
         CodeGen_LLVM::codegen_vector_reduce(op, init);
         return;
     }

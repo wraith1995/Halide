@@ -1501,7 +1501,12 @@ void IRPrinter::visit(const Shuffle *op) {
 void IRPrinter::visit(const VectorReduce *op) {
     stream << typep(op->type);
     paren_depth++;
-    stream << paren("vector_reduce_", false) << paren(op->op, false) << paren("(");
+    stream << paren("vector_reduce_", false) << paren(op->op, false);
+    // Annotate a non-default realization so the recognizer scope is visible in dumps.
+    if (op->realization != GPUVectorScope::Register) {
+        stream << paren(op->realization == GPUVectorScope::Warp ? "<warp>" : "<warp_group>", false);
+    }
+    stream << paren("(");
     print_no_parens(op->value);
     stream << paren(")");
     paren_depth--;

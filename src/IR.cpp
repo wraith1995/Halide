@@ -991,7 +991,8 @@ Stmt HoistedStorage::make(const std::string &name,
 
 Expr VectorReduce::make(VectorReduce::Operator op,
                         Expr vec,
-                        int lanes) {
+                        int lanes,
+                        GPUVectorScope realization) {
     if (vec.type().is_bool()) {
         internal_assert(op == VectorReduce::And || op == VectorReduce::Or)
             << "The only legal operators for VectorReduce on a Bool"
@@ -1008,6 +1009,7 @@ Expr VectorReduce::make(VectorReduce::Operator op,
     node->type = vec.type().with_lanes(lanes);
     node->op = op;
     node->value = std::move(vec);
+    node->realization = realization;
     return node;
 }
 
