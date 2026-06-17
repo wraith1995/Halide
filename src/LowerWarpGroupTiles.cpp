@@ -139,11 +139,13 @@ class RewriteWarpGroupTiles : public IRMutator {
         return s;
     }
 
-    // The tile-origin offset of an operand within its shared allocation: resolve
-    // CSE'd lets, zero all variables to keep the const part, then scalarize (the
-    // load index may be a vector gather over the core-matrix-tiled k -- the tile
-    // origin is the same constant across all lanes).
-    Expr tile_origin(Expr base) {
+    // The shared element offset of the operand tile at vector lane `lane` (k=lane),
+    // with all thread/loop vars + buffer mins zeroed: resolve CSE'd lets, zero vars,
+    // then extract the given lane. lane 0 = the tile origin (k=0). lane 16 = the start
+    // of the next wgmma K-chunk (used to derive the per-chunk descriptor stride for
+    // K>16 accumulation -- the vectorized k tile is a core-matrix gather, so the chunk
+    // stride is the affine address delta over 16 k-steps).
+    Expr tile_origin_at_lane(Expr base, int lane) {
         for (int iter = 0; iter < 32; iter++) {
             Expr prev = base;
             base = substitute(lets, base);
@@ -152,13 +154,13 @@ class RewriteWarpGroupTiles : public IRMutator {
             }
         }
         Expr z = simplify(ZeroVars().run(simplify(base)));
-        // The vectorized k tile is a gather (k%8 + (k/8)*64 ...), so after zeroing the
-        // thread vars the index is still a 16-lane vector with no named lane var. Lane 0
-        // (k=0, all vars 0) is the tile origin -- the constant base of the allocation.
         if (z.type().lanes() > 1) {
-            z = extract_lane(z, 0);
+            z = extract_lane(z, lane);
         }
         return simplify(z);
+    }
+    Expr tile_origin(const Expr &base) {
+        return tile_origin_at_lane(base, 0);
     }
 
     Stmt visit(const For *op) override {
@@ -199,13 +201,22 @@ class RewriteWarpGroupTiles : public IRMutator {
             return IRMutator::visit(op);
         }
 
+        // The contraction is one wide reduce. m64n16k16 contracts K=16 per
+        // wgmma.mma_async, so a width-K reduce = K/16 accumulating mma's (the async
+        // chunks). The reduce input is the float32xK product, so its lanes == K.
+        const int K_TILE = 16;
+        int reduce_k = vr->value.type().lanes();
+        if (reduce_k % K_TILE != 0 || reduce_k < K_TILE) {
+            return IRMutator::visit(op);  // not a wgmma-shaped contraction
+        }
+        int n_chunks = reduce_k / K_TILE;
+
         if (getenv("HL_DEBUG_WGMMA")) {
             debug(0) << "[wgtile] rewriting tile store #" << frag_index
-                     << " -> wgmma frag, buffer=" << op->name << "\n"
+                     << " -> wgmma frag, buffer=" << op->name
+                     << ", reduce_k=" << reduce_k << " n_chunks=" << n_chunks << "\n"
                      << "    A=" << a.buffer << " idx=" << a.base_index << "\n"
-                     << "      origin_A=" << tile_origin(a.base_index) << "\n"
-                     << "    B=" << b.buffer << " idx=" << b.base_index << "\n"
-                     << "      origin_B=" << tile_origin(b.base_index) << "\n";
+                     << "    B=" << b.buffer << " idx=" << b.base_index << "\n";
         }
         int i = frag_index++;
         if (i >= 8) {
@@ -215,19 +226,27 @@ class RewriteWarpGroupTiles : public IRMutator {
         }
 
         Expr lane = Variable::make(Int(32), thread_var);
-        // The value: register i of the wgmma fragment. Carry i + the two shared
-        // operand buffers (as base Loads codegen introspects for the matrix
-        // descriptors). scaleD=0 (overwrite) -- M0 is a single k=16 step, so we
-        // drop the `+ Load(C)` accumulation of the original store value.
-        // Descriptor base = each operand's tile origin within the (fused) shared
-        // allocation (As@0, Bs@offset) -- NOT the per-thread row, which the wgmma
-        // reads via the descriptor's leading dimension.
-        Expr load_a = Load::make(a.elem_type, a.buffer, tile_origin(a.base_index),
+        // The value: register i of the wgmma fragment. Carry i + n_chunks + each
+        // operand's tile origin (lane-0 shared offset) and per-chunk descriptor stride
+        // (the affine address delta over one K_TILE step, derived from lane K_TILE vs
+        // lane 0 of the core-matrix gather). codegen advances the descriptor start by
+        // chunk*stride and accumulates the chunks into the D fragment (scaleD carry).
+        // The original `+ Load(C)` is dropped -- the fragment IS the accumulator.
+        Expr base_a = tile_origin_at_lane(a.base_index, 0);
+        Expr base_b = tile_origin_at_lane(b.base_index, 0);
+        Expr stride_a = (n_chunks > 1)
+                            ? simplify(tile_origin_at_lane(a.base_index, K_TILE) - base_a)
+                            : Expr(0);
+        Expr stride_b = (n_chunks > 1)
+                            ? simplify(tile_origin_at_lane(b.base_index, K_TILE) - base_b)
+                            : Expr(0);
+        Expr load_a = Load::make(a.elem_type, a.buffer, base_a,
                                  Buffer<>(), Parameter(), const_true(), ModulusRemainder());
-        Expr load_b = Load::make(b.elem_type, b.buffer, tile_origin(b.base_index),
+        Expr load_b = Load::make(b.elem_type, b.buffer, base_b,
                                  Buffer<>(), Parameter(), const_true(), ModulusRemainder());
         Expr frag = Call::make(op->value.type(), "wgmma_m64n16k16_f32",
-                               {i, load_a, load_b}, Call::Intrinsic);
+                               {i, n_chunks, load_a, stride_a, load_b, stride_b},
+                               Call::Intrinsic);
 
         // The index: the global slot the hardware map assigns to (lane, reg i).
         // M0 ASSUMPTION (single block at origin, dense 64x16 output, m

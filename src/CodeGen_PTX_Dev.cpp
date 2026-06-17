@@ -310,33 +310,31 @@ void CodeGen_PTX_Dev::init_module() {
 
 void CodeGen_PTX_Dev::visit(const Call *op) {
     if (op->is_intrinsic() && op->name == "wgmma_m64n16k16_f32") {
-        // M0 Hopper tile reduce, emitted by lower_warp_group_tiles. Args:
-        // [reg_index (0..7), Load(A_shared, 0), Load(B_shared, 0)]. The collective
-        // is emitted ONCE per kernel (all 8 per-thread fragment calls extract from
-        // the cached {f32 x 8} accumulator). See gpu_recognizer_design.md S5b.
-        internal_assert(op->args.size() == 3)
-            << "wgmma_m64n16k16_f32 expects (reg_index, LoadA, LoadB)\n";
-        if (getenv("HL_DEBUG_WGMMA")) {
-            debug(0) << "[wgtile] codegen wgmma frag reg=" << op->args[0] << "\n";
-        }
+        // Hopper tile reduce, emitted by lower_warp_group_tiles. Args:
+        // [reg_index (0..7), n_chunks, Load(A_shared, base), strideA, Load(B_shared, base),
+        // strideB]. The contraction is K = n_chunks*16; each chunk is one wgmma.mma_async,
+        // all accumulating into the same {f32 x 8} D fragment (scaleD carry). The collective
+        // is emitted ONCE per kernel (all 8 per-thread fragment calls extract from the cached
+        // accumulator). See gpu_recognizer_design.md S5b.
+        internal_assert(op->args.size() == 6)
+            << "wgmma_m64n16k16_f32 expects (reg, n_chunks, LoadA, strideA, LoadB, strideB)\n";
         auto reg = as_const_int(op->args[0]);
-        const Load *la = op->args[1].as<Load>();
-        const Load *lb = op->args[2].as<Load>();
-        internal_assert(reg && la && lb)
-            << "wgmma_m64n16k16_f32 args must be (const int, Load, Load)\n";
+        auto n_chunks = as_const_int(op->args[1]);
+        const Load *la = op->args[2].as<Load>();
+        auto stride_a = as_const_int(op->args[3]);
+        const Load *lb = op->args[4].as<Load>();
+        auto stride_b = as_const_int(op->args[5]);
+        internal_assert(reg && n_chunks && la && stride_a && lb && stride_b)
+            << "wgmma_m64n16k16_f32 args must be (const int, const int, Load, const int, Load, const int)\n";
+        if (getenv("HL_DEBUG_WGMMA")) {
+            debug(0) << "[wgtile] codegen wgmma frag reg=" << *reg << " n_chunks=" << *n_chunks
+                     << " strideA=" << *stride_a << " strideB=" << *stride_b << "\n";
+        }
 
         if (cached_wgmma_acc == nullptr) {
-            // M0 first-guess core-matrix offsets for a 64x16 (A) / 16x16 (B) f16
-            // K-major tile (Colfax/CUTLASS canonical no-swizzle): LBO 128 B, SBO
-            // 256 B. la->index / lb->index carry the tile origin the recognizer
-            // captured (As@0, Bs@1024 elems). Pinned against the oracle on H100.
-            llvm::Value *desc_a = build_wgmma_descriptor(la->name, la->type.element_of(),
-                                                         la->index, /*lbo*/ 128, /*sbo*/ 256);
-            llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
-                                                         lb->index, /*lbo*/ 128, /*sbo*/ 256);
-
-            // Zeroed {f32 x 8} accumulator (scaleD=0 overwrites on this single
-            // k=16 step, so the zero init is just for a well-defined value).
+            // Zeroed {f32 x 8} D fragment. Chunk 0 overwrites (scaleD=0); the zero init
+            // is belt-and-suspenders. First-guess core-matrix offsets for a 64x16 (A) /
+            // 16x16 (B) f16 K-major tile (Colfax/CUTLASS no-swizzle): LBO 128 B, SBO 256 B.
             llvm::Type *f32 = llvm::Type::getFloatTy(*context);
             llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(8, f32));
             llvm::Value *acc = llvm::UndefValue::get(acc_ty);
@@ -349,10 +347,22 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                 llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, s, "", /*hasSideEffects*/ true);
                 builder->CreateCall(ia);
             };
-            // fence (make prior register/shared writes visible to the async MMA),
-            // one mma_async (k=16, scaleD=0), commit the group, wait for it.
+            // fence (make prior register/shared writes visible to the async MMA), then the
+            // K/16 chunks issued back-to-back into one commit group, accumulating into D
+            // (chunk 0 scaleD=0 overwrite, rest scaleD=1 carry), then commit + wait once.
+            // NOTE: this wait_group 0 is the *unpipelined* placement (num_stages=1 in Triton
+            // terms). The waits are emitted separably so a future loop-pipelining pass can
+            // hoist them across a staging loop without touching this mma path.
             emit_wgmma_asm("wgmma.fence.sync.aligned;");
-            acc = emit_wgmma_m64n16k16(acc, desc_a, desc_b, /*scale_d*/ false);
+            for (int c = 0; c < (int)*n_chunks; c++) {
+                Expr off_a = simplify(la->index + Expr((int)(*stride_a) * c));
+                Expr off_b = simplify(lb->index + Expr((int)(*stride_b) * c));
+                llvm::Value *desc_a = build_wgmma_descriptor(la->name, la->type.element_of(),
+                                                             off_a, /*lbo*/ 128, /*sbo*/ 256);
+                llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
+                                                             off_b, /*lbo*/ 128, /*sbo*/ 256);
+                acc = emit_wgmma_m64n16k16(acc, desc_a, desc_b, /*scale_d*/ c > 0);
+            }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
             cached_wgmma_acc = acc;
