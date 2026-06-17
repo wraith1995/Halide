@@ -1940,15 +1940,15 @@ private:
     Stmt visit(const For *op) override {
         ScopedValue<DeviceAPI> d(device_api,
                                  op->device_api != DeviceAPI::None ? op->device_api : device_api);
-        if (op->warps_per_group >= 0) {
-            // A gpu_warps work-distribution axis: peel its N iterations into N
-            // symmetric warp-group branches (the group index substituted in as a
-            // constant), then flat-partition them through the same core that serves
-            // async Forks — sum across groups, warp-aligned per group. This is the
-            // data-symmetric source of warp groups (vs the role-asymmetric Fork);
-            // both feed partition_warp_groups. (warps_per_group == 0 = derive each
-            // group's size from its thread tile; an explicit count is the wgmma-scope
-            // override, handled when that lands.)
+        if (op->warps_per_group > 0) {
+            // EXPLICIT wgmma-scope sizing: each group is exactly N warps regardless of
+            // the thread tile (idle lanes masked). That padding can't be a plain thread
+            // dimension, so we peel into N symmetric warp-group branches (group index
+            // substituted in) and flat-partition them via partition_warp_groups (the
+            // same core the async Fork uses). NOTE: the guarded branches can't yet carry
+            // a correct shared-memory barrier (that needs the WarpGroup-scope scoped
+            // barrier — research/gpu_sync_model.md step 4); explicit-size groups are
+            // pointwise-only until then.
             Stmt body = mutate(op->body);
             auto n = as_const_int(simplify(op->extent()));
             user_assert(n && *n > 0)
@@ -1962,6 +1962,14 @@ private:
             }
             return partition_warp_groups(branches, warp_size, device_api, op->warps_per_group);
         }
+        // A DERIVED-size (warps_per_group == 0) symmetric gpu_warps axis lowers as a
+        // normal thread sub-dimension: the hardware decodes the group index from
+        // threadIdx (group = high thread dim, within-group lane = low dims), so the
+        // group's produce/consume stay separate thread loops at block level and the
+        // standard fusion + barrier pipeline applies — a shared-memory consumer gets a
+        // correct whole-CTA barrier reached by every lane (the "decode model",
+        // research/gpu_sync_model.md §3). The role-asymmetric Fork still peels (visit
+        // Fork). warps_per_group < 0 (not a gpu_warps axis) is also unchanged here.
         return IRMutator::visit(op);
     }
 
