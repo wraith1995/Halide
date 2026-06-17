@@ -1987,6 +1987,10 @@ Stage &Stage::gpu_warps(const VarOrRVar &wg, int warps_per_group, DeviceAPI devi
     // SUM rather than max. See research/gpu_warps_model.md.
     set_dim_type(wg, ForType::GPUThread);
     set_dim_warps_per_group(wg, warps_per_group);
+    // The group is the warp-group collective scope: a vectorized tile reduce nested
+    // inside it inherits WarpGroup realization, which the recognizer keys on to emit
+    // wgmma (the peer of gpu_lanes -> Warp). See research/gpu_recognizer_design.md.
+    set_dim_realization(wg, Internal::GPUVectorScope::WarpGroup);
     return *this;
 }
 
