@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; i++) {
             in(i) = i * 3 + 5;
         }
-        Func in_b = BoundaryCondition::repeat_edge(in);
+        Func in_b = BoundaryConditions::repeat_edge(in);
 
         Func staged("staged"), cons("cons");
         Var x("x"), xo("xo"), xb("xb"), wg("wg"), tx("tx");
