@@ -24,8 +24,16 @@ int main(int argc, char **argv) {
     struct Case {
         int groups;
         int threads_per_group;
+        int explicit_warps;  // 0 = derive group size from the tile; N = force N warps/group
     };
-    const Case cases[] = {{2, 32}, {4, 32}, {3, 48}, {2, 64}};
+    const Case cases[] = {
+        {2, 32, 0},
+        {4, 32, 0},
+        {3, 48, 0},
+        {2, 64, 0},
+        {2, 32, 2},  // explicit 2-warp groups, only 32 lanes work (32 idle) — wgmma-scope sizing
+        {3, 32, 4},  // explicit 4-warp groups, 32 lanes work (96 idle)
+    };
 
     for (const Case &c : cases) {
         const int per_block = c.groups * c.threads_per_group;
@@ -42,7 +50,7 @@ int main(int argc, char **argv) {
             .split(x, xo, xb, per_block)
             .split(xb, wg, tx, c.threads_per_group)
             .gpu_blocks(xo)
-            .gpu_warps(wg)        // c.groups warp groups, size derived from tx
+            .gpu_warps(wg, c.explicit_warps)  // c.groups warp groups; size derived or explicit
             .gpu_threads(tx);
 
         Buffer<int> out = f.realize({n}, target);
@@ -51,13 +59,13 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; i++) {
             int correct = i * 2 + 1;
             if (out(i) != correct) {
-                printf("gpu_warps(groups=%d, threads_per_group=%d): out(%d) = %d instead of %d\n",
-                       c.groups, c.threads_per_group, i, out(i), correct);
+                printf("gpu_warps(groups=%d, threads_per_group=%d, explicit_warps=%d): out(%d) = %d instead of %d\n",
+                       c.groups, c.threads_per_group, c.explicit_warps, i, out(i), correct);
                 return 1;
             }
         }
-        printf("gpu_warps groups=%d threads_per_group=%d (per_block=%d): OK\n",
-               c.groups, c.threads_per_group, per_block);
+        printf("gpu_warps groups=%d threads_per_group=%d explicit_warps=%d (per_block=%d): OK\n",
+               c.groups, c.threads_per_group, c.explicit_warps, per_block);
     }
 
     printf("Success!\n");

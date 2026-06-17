@@ -1876,7 +1876,7 @@ public:
 // per-group sizing/guard/flat-id math is identical for both; only how the branches
 // are produced differs.
 Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
-                           DeviceAPI device_api) {
+                           DeviceAPI device_api, int warps_per_group_override = 0) {
     const std::string ftid = unique_name("warp_flat") + gpu_thread_name(0);
     Expr fv = Variable::make(Int(32), ftid);
     Expr base = 0;
@@ -1890,7 +1890,14 @@ Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
             maxe[i] = te.extent[i].defined() ? te.extent[i] : Expr(1);
             prod = simplify(prod * maxe[i]);
         }
-        Expr size = simplify(((prod + (warp_size - 1)) / warp_size) * warp_size);  // warp-aligned group size
+        // Group size: an explicit warps_per_group override (the wgmma scope, D2)
+        // fixes it at N warps regardless of the thread tile; otherwise derive it
+        // from the tile, warp-aligned (D4). The thread tile still maps into the
+        // first `prod` lanes (FlattenBranchThreads masks the rest), so an override
+        // larger than the tile leaves the extra warps idle.
+        Expr size = warps_per_group_override > 0
+                        ? Expr(warps_per_group_override * warp_size)
+                        : simplify(((prod + (warp_size - 1)) / warp_size) * warp_size);  // warp-aligned group size
         Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)(branch);
         // Group range guard: only this group's warp range runs the branch (incl. its
         // cross-group barriers), so per-edge barrier counts (= sum of two groups) hold.
@@ -1948,7 +1955,7 @@ private:
             for (int64_t g = 0; g < *n; g++) {
                 branches.push_back(substitute(op->name, op->min + (int)g, body));
             }
-            return partition_warp_groups(branches, warp_size, device_api);
+            return partition_warp_groups(branches, warp_size, device_api, op->warps_per_group);
         }
         return IRMutator::visit(op);
     }
