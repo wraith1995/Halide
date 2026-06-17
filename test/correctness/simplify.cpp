@@ -813,14 +813,14 @@ void check_vectors() {
 
     Expr bool_vector = Variable::make(Bool(4), "bool_vector");
     Expr int_vector = Variable::make(Int(32, 4), "int_vector");
-    check(VectorReduce::make(VectorReduce::And, Broadcast::make(bool_vector, 4), 1),
-          VectorReduce::make(VectorReduce::And, bool_vector, 1));
-    check(VectorReduce::make(VectorReduce::Or, Broadcast::make(bool_vector, 4), 2),
-          Broadcast::make(VectorReduce::make(VectorReduce::Or, bool_vector, 1), 2));
-    check(VectorReduce::make(VectorReduce::Min, Broadcast::make(int_vector, 4), 4),
-          Broadcast::make(VectorReduce::make(VectorReduce::Min, int_vector, 1), 4));
-    check(VectorReduce::make(VectorReduce::Max, Broadcast::make(int_vector, 4), 8),
-          Broadcast::make(VectorReduce::make(VectorReduce::Max, int_vector, 2), 4));
+    check(VectorReduce::make(VectorReduce::And, Broadcast::make(bool_vector, 4), 1, Halide::Internal::GPUVectorScope::Register),
+          VectorReduce::make(VectorReduce::And, bool_vector, 1, Halide::Internal::GPUVectorScope::Register));
+    check(VectorReduce::make(VectorReduce::Or, Broadcast::make(bool_vector, 4), 2, Halide::Internal::GPUVectorScope::Register),
+          Broadcast::make(VectorReduce::make(VectorReduce::Or, bool_vector, 1, Halide::Internal::GPUVectorScope::Register), 2));
+    check(VectorReduce::make(VectorReduce::Min, Broadcast::make(int_vector, 4), 4, Halide::Internal::GPUVectorScope::Register),
+          Broadcast::make(VectorReduce::make(VectorReduce::Min, int_vector, 1, Halide::Internal::GPUVectorScope::Register), 4));
+    check(VectorReduce::make(VectorReduce::Max, Broadcast::make(int_vector, 4), 8, Halide::Internal::GPUVectorScope::Register),
+          Broadcast::make(VectorReduce::make(VectorReduce::Max, int_vector, 2, Halide::Internal::GPUVectorScope::Register), 4));
 
     {
         Expr x = Variable::make(Int(32), "x");
@@ -829,19 +829,19 @@ void check_vectors() {
         // == Symbolic Strides ==
 
         // 1. Min: Scalar Reduction (arg_lanes=4, lanes=1 -> factor=4)
-        check(VectorReduce::make(VectorReduce::Min, Ramp::make(x, y, 4), 1),
+        check(VectorReduce::make(VectorReduce::Min, Ramp::make(x, y, 4), 1, Halide::Internal::GPUVectorScope::Register),
               min(y, 0) * 3 + x);
 
         // 2. Min: Vector Reduction (arg_lanes=6, lanes=2 -> factor=3)
-        check(VectorReduce::make(VectorReduce::Min, Ramp::make(x, y, 6), 2),
+        check(VectorReduce::make(VectorReduce::Min, Ramp::make(x, y, 6), 2, Halide::Internal::GPUVectorScope::Register),
               Ramp::make(min(y, 0) * 2 + x, y * 3, 2));
 
         // 3. Max: Scalar Reduction (arg_lanes=4, lanes=1 -> factor=4)
-        check(VectorReduce::make(VectorReduce::Max, Ramp::make(x, y, 4), 1),
+        check(VectorReduce::make(VectorReduce::Max, Ramp::make(x, y, 4), 1, Halide::Internal::GPUVectorScope::Register),
               max(y, 0) * 3 + x);
 
         // 4. Max: Vector Reduction (arg_lanes=6, lanes=2 -> factor=3)
-        check(VectorReduce::make(VectorReduce::Max, Ramp::make(x, y, 6), 2),
+        check(VectorReduce::make(VectorReduce::Max, Ramp::make(x, y, 6), 2, Halide::Internal::GPUVectorScope::Register),
               Ramp::make(max(y, 0) * 2 + x, y * 3, 2));
 
         // == Constant Strides (Positive & Negative) ==
@@ -850,47 +850,47 @@ void check_vectors() {
         // Block 1: min(x, x+2, x+4, x+6) -> x
         // Expected Base: x + min(2 * 3, 0) -> x + 0 -> x
         // Expected Stride: 2 * 4 = 8
-        check(VectorReduce::make(VectorReduce::Min, Ramp::make(x, 2, 8), 2),
+        check(VectorReduce::make(VectorReduce::Min, Ramp::make(x, 2, 8), 2, Halide::Internal::GPUVectorScope::Register),
               Ramp::make(x, 8, 2));
 
         // 6. Max: Positive Stride (arg_lanes=8, lanes=2 -> factor=4, stride=2)
         // Block 1: max(x, x+2, x+4, x+6) -> x+6
         // Expected Base: x + max(2 * 3, 0) -> x + 6
         // Expected Stride: 2 * 4 = 8
-        check(VectorReduce::make(VectorReduce::Max, Ramp::make(x, 2, 8), 2),
+        check(VectorReduce::make(VectorReduce::Max, Ramp::make(x, 2, 8), 2, Halide::Internal::GPUVectorScope::Register),
               Ramp::make(x + 6, 8, 2));
 
         // 7. Min: Negative Stride (arg_lanes=8, lanes=2 -> factor=4, stride=-2)
         // Block 1: min(x, x-2, x-4, x-6) -> x-6
         // Expected Base: x + min(-2 * 3, 0) -> x - 6
         // Expected Stride: -2 * 4 = -8
-        check(VectorReduce::make(VectorReduce::Min, Ramp::make(x, -2, 8), 2),
+        check(VectorReduce::make(VectorReduce::Min, Ramp::make(x, -2, 8), 2, Halide::Internal::GPUVectorScope::Register),
               Ramp::make(x + -6, -8, 2));
 
         // 8. Max: Negative Stride (arg_lanes=8, lanes=2 -> factor=4, stride=-2)
         // Block 1: max(x, x-2, x-4, x-6) -> x
         // Expected Base: x + max(-2 * 3, 0) -> x + 0 -> x
         // Expected Stride: -2 * 4 = -8
-        check(VectorReduce::make(VectorReduce::Max, Ramp::make(x, -2, 8), 2),
+        check(VectorReduce::make(VectorReduce::Max, Ramp::make(x, -2, 8), 2, Halide::Internal::GPUVectorScope::Register),
               Ramp::make(x, -8, 2));
     }
 
     {
         // h_add(broadcast(x, 8), 4) should simplify to broadcast(x * 2, 4)
-        check(VectorReduce::make(VectorReduce::Add, broadcast(x, 8), 4),
+        check(VectorReduce::make(VectorReduce::Add, broadcast(x, 8), 4, Halide::Internal::GPUVectorScope::Register),
               broadcast(x * 2, 4));
     }
 
     {
         Expr const_u8 = cast(UInt(8), 3);
-        check(VectorReduce::make(VectorReduce::Add, broadcast(const_u8, 9), 3), broadcast(cast(UInt(8), 9), 3));
+        check(VectorReduce::make(VectorReduce::Add, broadcast(const_u8, 9), 3, Halide::Internal::GPUVectorScope::Register), broadcast(cast(UInt(8), 9), 3));
     }
 
     {
         // Test VectorReduce::Add on a variable of unsigned type to ensure the multiplied factor
         // keeps the correct type and avoids type-mismatch assertion failures.
         Expr u8_x = Variable::make(UInt(8), "u8_x");
-        check(VectorReduce::make(VectorReduce::Add, broadcast(u8_x, 9), 3), broadcast(u8_x * cast(UInt(8), 3), 3));
+        check(VectorReduce::make(VectorReduce::Add, broadcast(u8_x, 9), 3, Halide::Internal::GPUVectorScope::Register), broadcast(u8_x * cast(UInt(8), 3), 3));
     }
 
     {
@@ -908,7 +908,7 @@ void check_vectors() {
         Expr inner = Select::make(Broadcast::make(cond, 2),
                                   Broadcast::make(lhs, 2),
                                   Broadcast::make(rhs, 2));
-        check(cast(UInt(1), VectorReduce::make(VectorReduce::Add, inner, 1)),
+        check(cast(UInt(1), VectorReduce::make(VectorReduce::Add, inner, 1, Halide::Internal::GPUVectorScope::Register)),
               cast(UInt(1), 0));
     }
 }
@@ -1838,7 +1838,7 @@ void check_boolean() {
 
     // A for loop is also an if statement that the extent is greater than zero
     Stmt body = AssertStmt::make(y == z, y);
-    Stmt loop = For::make("t", 0, x, ForType::Serial, Partition::Auto, DeviceAPI::None, body);
+    Stmt loop = For::make("t", 0, x, ForType::Serial, Partition::Auto, DeviceAPI::None, body, Halide::Internal::GPUVectorScope::Register, -1);
     check(IfThenElse::make(0 <= x, loop), loop);
 
     // A for loop where the min equals the max is just the body
@@ -2286,9 +2286,9 @@ void check_unreachable() {
     check(Call::make(Int(32), Call::if_then_else, {x != 0, y, unreachable()}, Call::PureIntrinsic), y);
     check(Call::make(Int(32), Call::if_then_else, {x != 0, unreachable(), y}, Call::PureIntrinsic), y);
 
-    check(Block::make(not_no_op(y), For::make("i", 0, 1, ForType::Serial, Partition::Auto, DeviceAPI::None, Evaluate::make(unreachable()))),
+    check(Block::make(not_no_op(y), For::make("i", 0, 1, ForType::Serial, Partition::Auto, DeviceAPI::None, Evaluate::make(unreachable()), Halide::Internal::GPUVectorScope::Register, -1)),
           Evaluate::make(unreachable()));
-    check(For::make("i", 0, x, ForType::Serial, Partition::Auto, DeviceAPI::None, Evaluate::make(unreachable())),
+    check(For::make("i", 0, x, ForType::Serial, Partition::Auto, DeviceAPI::None, Evaluate::make(unreachable()), Halide::Internal::GPUVectorScope::Register, -1),
           Evaluate::make(0));
 }
 
@@ -2523,7 +2523,7 @@ int main(int argc, char **argv) {
 
     {
         Stmt body = AssertStmt::make(x >= 0, y);
-        check(For::make("t", 0, x, ForType::Serial, Partition::Auto, DeviceAPI::None, body),
+        check(For::make("t", 0, x, ForType::Serial, Partition::Auto, DeviceAPI::None, body, Halide::Internal::GPUVectorScope::Register, -1),
               Evaluate::make(0));
     }
 

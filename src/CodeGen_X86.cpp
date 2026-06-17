@@ -923,7 +923,7 @@ void CodeGen_X86::codegen_vector_reduce(const VectorReduce *op, const Expr &init
             // Cast to uint64 instead
             Expr equiv = Cast::make(UInt(64, cast->value.type().lanes()), cast->value);
             // Reduce on that to hit psadbw
-            equiv = VectorReduce::make(VectorReduce::Add, equiv, op->type.lanes());
+            equiv = VectorReduce::make(VectorReduce::Add, equiv, op->type.lanes(), GPUVectorScope::Register);
             // Then cast that to the desired type
             equiv = Cast::make(cast->type.with_lanes(equiv.type().lanes()), equiv);
             codegen(equiv);

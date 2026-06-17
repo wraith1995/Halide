@@ -750,7 +750,7 @@ class InjectHexagonRpc : public IRMutator {
             body = LetStmt::make(loop->name, loop->min, loop->body);
         } else {
             body = For::make(loop->name, loop->min, loop->max, loop->for_type, loop->partition_policy,
-                             DeviceAPI::None, loop->body);
+                             DeviceAPI::None, loop->body, loop->realization, loop->warps_per_group);
         }
 
         // Build a closure for the device code.

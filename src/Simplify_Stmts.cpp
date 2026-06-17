@@ -296,13 +296,13 @@ Stmt Simplify::visit(const For *op) {
                !stmt_uses_var(new_body, op->name) &&
                !is_const_zero(new_min) &&
                is_const(shifted_max = mutate((new_max - new_min), nullptr))) {
-        return For::make(op->name, make_zero(Int(32)), shifted_max, op->for_type, op->partition_policy, op->device_api, new_body);
+        return For::make(op->name, make_zero(Int(32)), shifted_max, op->for_type, op->partition_policy, op->device_api, new_body, op->realization, op->warps_per_group);
     } else if (op->min.same_as(new_min) &&
                op->max.same_as(new_max) &&
                op->body.same_as(new_body)) {
         return op;
     } else {
-        return For::make(op->name, new_min, new_max, op->for_type, op->partition_policy, op->device_api, new_body);
+        return For::make(op->name, new_min, new_max, op->for_type, op->partition_policy, op->device_api, new_body, op->realization, op->warps_per_group);
     }
 }
 

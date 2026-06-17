@@ -284,7 +284,7 @@ void IRGraphCXXPrinter::test() {
 #define CODE(X) X
     {
         // This:
-        Expr e = Select::make(Mod::make(Ramp::make(10, 314, 8), Broadcast::make(10, 8)) < Variable::make(Int(32), "p"), Broadcast::make(40, 8) + Ramp::make(4, 8, 8), VectorReduce::make(VectorReduce::Add, Ramp::make(0, 1, 16), 8));
+        Expr e = Select::make(Mod::make(Ramp::make(10, 314, 8), Broadcast::make(10, 8)) < Variable::make(Int(32), "p"), Broadcast::make(40, 8) + Ramp::make(4, 8, 8), VectorReduce::make(VectorReduce::Add, Ramp::make(0, 1, 16), 8, Halide::Internal::GPUVectorScope::Register));
         e = e * e;  // make it a graph
         e = cast(Float(32, 8), e);
         e = reinterpret(Int(32, 8), e);
@@ -315,7 +315,7 @@ void IRGraphCXXPrinter::test() {
     X(Expr expr_15 = IntImm::make(Type(Type::Int, 32, 1), 0);)            \
     X(Expr expr_16 = IntImm::make(Type(Type::Int, 32, 1), 1);)            \
     X(Expr expr_17 = Ramp::make(expr_15, expr_16, 16);)                   \
-    X(Expr expr_18 = VectorReduce::make(VectorReduce::Add, expr_17, 8);)  \
+    X(Expr expr_18 = VectorReduce::make(VectorReduce::Add, expr_17, 8, Halide::Internal::GPUVectorScope::Register);)  \
     X(Expr expr_19 = Select::make(expr_8, expr_14, expr_18);)             \
     X(Expr expr_20 = Mul::make(expr_19, expr_19);)                        \
     X(Expr expr_21 = Cast::make(Type(Type::Float, 32, 8), expr_20);)      \

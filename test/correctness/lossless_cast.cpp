@@ -50,11 +50,11 @@ int main(int argc, char **argv) {
     e = cast(u32, var_u8);
     found_error |= check_lossless_cast(u16, e, cast(u16, var_u8));
 
-    e = VectorReduce::make(VectorReduce::Add, cast(u16x, var_u8x), 1);
+    e = VectorReduce::make(VectorReduce::Add, cast(u16x, var_u8x), 1, Halide::Internal::GPUVectorScope::Register);
     found_error |= check_lossless_cast(u16, e, cast(u16, e));
 
-    e = VectorReduce::make(VectorReduce::Add, cast(u32x, var_u8x), 1);
-    found_error |= check_lossless_cast(u16, e, VectorReduce::make(VectorReduce::Add, cast(u16x, var_u8x), 1));
+    e = VectorReduce::make(VectorReduce::Add, cast(u32x, var_u8x), 1, Halide::Internal::GPUVectorScope::Register);
+    found_error |= check_lossless_cast(u16, e, VectorReduce::make(VectorReduce::Add, cast(u16x, var_u8x), 1, Halide::Internal::GPUVectorScope::Register));
 
     e = cast(u32, var_u8) - 16;
     found_error |= check_lossless_cast(u16, e, Expr());
@@ -84,7 +84,7 @@ int main(int argc, char **argv) {
     // Check narrowing a vector reduction of something narrowable to bool ...
     auto make_reduce = [&](Type t, VectorReduce::Operator op) {
         return VectorReduce::make(op,
-                                  cast(t.with_lanes(4), Ramp::make(x, 1, 4) > 4), 2);
+                                  cast(t.with_lanes(4), Ramp::make(x, 1, 4) > 4), 2, Halide::Internal::GPUVectorScope::Register);
     };
 
     // It's OK to narrow it to 8-bit.

@@ -338,7 +338,7 @@ class SimplifyUsingBounds : public IRMutator {
         containing_loops.push_back({op->name, {min, max}});
         Stmt body = mutate(op->body);
         containing_loops.pop_back();
-        return For::make(op->name, min, max, op->for_type, op->partition_policy, op->device_api, body);
+        return For::make(op->name, min, max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
     }
 
 public:
@@ -380,7 +380,7 @@ class TrimNoOps : public IRMutator {
             if (body.same_as(op->body)) {
                 return op;
             } else {
-                return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body);
+                return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
             }
         }
 
@@ -393,7 +393,7 @@ class TrimNoOps : public IRMutator {
 
         if (i.is_everything()) {
             // Nope.
-            return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body);
+            return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
         }
 
         if (i.is_empty()) {
@@ -429,7 +429,7 @@ class TrimNoOps : public IRMutator {
             new_max = old_max;
         }
 
-        Stmt stmt = For::make(op->name, new_min_var, new_max_var, op->for_type, op->partition_policy, op->device_api, body);
+        Stmt stmt = For::make(op->name, new_min_var, new_max_var, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
         stmt = LetStmt::make(new_max_name, new_max, stmt);
         stmt = LetStmt::make(new_min_name, new_min, stmt);
         stmt = LetStmt::make(old_max_name, old_max, stmt);

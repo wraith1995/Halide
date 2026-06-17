@@ -2683,8 +2683,8 @@ bool CodeGen_ARM::codegen_dot_product_vector_reduce(const VectorReduce *op, cons
         }
         if (expr_match(p.pattern, op->value, matches)) {
             if (factor != p.factor) {
-                Expr equiv = VectorReduce::make(op->op, op->value, op->value.type().lanes() / p.factor);
-                equiv = VectorReduce::make(op->op, equiv, op->type.lanes());
+                Expr equiv = VectorReduce::make(op->op, op->value, op->value.type().lanes() / p.factor, GPUVectorScope::Register);
+                equiv = VectorReduce::make(op->op, equiv, op->type.lanes(), GPUVectorScope::Register);
                 codegen_vector_reduce(equiv.as<VectorReduce>(), init);
                 return true;
             }
@@ -2852,7 +2852,7 @@ bool CodeGen_ARM::codegen_across_vector_reduce(const VectorReduce *op, const Exp
             internal_error << "unreachable";
         }
 
-        Expr equiv = VectorReduce::make(op->op, Shuffle::make_concat({val, padding}), 1);
+        Expr equiv = VectorReduce::make(op->op, Shuffle::make_concat({val, padding}), 1, GPUVectorScope::Register);
         if (init.defined()) {
             equiv = binop(equiv, init);
         }

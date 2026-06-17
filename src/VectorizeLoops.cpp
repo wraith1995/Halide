@@ -184,12 +184,12 @@ Interval bounds_of_lanes(const Expr &e) {
     // If all else fails, just take the explicit min and max over the
     // lanes
     if (e.type().is_bool()) {
-        Expr min_lane = VectorReduce::make(VectorReduce::And, e, 1);
-        Expr max_lane = VectorReduce::make(VectorReduce::Or, e, 1);
+        Expr min_lane = VectorReduce::make(VectorReduce::And, e, 1, GPUVectorScope::Register);
+        Expr max_lane = VectorReduce::make(VectorReduce::Or, e, 1, GPUVectorScope::Register);
         return {min_lane, max_lane};
     } else {
-        Expr min_lane = VectorReduce::make(VectorReduce::Min, e, 1);
-        Expr max_lane = VectorReduce::make(VectorReduce::Max, e, 1);
+        Expr min_lane = VectorReduce::make(VectorReduce::Min, e, 1, GPUVectorScope::Register);
+        Expr max_lane = VectorReduce::make(VectorReduce::Max, e, 1, GPUVectorScope::Register);
         return {min_lane, max_lane};
     }
 }
@@ -245,7 +245,7 @@ class SerializeLoops : public IRMutator {
     Stmt visit(const For *op) override {
         if (op->for_type == ForType::Vectorized) {
             return For::make(op->name, op->min, op->max,
-                             ForType::Serial, op->partition_policy, op->device_api, mutate(op->body));
+                             ForType::Serial, op->partition_policy, op->device_api, mutate(op->body), op->realization, op->warps_per_group);
         }
 
         return IRMutator::visit(op);
@@ -1130,7 +1130,7 @@ protected:
             if (store_index.type().is_scalar()) {
                 // The index doesn't depend on the value being
                 // vectorized, so it's a total reduction.
-                b = VectorReduce::make(reduce_op, b, 1);
+                b = VectorReduce::make(reduce_op, b, 1, GPUVectorScope::Register);
             } else {
 
                 // The output lanes is >1, so there must be at least one
@@ -1189,7 +1189,7 @@ protected:
 
                 if (inner_dup > 1) {
                     int new_lanes = b_shape_mr.total_lanes() / inner_dup;
-                    b = VectorReduce::make(reduce_op, b, new_lanes);
+                    b = VectorReduce::make(reduce_op, b, new_lanes, GPUVectorScope::Register);
                     b_shape_mr.slice(0, make_zero(b_shape_mr.base.type()));
                 }
 
@@ -1362,7 +1362,7 @@ protected:
         for (int ix = vectorized_vars.size() - 1; ix >= 0; ix--) {
             s = For::make(vectorized_vars[ix].name, vectorized_vars[ix].min,
                           vectorized_vars[ix].min + vectorized_vars[ix].lanes - 1,
-                          ForType::Serial, Partition::Auto, DeviceAPI::None, s);
+                          ForType::Serial, Partition::Auto, DeviceAPI::None, s, GPUVectorScope::Register, -1);
         }
 
         return s;

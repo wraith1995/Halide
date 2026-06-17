@@ -349,8 +349,8 @@ void CodeGen_WebAssembly::codegen_vector_reduce(const VectorReduce *op, const Ex
         }
         if (expr_match(p.pattern, op->value, matches)) {
             if (factor != p.factor) {
-                Expr equiv = VectorReduce::make(op->op, op->value, op->value.type().lanes() / p.factor);
-                equiv = VectorReduce::make(op->op, equiv, op->type.lanes());
+                Expr equiv = VectorReduce::make(op->op, op->value, op->value.type().lanes() / p.factor, GPUVectorScope::Register);
+                equiv = VectorReduce::make(op->op, equiv, op->type.lanes(), GPUVectorScope::Register);
                 codegen_vector_reduce(equiv.as<VectorReduce>(), init);
                 return;
             }

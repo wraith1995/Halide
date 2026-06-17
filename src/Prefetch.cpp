@@ -251,7 +251,7 @@ protected:
 
         Stmt stmt;
         if (!body.same_as(op->body)) {
-            stmt = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, std::move(body));
+            stmt = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, std::move(body), op->realization, op->warps_per_group);
         } else {
             stmt = op;
         }
@@ -307,7 +307,7 @@ protected:
             stmt = Evaluate::make(Call::make(prefetch->type, Call::prefetch, args, Call::Intrinsic));
             for (size_t i = 0; i < index_names.size(); ++i) {
                 stmt = For::make(index_names[i], 0, prefetch->args[(i + max_dim) * 2 + 2] - 1,
-                                 ForType::Serial, Partition::Auto, DeviceAPI::None, stmt);
+                                 ForType::Serial, Partition::Auto, DeviceAPI::None, stmt, GPUVectorScope::Register, -1);
             }
             debug(5) << "\nReduce prefetch to " << max_dim << " dim:\n"
                      << "Before:\n"
@@ -379,7 +379,7 @@ protected:
             stmt = Evaluate::make(Call::make(prefetch->type, Call::prefetch, args, Call::Intrinsic));
             for (size_t i = 0; i < index_names.size(); ++i) {
                 stmt = For::make(index_names[i], 0, extents[i] - 1,
-                                 ForType::Serial, Partition::Auto, DeviceAPI::None, stmt);
+                                 ForType::Serial, Partition::Auto, DeviceAPI::None, stmt, GPUVectorScope::Register, -1);
             }
             debug(5) << "\nSplit prefetch to max of " << max_byte_size << " bytes:\n"
                      << "Before:\n"

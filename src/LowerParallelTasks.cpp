@@ -278,7 +278,7 @@ struct LowerParallelTasks : public IRMutator {
                                        ForType::Serial,
                                        t.partition_policy,
                                        DeviceAPI::None,
-                                       t.body);
+                                       t.body, GPUVectorScope::Register, -1);
                 } else {
                     internal_assert(is_const_one(t.extent));
                 }

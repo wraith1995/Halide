@@ -4530,7 +4530,7 @@ void CodeGen_LLVM::codegen_vector_reduce(const VectorReduce *op, const Expr &ini
     if (op->type.is_bool() && op->op == VectorReduce::Or) {
         // Cast to u8, use max, cast back to bool.
         Expr equiv = cast(op->value.type().with_bits(8), op->value);
-        equiv = VectorReduce::make(VectorReduce::Max, equiv, op->type.lanes());
+        equiv = VectorReduce::make(VectorReduce::Max, equiv, op->type.lanes(), GPUVectorScope::Register);
         if (init.defined()) {
             equiv = max(equiv, init);
         }
@@ -4542,7 +4542,7 @@ void CodeGen_LLVM::codegen_vector_reduce(const VectorReduce *op, const Expr &ini
     if (op->type.is_bool() && op->op == VectorReduce::And) {
         // Cast to u8, use min, cast back to bool.
         Expr equiv = cast(op->value.type().with_bits(8), op->value);
-        equiv = VectorReduce::make(VectorReduce::Min, equiv, op->type.lanes());
+        equiv = VectorReduce::make(VectorReduce::Min, equiv, op->type.lanes(), GPUVectorScope::Register);
         equiv = cast(op->type, equiv);
         if (init.defined()) {
             equiv = min(equiv, init);
@@ -4553,7 +4553,7 @@ void CodeGen_LLVM::codegen_vector_reduce(const VectorReduce *op, const Expr &ini
 
     if (elt == Float(16) && upgrade_type_for_arithmetic(elt) != elt) {
         Expr equiv = cast(op->value.type().with_bits(32), op->value);
-        equiv = VectorReduce::make(op->op, equiv, op->type.lanes());
+        equiv = VectorReduce::make(op->op, equiv, op->type.lanes(), GPUVectorScope::Register);
         if (init.defined()) {
             equiv = binop(equiv, init);
         }
@@ -4711,7 +4711,7 @@ void CodeGen_LLVM::codegen_vector_reduce(const VectorReduce *op, const Expr &ini
                 equiv = next;
             }
         }
-        equiv = VectorReduce::make(op->op, equiv, 1);
+        equiv = VectorReduce::make(op->op, equiv, 1, GPUVectorScope::Register);
         if (init.defined()) {
             equiv = binop(equiv, init);
         }
@@ -4725,7 +4725,7 @@ void CodeGen_LLVM::codegen_vector_reduce(const VectorReduce *op, const Expr &ini
         // be widening the type by 4x or more we should also factor the
         // widening into multiple stages.
         Type intermediate_type = op->value.type().with_lanes(op->value.type().lanes() / 2);
-        Expr equiv = VectorReduce::make(op->op, op->value, intermediate_type.lanes());
+        Expr equiv = VectorReduce::make(op->op, op->value, intermediate_type.lanes(), GPUVectorScope::Register);
         if (op->op == VectorReduce::Add &&
             (op->type.is_int() || op->type.is_uint()) &&
             op->type.bits() >= 32) {
@@ -4739,12 +4739,12 @@ void CodeGen_LLVM::codegen_vector_reduce(const VectorReduce *op, const Expr &ini
             if (narrower.defined()) {
                 // Widen it by 2x before the horizontal add
                 narrower = cast(narrower.type().widen(), narrower);
-                equiv = VectorReduce::make(op->op, narrower, intermediate_type.lanes());
+                equiv = VectorReduce::make(op->op, narrower, intermediate_type.lanes(), GPUVectorScope::Register);
                 // Then widen it by 2x again afterwards
                 equiv = cast(intermediate_type, equiv);
             }
         }
-        equiv = VectorReduce::make(op->op, equiv, op->type.lanes());
+        equiv = VectorReduce::make(op->op, equiv, op->type.lanes(), GPUVectorScope::Register);
         if (init.defined()) {
             equiv = binop(equiv, init);
         }

@@ -1963,7 +1963,7 @@ struct VectorReduceOp {
         internal_assert(!overflow)
             << "Overflow occurred computing the lanes of a VectorReduce node in a rewriter rule.";
         int l = (int)lanes_val.u.i64;
-        return VectorReduce::make(reduce_op, a.make(state, type_hint), l);
+        return VectorReduce::make(reduce_op, a.make(state, type_hint), l, GPUVectorScope::Register);
     }
 
     constexpr static bool foldable = false;

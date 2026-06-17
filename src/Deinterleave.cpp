@@ -203,7 +203,7 @@ private:
             }
         }
         Expr in = Shuffle::make({op->value}, input_lanes);
-        return VectorReduce::make(op->op, in, new_lanes);
+        return VectorReduce::make(op->op, in, new_lanes, op->realization);
     }
 
     Expr visit(const Broadcast *op) override {

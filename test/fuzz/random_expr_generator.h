@@ -369,7 +369,7 @@ public:
                             fuzz.PickValueInArray({VectorReduce::Add, VectorReduce::Min, VectorReduce::Max});
                     Expr val = random_expr(t.with_lanes(input_lanes), depth);
                     internal_assert(val.type().lanes() == input_lanes) << val;
-                    return VectorReduce::make(op, val, t.lanes());
+                    return VectorReduce::make(op, val, t.lanes(), Halide::Internal::GPUVectorScope::Register);
                 }
                 return random_expr(t, depth);
             });

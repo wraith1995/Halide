@@ -942,7 +942,7 @@ Expr Deserializer::deserialize_expr(Serialize::Expr type_code, const void *expr)
         const auto value = deserialize_expr(vector_reduce_expr->value_type(), vector_reduce_expr->value());
         const auto reduction_op = deserialize_vector_reduce_op(vector_reduce_expr->reduction_op());
         const int32_t lanes = vector_reduce_expr->lanes();
-        return VectorReduce::make(reduction_op, value, lanes);
+        return VectorReduce::make(reduction_op, value, lanes, GPUVectorScope::Register);
     }
     case Serialize::Expr::UndefinedExpr: {
         return Expr();

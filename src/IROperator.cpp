@@ -557,7 +557,7 @@ Expr lossless_cast(Type t,
                                              VectorReduce::And :
                                              VectorReduce::Or);
                         }
-                        return VectorReduce::make(reduce_op, v, op->type.lanes());
+                        return VectorReduce::make(reduce_op, v, op->type.lanes(), op->realization);
                     }
                 }
             }

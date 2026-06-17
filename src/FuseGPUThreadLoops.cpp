@@ -149,7 +149,7 @@ protected:
         }
         while (max_depth < block_size.threads_dimensions()) {
             s = For::make(gpu_thread_name(max_depth), 0, 0, ForType::GPUThread,
-                          Partition::Never, device_api, s);
+                          Partition::Never, device_api, s, GPUVectorScope::Register, -1);
             max_depth++;
         }
         return s;
@@ -419,7 +419,7 @@ protected:
             Expr v = Variable::make(Int(32), loop_name);
             host_side_preamble = substitute(op->name, v, host_side_preamble);
             host_side_preamble = For::make(loop_name, new_min, new_max,
-                                           ForType::Serial, Partition::Never, DeviceAPI::None, host_side_preamble);
+                                           ForType::Serial, Partition::Never, DeviceAPI::None, host_side_preamble, GPUVectorScope::Register, -1);
             if (old_preamble.defined()) {
                 host_side_preamble = Block::make(old_preamble, host_side_preamble);
             }
@@ -1321,7 +1321,7 @@ protected:
                 body = Block::make(body, make_barrier(0));
             }
             return For::make(op->name, op->min, op->max,
-                             op->for_type, op->partition_policy, op->device_api, body);
+                             op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
         } else {
             return IRMutator::visit(op);
         }
@@ -1473,14 +1473,14 @@ protected:
             string thread_id = gpu_thread_name(0);
             // Add back in any register-level allocations
             body = register_allocs.rewrap(body, thread_id);
-            body = For::make(thread_id, 0, block_size_x - 1, innermost_loop_type, op->partition_policy, op->device_api, body);
+            body = For::make(thread_id, 0, block_size_x - 1, innermost_loop_type, op->partition_policy, op->device_api, body, GPUVectorScope::Register, -1);
 
             // Rewrap the whole thing in other loops over threads
             for (int i = 1; i < block_size.threads_dimensions(); i++) {
                 thread_id = gpu_thread_name(i);
                 body = register_allocs.rewrap(body, thread_id);
                 body = For::make(thread_id, 0, block_size.num_threads(i) - 1,
-                                 ForType::GPUThread, op->partition_policy, op->device_api, body);
+                                 ForType::GPUThread, op->partition_policy, op->device_api, body, GPUVectorScope::Register, -1);
             }
             thread_id.clear();
             body = register_allocs.rewrap(body, thread_id);
@@ -1732,7 +1732,7 @@ class WrapWarpGroups : public IRMutator {
         Expr v = Variable::make(Int(32), wg);
         Stmt guarded = IfThenElse::make(v == group, body);
         // min 0, max 1 => extent 2 (group 0 = producer, group 1 = consumer).
-        return For::make(wg, 0, 1, ForType::GPUThread, Partition::Never, device_api, guarded);
+        return For::make(wg, 0, 1, ForType::GPUThread, Partition::Never, device_api, guarded, GPUVectorScope::Register, -1);
     }
 
     Stmt visit(const ProducerConsumer *op) override {
@@ -1912,7 +1912,7 @@ Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
     }
     // For stores an inclusive max; max = total-1 gives extent total.
     return For::make(ftid, 0, simplify(base - 1), ForType::GPUThread,
-                     Partition::Never, device_api, body);
+                     Partition::Never, device_api, body, GPUVectorScope::Register, -1);
 }
 
 // Convert a device warp-spec Fork into a flat 1D thread partition by collecting its
@@ -2239,7 +2239,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         }
         // For stores an inclusive max, so max = num_groups - 1 gives extent num_groups.
         Stmt result = For::make(wg, 0, num_groups - 1, ForType::GPUThread,
-                                Partition::Never, device_api, body);
+                                Partition::Never, device_api, body, GPUVectorScope::Register, -1);
         // Re-emit the lifted storage at block level (outermost peeled first).
         for (auto it = lifted.rbegin(); it != lifted.rend(); ++it) {
             result = HoistedStorage::make(*it, result);

@@ -762,17 +762,17 @@ class PartitionLoops : public IRMutator {
         // Bust simple serial for loops up into three.
         if (op->for_type == ForType::Serial && !op->body.as<Acquire>()) {
             stmt = For::make(op->name, min_steady, max_steady - 1,
-                             op->for_type, op->partition_policy, op->device_api, simpler_body);
+                             op->for_type, op->partition_policy, op->device_api, simpler_body, op->realization, op->warps_per_group);
 
             if (make_prologue) {
                 prologue = For::make(op->name, op->min, min_steady - 1,
-                                     op->for_type, op->partition_policy, op->device_api, prologue);
+                                     op->for_type, op->partition_policy, op->device_api, prologue, op->realization, op->warps_per_group);
                 stmt = Block::make(prologue, stmt);
                 mutated = true;
             }
             if (make_epilogue) {
                 epilogue = For::make(op->name, max_steady, op->max,
-                                     op->for_type, op->partition_policy, op->device_api, epilogue);
+                                     op->for_type, op->partition_policy, op->device_api, epilogue, op->realization, op->warps_per_group);
                 stmt = Block::make(stmt, epilogue);
                 mutated = true;
             }
@@ -804,7 +804,7 @@ class PartitionLoops : public IRMutator {
                     mutated = true;
                 }
             }
-            stmt = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, stmt);
+            stmt = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, stmt, op->realization, op->warps_per_group);
         }
 
         if (make_epilogue) {
@@ -927,7 +927,7 @@ class RenormalizeGPULoops : public IRMutator {
             internal_assert(!expr_uses_var(f->min, op->name) &&
                             !expr_uses_var(f->max, op->name));
             Stmt inner = LetStmt::make(op->name, op->value, f->body);
-            inner = For::make(f->name, f->min, f->max, f->for_type, f->partition_policy, f->device_api, inner);
+            inner = For::make(f->name, f->min, f->max, f->for_type, f->partition_policy, f->device_api, inner, f->realization, f->warps_per_group);
             return mutate(inner);
         } else if (a && in_gpu_loop && !in_thread_loop) {
             internal_assert(a->extents.size() == 1);
@@ -1005,7 +1005,7 @@ class RenormalizeGPULoops : public IRMutator {
                    for_a->min.same_as(for_b->min) &&
                    for_a->max.same_as(for_b->max)) {
             Stmt inner = IfThenElse::make(op->condition, for_a->body, for_b->body);
-            inner = For::make(for_a->name, for_a->min, for_a->max, for_a->for_type, for_a->partition_policy, for_a->device_api, inner);
+            inner = For::make(for_a->name, for_a->min, for_a->max, for_a->for_type, for_a->partition_policy, for_a->device_api, inner, for_a->realization, for_a->warps_per_group);
             return mutate(inner);
         } else {
             internal_error << "Unexpected construct inside if statement: " << Stmt(op) << "\n";

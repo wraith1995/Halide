@@ -1016,8 +1016,8 @@ struct For : public StmtNode<For> {
                      ForType for_type, Partition partition_policy,
                      DeviceAPI device_api,
                      Stmt body,
-                     GPUVectorScope realization = GPUVectorScope::Register,
-                     int warps_per_group = -1);
+                     GPUVectorScope realization,
+                     int warps_per_group);
 
     bool is_unordered_parallel() const {
         return Halide::Internal::is_unordered_parallel(for_type);
@@ -1217,7 +1217,7 @@ struct VectorReduce : public ExprNode<VectorReduce> {
     GPUVectorScope realization = GPUVectorScope::Register;
 
     static Expr make(Operator op, Expr vec, int lanes,
-                     GPUVectorScope realization = GPUVectorScope::Register);
+                     GPUVectorScope realization);
 
     static const IRNodeType _node_type = IRNodeType::VectorReduce;
 };

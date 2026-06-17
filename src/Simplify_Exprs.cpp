@@ -251,7 +251,7 @@ Expr Simplify::visit(const VectorReduce *op, ExprInfo *info) {
     if (value.same_as(op->value)) {
         return op;
     } else {
-        return VectorReduce::make(op->op, value, op->type.lanes());
+        return VectorReduce::make(op->op, value, op->type.lanes(), op->realization);
     }
 }
 
