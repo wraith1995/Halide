@@ -42,6 +42,7 @@ const VectorReduce *find_vector_reduce(const Expr &e) {
 struct Operand {
     std::string buffer;
     Type elem_type;
+    Expr base_index;  // the k-contiguous row Load's ramp base (per-thread row)
 };
 
 // Match reduce_add(widening_mul(LoadA, LoadB)) (peeling the f16->f32 casts the
@@ -68,10 +69,26 @@ bool parse_operands(const VectorReduce *vr, Operand &a, Operand &b) {
         }
         o.buffer = l->name;
         o.elem_type = l->type.element_of();
+        o.base_index = r->base;
         return true;
     };
     return as_load(mul->a, a) && as_load(mul->b, b);
 }
+
+// Replace every Variable with 0, leaving the constant (thread/loop-independent)
+// part of an index -- the tile-origin offset within the (possibly fused) shared
+// allocation. e.g. As base (tx%8)*128 -> 0; Bs base (tx/8)*16 + 1024 -> 1024.
+class ZeroVars : public IRMutator {
+    using IRMutator::visit;
+    Expr visit(const Variable *op) override {
+        return make_zero(op->type);
+    }
+
+public:
+    Expr run(const Expr &e) {
+        return mutate(e);
+    }
+};
 
 // The Hopper wgmma.m64n16k16 .f32 accumulator fragment map: which (row m, col
 // n) of the 64x16 output tile the per-thread register `i` (0..7) holds, as a
@@ -102,6 +119,27 @@ class RewriteWarpGroupTiles : public IRMutator {
     std::string group_var, thread_var;
     int warps_per_group = -1;
     int frag_index = 0;
+    std::map<std::string, Expr> lets;
+
+    Stmt visit(const LetStmt *op) override {
+        lets[op->name] = op->value;
+        Stmt s = IRMutator::visit(op);
+        lets.erase(op->name);
+        return s;
+    }
+
+    // The tile-origin offset of an operand within its shared allocation: resolve
+    // CSE'd lets, then zero all variables to keep the const part.
+    Expr tile_origin(Expr base) {
+        for (int iter = 0; iter < 32; iter++) {
+            Expr prev = base;
+            base = substitute(lets, base);
+            if (base.same_as(prev)) {
+                break;
+            }
+        }
+        return simplify(ZeroVars().run(simplify(base)));
+    }
 
     Stmt visit(const For *op) override {
         std::string saved_group = group_var, saved_thread = thread_var;
@@ -157,10 +195,13 @@ class RewriteWarpGroupTiles : public IRMutator {
         // operand buffers (as base Loads codegen introspects for the matrix
         // descriptors). scaleD=0 (overwrite) -- M0 is a single k=16 step, so we
         // drop the `+ Load(C)` accumulation of the original store value.
-        Expr load_a = Load::make(a.elem_type, a.buffer, 0, Buffer<>(), Parameter(),
-                                 const_true(), ModulusRemainder());
-        Expr load_b = Load::make(b.elem_type, b.buffer, 0, Buffer<>(), Parameter(),
-                                 const_true(), ModulusRemainder());
+        // Descriptor base = each operand's tile origin within the (fused) shared
+        // allocation (As@0, Bs@offset) -- NOT the per-thread row, which the wgmma
+        // reads via the descriptor's leading dimension.
+        Expr load_a = Load::make(a.elem_type, a.buffer, tile_origin(a.base_index),
+                                 Buffer<>(), Parameter(), const_true(), ModulusRemainder());
+        Expr load_b = Load::make(b.elem_type, b.buffer, tile_origin(b.base_index),
+                                 Buffer<>(), Parameter(), const_true(), ModulusRemainder());
         Expr frag = Call::make(op->value.type(), "wgmma_m64n16k16_f32",
                                {i, load_a, load_b}, Call::Intrinsic);
 
