@@ -369,6 +369,7 @@ class LowerWarpShuffles : public IRMutator {
     Scope<AllocInfo> allocation_info;
     Scope<Interval> bounds;
     int cuda_cap;
+    int target_warp_size;
 
     Stmt visit(const For *op) override {
         ScopedBinding<Interval>
@@ -381,8 +382,8 @@ class LowerWarpShuffles : public IRMutator {
             Expr extent = simplify(op->extent());
             if (op->for_type == ForType::GPULane) {
                 auto loop_size = as_const_int(extent);
-                user_assert(loop_size && *loop_size <= 32)
-                    << "CUDA gpu lanes loop must have constant extent of at most 32: " << extent << "\n";
+                user_assert(loop_size && *loop_size <= target_warp_size)
+                    << "CUDA gpu lanes loop must have constant extent of at most " << target_warp_size << ": " << extent << "\n";
 
                 // Select a warp size - the smallest power of two that contains the loop size
                 int64_t ws = 1;
@@ -669,8 +670,8 @@ class LowerWarpShuffles : public IRMutator {
     }
 
 public:
-    LowerWarpShuffles(int cuda_cap)
-        : cuda_cap(cuda_cap) {
+    LowerWarpShuffles(int cuda_cap, int target_warp_size)
+        : cuda_cap(cuda_cap), target_warp_size(target_warp_size) {
     }
 };
 
@@ -824,7 +825,7 @@ class LowerWarpShufflesInEachKernel : public IRMutator {
     Stmt visit(const For *op) override {
         if (op->device_api == DeviceAPI::CUDA && has_lane_loop(op)) {
             Stmt s = op;
-            s = LowerWarpShuffles(cuda_cap)(s);
+            s = LowerWarpShuffles(cuda_cap, target_warp_size)(s);
             s = HoistWarpShuffles()(s);
             return simplify(s);
         } else {
@@ -833,10 +834,11 @@ class LowerWarpShufflesInEachKernel : public IRMutator {
     }
 
     int cuda_cap;
+    int target_warp_size;
 
 public:
-    LowerWarpShufflesInEachKernel(int cuda_cap)
-        : cuda_cap(cuda_cap) {
+    LowerWarpShufflesInEachKernel(int cuda_cap, int target_warp_size)
+        : cuda_cap(cuda_cap), target_warp_size(target_warp_size) {
     }
 };
 
@@ -846,7 +848,7 @@ Stmt lower_warp_shuffles(Stmt s, const Target &t) {
     s = hoist_loop_invariant_values(s);
     s = SubstituteInLaneVar()(s);
     s = simplify(s);
-    s = LowerWarpShufflesInEachKernel(t.get_cuda_capability_lower_bound())(s);
+    s = LowerWarpShufflesInEachKernel(t.get_cuda_capability_lower_bound(), t.warp_size())(s);
     return s;
 };
 

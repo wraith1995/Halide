@@ -20,6 +20,7 @@
 #include "Simplify.h"
 #include "Solve.h"
 #include "Substitute.h"
+#include "Target.h"
 #include "Util.h"
 
 namespace Halide {
@@ -1460,9 +1461,16 @@ public:
 // Part 2 of the Fork-aware lowering: rewrite any device warp-spec Fork in this
 // statement into a flat 1D thread partition (defined below, after ThreadExtents).
 // No Fork => returns the statement unchanged (the identity invariant).
-Stmt flatten_warp_spec_forks(const Stmt &s);
+Stmt flatten_warp_spec_forks(const Stmt &s, int warp_size);
 
 class FuseGPUThreadLoops : public IRMutator {
+    const int warp_size;
+
+public:
+    explicit FuseGPUThreadLoops(int warp_size)
+        : warp_size(warp_size) {
+    }
+
 protected:
     using IRMutator::visit;
 
@@ -1479,7 +1487,7 @@ protected:
             // Warp-spec forks become a flat thread partition before block-size
             // analysis, so ExtractBlockSize sums the groups (one flat dim) instead
             // of maxing them. A kernel with no fork is returned unchanged.
-            Stmt loop = flatten_warp_spec_forks(op);
+            Stmt loop = flatten_warp_spec_forks(op, warp_size);
 
             // Do the analysis of thread block size and shared memory usage.
             ExtractBlockSize block_size;
@@ -1813,8 +1821,15 @@ public:
 // Sum(size_g) on dim 0; ExtractBlockSize then reads that sum as blockDim.x.
 class FlattenWarpSpecForks : public IRMutator {
     DeviceAPI device_api = DeviceAPI::None;
+    const int warp_size;
     using IRMutator::visit;
 
+public:
+    explicit FlattenWarpSpecForks(int warp_size)
+        : warp_size(warp_size) {
+    }
+
+private:
     static void flatten(const Stmt &s, std::vector<Stmt> &branches) {
         if (const Fork *f = s.as<Fork>()) {
             branches.push_back(f->first);
@@ -1846,7 +1861,7 @@ class FlattenWarpSpecForks : public IRMutator {
                 maxe[i] = te.extent[i].defined() ? te.extent[i] : Expr(1);
                 prod = simplify(prod * maxe[i]);
             }
-            Expr size = simplify(((prod + 31) / 32) * 32);  // warp-aligned group size
+            Expr size = simplify(((prod + (warp_size - 1)) / warp_size) * warp_size);  // warp-aligned group size
             Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)(branch);
             // Group range guard: only this group's warp range runs the branch (incl. its
             // cross-group barriers), so per-edge barrier counts (= sum of two groups) hold.
@@ -1860,8 +1875,8 @@ class FlattenWarpSpecForks : public IRMutator {
     }
 };
 
-Stmt flatten_warp_spec_forks(const Stmt &s) {
-    return FlattenWarpSpecForks()(s);
+Stmt flatten_warp_spec_forks(const Stmt &s, int warp_size) {
+    return FlattenWarpSpecForks(warp_size)(s);
 }
 
 // Is `name` a host semaphore of a warp-specialized ring producer? (Those are
@@ -1939,6 +1954,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         int producer;   // producing warp-group index (selects its thread count, fork_fuse)
     };
     std::map<std::string, BarrierInfo> sema_map;
+    const int warp_size;
     using IRMutator::visit;
 
     // mode 0 = wait, 1 = arrive. id = base + (ring_loop % ring_n) selects the slot.
@@ -2072,7 +2088,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                         t = t * te.extent[d];
                     }
                 }
-                return simplify(((simplify(t) + 31) / 32) * 32);  // round up to a warp
+                return simplify(((simplify(t) + (warp_size - 1)) / warp_size) * warp_size);  // round up to a warp
             };
             std::vector<Expr> ptv(num_producers);
             for (int i = 0; i < num_producers; i++) {
@@ -2157,8 +2173,8 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     }
 
 public:
-    LowerGPUWarpAsyncFork(const std::map<std::string, Function> &env)
-        : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") != "0") {
+    LowerGPUWarpAsyncFork(const std::map<std::string, Function> &env, int warp_size)
+        : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") != "0"), warp_size(warp_size) {
     }
 };
 
@@ -2168,16 +2184,16 @@ Stmt inject_gpu_warp_specialization(Stmt s, const std::map<std::string, Function
     return InjectGPUWarpSpecialization(env)(s);
 }
 
-Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env) {
-    return LowerGPUWarpAsyncFork(env)(s);
+Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env, const Target &t) {
+    return LowerGPUWarpAsyncFork(env, t.warp_size())(s);
 }
 
-Stmt fuse_gpu_thread_loops(Stmt s) {
+Stmt fuse_gpu_thread_loops(Stmt s, const Target &t) {
     // NormalizeIfStatements pushes the predicates between GPU blocks
     // into the innermost GPU block. FuseGPUThreadLoops would then
     // merge the predicate into the merged GPU thread.
     s = NormalizeIfStatements()(s);
-    s = FuseGPUThreadLoops()(s);
+    s = FuseGPUThreadLoops(t.warp_size())(s);
     s = ZeroGPULoopMins()(s);
     return s;
 }

@@ -35,7 +35,7 @@ Stmt inject_gpu_warp_specialization(Stmt s, const std::map<std::string, Function
  * per-slot named barriers: producer warps stage into a shared ring while consumer
  * warps compute, running ahead by the ring depth. Runs after canonicalize_gpu_vars,
  * before inject_gpu_warp_specialization (which handles the non-ring case). */
-Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env);
+Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env, const Target &t);
 
 /** Converts Halide's GPGPU IR to the OpenCL/CUDA/Metal model. Within
  * every loop over gpu block indices, fuse the inner loops over thread
@@ -45,7 +45,7 @@ Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env);
  * shared allocations at the block level out into a single shared
  * memory array, and heap allocations into a slice of a global pool
  * allocated outside the kernel. */
-Stmt fuse_gpu_thread_loops(Stmt s);
+Stmt fuse_gpu_thread_loops(Stmt s, const Target &t);
 
 }  // namespace Internal
 }  // namespace Halide

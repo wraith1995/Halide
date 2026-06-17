@@ -322,6 +322,13 @@ struct Target {
      */
     std::string to_string() const;
 
+    /** The number of threads in a GPU warp (NVIDIA) / wavefront (AMD) for
+     * this Target. The single source of truth for code that warp-aligns the
+     * thread partition or bounds a lane axis, so the constant is not baked in
+     * at each site. NVIDIA is 32 (the only width Halide's GPU backends
+     * currently assume); an AMD wave64 target would override this. */
+    int warp_size() const;
+
     /** Given a data type, return an estimate of the "natural" vector size
      * for that data type when compiling for this Target. */
     int natural_vector_size(const Halide::Type &t) const;

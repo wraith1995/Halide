@@ -1611,6 +1611,15 @@ Target::Feature target_feature_for_device_api(DeviceAPI api) {
     }
 }
 
+int Target::warp_size() const {
+    // NVIDIA warps are 32 threads, and that is the only width Halide's GPU
+    // backends currently assume (the GEMM/tensor path is NVIDIA-gated). An AMD
+    // wave64 target would return 64 here; until such a target feature exists,
+    // this is the single named source of the constant rather than a literal
+    // sprinkled across the GPU lowering passes.
+    return 32;
+}
+
 int Target::natural_vector_size(const Halide::Type &t) const {
     user_assert(!has_unknowns())
         << "natural_vector_size cannot be used on a Target with Unknown values.\n";
