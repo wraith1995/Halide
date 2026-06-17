@@ -99,6 +99,16 @@ protected:
     // gpu_thread_barrier, so the barrier commits + waits for it (synchronous cp.async).
     bool emitted_cp_async = false;
 
+    // M0 wgmma: the {f32 x 8} accumulator from the one wgmma.mma_async collective
+    // emitted per kernel (the recognizer's per-element calls all extract from it).
+    // Reset per add_kernel. See research/gpu_recognizer_design.md S5b.
+    llvm::Value *cached_wgmma_acc = nullptr;
+
+    /** Build a 64-bit Hopper wgmma shared matrix descriptor for the shared
+     * allocation `buffer`. M0 first-guess encoding (address only; LBO/SBO/
+     * swizzle pinned on H100). */
+    llvm::Value *build_wgmma_descriptor(const std::string &buffer, Type elem_type);
+
     /** Apply a shared-memory bank-conflict swizzle (recorded per allocation in
      * visit(Allocate)) to the element index, at the address seam. Identity for
      * non-swizzled buffers. The IR index stays affine; only the emitted address
@@ -159,6 +169,8 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
     internal_assert(module != nullptr);
 
     debug(2) << "In CodeGen_PTX_Dev::add_kernel\n";
+
+    cached_wgmma_acc = nullptr;
 
     // Now deduce the types of the arguments to our function
     vector<llvm::Type *> arg_types(args.size());
@@ -292,6 +304,52 @@ void CodeGen_PTX_Dev::init_module() {
 }
 
 void CodeGen_PTX_Dev::visit(const Call *op) {
+    if (op->is_intrinsic() && op->name == "wgmma_m64n16k16_f32") {
+        // M0 Hopper tile reduce, emitted by lower_warp_group_tiles. Args:
+        // [reg_index (0..7), Load(A_shared, 0), Load(B_shared, 0)]. The collective
+        // is emitted ONCE per kernel (all 8 per-thread fragment calls extract from
+        // the cached {f32 x 8} accumulator). See gpu_recognizer_design.md S5b.
+        internal_assert(op->args.size() == 3)
+            << "wgmma_m64n16k16_f32 expects (reg_index, LoadA, LoadB)\n";
+        if (getenv("HL_DEBUG_WGMMA")) {
+            debug(0) << "[wgtile] codegen wgmma frag reg=" << op->args[0] << "\n";
+        }
+        auto reg = as_const_int(op->args[0]);
+        const Load *la = op->args[1].as<Load>();
+        const Load *lb = op->args[2].as<Load>();
+        internal_assert(reg && la && lb)
+            << "wgmma_m64n16k16_f32 args must be (const int, Load, Load)\n";
+
+        if (cached_wgmma_acc == nullptr) {
+            llvm::Value *desc_a = build_wgmma_descriptor(la->name, la->type.element_of());
+            llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of());
+
+            // Zeroed {f32 x 8} accumulator (scaleD=0 overwrites on this single
+            // k=16 step, so the zero init is just for a well-defined value).
+            llvm::Type *f32 = llvm::Type::getFloatTy(*context);
+            llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(8, f32));
+            llvm::Value *acc = llvm::UndefValue::get(acc_ty);
+            for (int j = 0; j < 8; j++) {
+                acc = builder->CreateInsertValue(acc, llvm::ConstantFP::get(f32, 0.0), j);
+            }
+
+            auto emit_wgmma_asm = [&](const char *s) {
+                llvm::FunctionType *ft = llvm::FunctionType::get(void_t, false);
+                llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, s, "", /*hasSideEffects*/ true);
+                builder->CreateCall(ia);
+            };
+            // fence (make prior register/shared writes visible to the async MMA),
+            // one mma_async (k=16, scaleD=0), commit the group, wait for it.
+            emit_wgmma_asm("wgmma.fence.sync.aligned;");
+            acc = emit_wgmma_m64n16k16(acc, desc_a, desc_b, /*scale_d*/ false);
+            emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
+            emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
+            cached_wgmma_acc = acc;
+        }
+        value = builder->CreateExtractValue(cached_wgmma_acc, (unsigned)*reg);
+        return;
+    }
+
     if (op->is_intrinsic(Call::gpu_thread_barrier)) {
         // Even though we always insert a __syncthreads equivalent
         // (which has both a device and shared memory fence)
@@ -623,6 +681,19 @@ class RewriteLoadsAs32Bit : public IRMutator {
         }
     }
 };
+
+llvm::Value *CodeGen_PTX_Dev::build_wgmma_descriptor(const std::string &buffer, Type elem_type) {
+    // The shared base pointer of the operand tile (offset 0 = tile origin).
+    llvm::Value *base_ptr = codegen_buffer_pointer(buffer, elem_type, Expr(0));
+    llvm::Value *addr = builder->CreatePtrToInt(base_ptr, i64_t);
+    // M0 first-guess encoding (research/gpu_recognizer_design.md S5a/S5b): the
+    // matrix start address in bits [0:14) as (addr >> 4). Leading-byte-offset,
+    // stride-byte-offset, base-offset and swizzle-mode fields are left 0 here --
+    // they are hardware-pinned and get filled in / corrected against the f64
+    // oracle on H100. TODO(H100): real LBO/SBO/swizzle.
+    llvm::Value *enc = builder->CreateLShr(addr, llvm::ConstantInt::get(i64_t, 4));
+    return builder->CreateAnd(enc, llvm::ConstantInt::get(i64_t, 0x3FFF));
+}
 
 llvm::Value *CodeGen_PTX_Dev::emit_wgmma_m64n16k16(llvm::Value *acc, llvm::Value *desc_a,
                                                    llvm::Value *desc_b, bool scale_d) {
