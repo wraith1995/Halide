@@ -1928,6 +1928,28 @@ private:
     Stmt visit(const For *op) override {
         ScopedValue<DeviceAPI> d(device_api,
                                  op->device_api != DeviceAPI::None ? op->device_api : device_api);
+        if (op->warps_per_group >= 0) {
+            // A gpu_warps work-distribution axis: peel its N iterations into N
+            // symmetric warp-group branches (the group index substituted in as a
+            // constant), then flat-partition them through the same core that serves
+            // async Forks — sum across groups, warp-aligned per group. This is the
+            // data-symmetric source of warp groups (vs the role-asymmetric Fork);
+            // both feed partition_warp_groups. (warps_per_group == 0 = derive each
+            // group's size from its thread tile; an explicit count is the wgmma-scope
+            // override, handled when that lands.)
+            Stmt body = mutate(op->body);
+            auto n = as_const_int(simplify(op->extent()));
+            user_assert(n && *n > 0)
+                << "gpu_warps axis " << op->name
+                << " must have a constant positive extent (the number of warp groups), got: "
+                << op->extent() << "\n";
+            std::vector<Stmt> branches;
+            branches.reserve((size_t)*n);
+            for (int64_t g = 0; g < *n; g++) {
+                branches.push_back(substitute(op->name, op->min + (int)g, body));
+            }
+            return partition_warp_groups(branches, warp_size, device_api);
+        }
         return IRMutator::visit(op);
     }
 

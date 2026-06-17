@@ -168,6 +168,7 @@ tests(
     gpu_transpose.cpp
     gpu_vectorize.cpp
     gpu_vectorized_shared_memory.cpp
+    gpu_warps.cpp
     growing_stack.cpp
     half_native_interleave.cpp
     halide_buffer.cpp
