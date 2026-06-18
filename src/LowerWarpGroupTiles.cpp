@@ -10,6 +10,8 @@
 #include "Substitute.h"
 #include "Target.h"
 
+#include <set>
+
 namespace Halide {
 namespace Internal {
 
@@ -139,6 +141,27 @@ bool has_buffer_query(const Expr &e) {
     return v.found;
 }
 
+// True if e reads (a Load from) one of the named buffers. Used by mainloop 1b to spot the
+// `C = prod` epilogue copy: a store whose value loads a recorded wgmma register accumulator.
+bool loads_one_of(const Expr &e, const std::set<std::string> &names) {
+    class V : public IRVisitor {
+        using IRVisitor::visit;
+        void visit(const Load *op) override {
+            if (names.count(op->name)) {
+                found = true;
+            }
+            IRVisitor::visit(op);
+        }
+
+    public:
+        const std::set<std::string> &names;
+        bool found = false;
+        explicit V(const std::set<std::string> &n) : names(n) {}
+    } v(names);
+    e.accept(&v);
+    return v.found;
+}
+
 // Collect the output buffer's per-dimension stride from a device store index: the strides
 // ride as kernel-param Variables named "<buf>.stride.<d>". The epilogue rewrite multiplies
 // the fragment's tile-local (m,n) by these to flatten to the global output offset (so M/N
@@ -253,6 +276,16 @@ class RewriteWarpGroupTiles : public IRMutator {
     // core-matrix tiling. Empty unless HL_WGMMA_AUTOLAYOUT is set (prototype gate).
     std::map<std::string, std::pair<int, int>> natural_operands;
 
+    // Mainloop 1b (HL_WGMMA_KCARRY, Option A): buffers that are wgmma REGISTER accumulators
+    // (the `prod` Func). Their wgmma reduce store accumulates into the carried D fragment
+    // (accum8, scaleD=1) instead of overwriting; their copy-out (`C = prod`) is the epilogue
+    // that gets the non-affine frag map applied to the OUTPUT index. Populated as we rewrite
+    // the accumulator's update (visited before the epilogue copy in the same block).
+    std::set<std::string> wgmma_accumulators;
+    // The accumulator's per-thread base index (frag 0's store index), captured per group so the
+    // 8 scalar frag stores all read/write prod[base + i].
+    Expr acc_base;
+
     Stmt visit(const LetStmt *op) override {
         lets[op->name] = op->value;
         Stmt s = IRMutator::visit(op);
@@ -327,6 +360,19 @@ class RewriteWarpGroupTiles : public IRMutator {
         return s;
     }
 
+    Stmt visit(const Atomic *op) override {
+        // Mainloop 1b (HL_WGMMA_KCARRY): `.atomic()` is needed only to make `vectorize(ki)` on
+        // the reduction legal at schedule time; the recognizer then REPLACES the atomic reduction
+        // with the wgmma collective, whose result is a plain per-thread REGISTER store (no RMW
+        // contention). Strip the now-vestigial Atomic so that store does not lower to an
+        // (unsupported) atomic op on register/local memory. Only the wgmma accumulator update is
+        // wrapped in Atomic under this schedule, so stripping is safe.
+        if (getenv("HL_WGMMA_KCARRY")) {
+            return mutate(op->body);
+        }
+        return IRMutator::visit(op);
+    }
+
     Stmt visit(const Store *op) override {
         // 1.1 auto-layout: a store to a natural shared operand is the PRODUCER fill; re-encode
         // its (clean 0-based allocation-relative) index to the core-matrix tiling so the wgmma
@@ -347,6 +393,40 @@ class RewriteWarpGroupTiles : public IRMutator {
         if (group_var.empty() || warps_per_group <= 0 || thread_var.empty()) {
             return IRMutator::visit(op);
         }
+
+        // 1b epilogue (HL_WGMMA_KCARRY): a store whose value LOADS a recorded register
+        // accumulator (`prod`) AND has no vector reduce is the `C = prod` copy-out (the
+        // accumulator's OWN update `prod += ...` also loads prod, but carries the reduce -- that
+        // is the accumulate path below, not the epilogue). prod holds D in frag-register order
+        // (8 per thread); apply the non-affine frag map to the OUTPUT index so register f lands
+        // at hardware (m,n). Only the index changes; the value (Load prod[frag f]) is kept.
+        if (getenv("HL_WGMMA_KCARRY") && !wgmma_accumulators.empty() &&
+            loads_one_of(op->value, wgmma_accumulators) && !find_vector_reduce(op->value)) {
+            int i = frag_index++;
+            if (i >= 8) {
+                return IRMutator::visit(op);
+            }
+            Expr lane = Variable::make(Int(32), thread_var);
+            if (!out_captured) {
+                Expr ri = resolve_lets(op->index, /*device_only*/ true);
+                StrideCollector sc;
+                ri.accept(&sc);
+                out_stride_m = sc.dim(0);
+                out_stride_n = sc.dim(1);
+                out_base = simplify(substitute(thread_var, make_zero(Int(32)),
+                                               substitute(group_var, make_zero(Int(32)), ri)));
+                out_captured = true;
+            }
+            Expr slot = simplify(out_base + frag_row_m(lane, i) * out_stride_m +
+                                 frag_col_n(lane, i) * out_stride_n);
+            if (getenv("HL_DEBUG_WGMMA")) {
+                debug(0) << "[wgtile] 1b epilogue store #" << i << " " << op->name
+                         << " <- accumulator -> frag slot\n";
+            }
+            return Store::make(op->name, mutate(op->value), slot, op->param, op->predicate,
+                               op->alignment);
+        }
+
         const VectorReduce *vr = find_vector_reduce(op->value);
         if (!vr) {
             return IRMutator::visit(op);
@@ -411,6 +491,35 @@ class RewriteWarpGroupTiles : public IRMutator {
                                  Buffer<>(), Parameter(), const_true(), ModulusRemainder());
         Expr load_b = Load::make(b.elem_type, b.buffer, base_b,
                                  Buffer<>(), Parameter(), const_true(), ModulusRemainder());
+
+        // 1b accumulate (HL_WGMMA_KCARRY, Option A): the wgmma reduce store targets a register
+        // accumulator (`prod`), NOT the global output. Emit ONE vector store of
+        // accum8(Load(prod)) into prod's NATURAL per-thread slots (frag-register order, ramp
+        // stride 1, NO frag map -- the frag map is applied later at the C=prod epilogue). D_in =
+        // the current prod = the loop-carried accumulator; compute_at gives the carry across ko
+        // and hoists the epilogue out of the loop. scaleD=1 (accumulate) lives in accum8.
+        if (getenv("HL_WGMMA_KCARRY")) {
+            wgmma_accumulators.insert(op->name);
+            // The accumulator's per-thread base = frag 0's store index (frags 0..7 land at
+            // base+0..7). Emit one SCALAR store per frag prod[base+i] = accum_reg(i, ...), like
+            // the M1 scalar+cache path: the wgmma is cached (one per ko body) and seeds D from
+            // prod's current value (D_in = Load(prod, base)); scaleD=1 accumulates. No vector
+            // store to register memory -> no per-lane scalarization of the collective.
+            if (i == 0) {
+                acc_base = op->index;
+            }
+            Expr d_in = Load::make(op->value.type(), op->name, acc_base,
+                                   Buffer<>(), op->param, const_true(), ModulusRemainder());
+            Expr call = Call::make(op->value.type(), "wgmma_m64n16k16_f32_accum_reg",
+                                   {i, d_in, n_chunks, load_a, stride_a, load_b, stride_b},
+                                   Call::Intrinsic);
+            if (getenv("HL_DEBUG_WGMMA")) {
+                debug(0) << "[wgtile] 1b accumulate frag #" << i << " -> accum_reg into "
+                         << op->name << " (n_chunks=" << n_chunks << ")\n";
+            }
+            return Store::make(op->name, call, op->index, op->param, op->predicate, op->alignment);
+        }
+
         // Capture the output-tile epilogue base + strides once per group (frag 0 is the
         // store whose natural in-tile offset is 0 at the zeroed thread var, so zeroing the
         // thread/warp vars leaves exactly the block tile corner + buffer mins). The strides

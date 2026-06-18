@@ -309,6 +309,63 @@ void CodeGen_PTX_Dev::init_module() {
 }
 
 void CodeGen_PTX_Dev::visit(const Call *op) {
+    if (op->is_intrinsic() && op->name == "wgmma_m64n16k16_f32_accum_reg") {
+        // Mainloop 1b (Option A, register accumulator). Accumulate ONE wgmma tile into a
+        // LOOP-CARRIED D fragment held in `prod`'s per-thread registers (the recognizer emits
+        // 8 SCALAR stores prod[base+i] = accum_reg(i, ...), mirroring the M1 scalar+cache path
+        // so there is no vector store to register memory and no per-lane scalarization of the
+        // collective). Args: (reg, D_in_load, n_chunks, LoadA, strideA, LoadB, strideB) -> f32.
+        //   - D_in_load is a SCALAR Load marking prod + its per-thread base index; codegen seeds
+        //     the accumulator from prod[base+0..7] (the running sum carried across ko by
+        //     compute_at), so every chunk uses scaleD=1 (accumulate).
+        //   - The wgmma is emitted ONCE per ko body (cached); the 8 scalar stores extract reg i.
+        internal_assert(op->args.size() == 7u) << "wgmma accum_reg arg count mismatch\n";
+        auto reg = as_const_int(op->args[0]);
+        const Load *dl = op->args[1].as<Load>();
+        auto n_chunks = as_const_int(op->args[2]);
+        const Load *la = op->args[3].as<Load>();
+        auto stride_a = as_const_int(op->args[4]);
+        const Load *lb = op->args[5].as<Load>();
+        auto stride_b = as_const_int(op->args[6]);
+        internal_assert(reg && dl && n_chunks && la && stride_a && lb && stride_b)
+            << "wgmma accum_reg args malformed\n";
+
+        if (cached_wgmma_acc == nullptr) {
+            // Seed the {f32 x 8} accumulator from prod[base+0..7] (8 scalar loads).
+            llvm::Type *f32 = llvm::Type::getFloatTy(*context);
+            llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(8, f32));
+            llvm::Value *acc = llvm::UndefValue::get(acc_ty);
+            for (int j = 0; j < 8; j++) {
+                Expr slot = simplify(dl->index + j);
+                Expr load_j = Load::make(dl->type, dl->name, slot, Buffer<>(), dl->param,
+                                         const_true(), ModulusRemainder());
+                acc = builder->CreateInsertValue(acc, codegen(load_j), j);
+            }
+            auto emit_wgmma_asm = [&](const char *s) {
+                llvm::FunctionType *ft = llvm::FunctionType::get(void_t, false);
+                llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, s, "", /*hasSideEffects*/ true);
+                builder->CreateCall(ia);
+            };
+            int sbo = 256 * (int)*n_chunks;
+            emit_wgmma_asm("wgmma.fence.sync.aligned;");
+            for (int c = 0; c < (int)*n_chunks; c++) {
+                Expr off_a = simplify(la->index + Expr((int)(*stride_a) * c));
+                Expr off_b = simplify(lb->index + Expr((int)(*stride_b) * c));
+                llvm::Value *desc_a = build_wgmma_descriptor(la->name, la->type.element_of(),
+                                                             off_a, /*lbo*/ 128, sbo);
+                llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
+                                                             off_b, /*lbo*/ 128, sbo);
+                // scaleD=1 ALWAYS: prod already holds the running sum across prior ko iterations.
+                acc = emit_wgmma_m64n16k16(acc, desc_a, desc_b, /*scale_d*/ true);
+            }
+            emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
+            emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
+            cached_wgmma_acc = acc;
+        }
+        value = builder->CreateExtractValue(cached_wgmma_acc, (unsigned)*reg);
+        return;
+    }
+
     if (op->is_intrinsic() && (op->name == "wgmma_m64n16k16_f32" ||
                                op->name == "wgmma_m64n16k16_f32_frag8")) {
         // Hopper tile reduce, emitted by lower_warp_group_tiles. Two forms share the same
