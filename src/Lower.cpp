@@ -377,7 +377,7 @@ void lower_impl(const vector<Function> &output_funcs,
     if (t.has_gpu_feature() ||
         t.has_feature(Target::Vulkan)) {
         debug(1) << "Injecting per-block gpu synchronization...\n";
-        s = fuse_gpu_thread_loops(s, t);
+        s = fuse_gpu_thread_loops(s, t, env);
         log("Lowering after injecting per-block gpu synchronization:", s);
     }
 

@@ -1513,14 +1513,16 @@ public:
 // Part 2 of the Fork-aware lowering: rewrite any device warp-spec Fork in this
 // statement into a flat 1D thread partition (defined below, after ThreadExtents).
 // No Fork => returns the statement unchanged (the identity invariant).
-Stmt flatten_warp_spec_forks(const Stmt &s, int warp_size);
+Stmt flatten_warp_spec_forks(const Stmt &s, int warp_size,
+                             const std::map<std::string, Function> &env);
 
 class FuseGPUThreadLoops : public IRMutator {
     const int warp_size;
+    const std::map<std::string, Function> &env;
 
 public:
-    explicit FuseGPUThreadLoops(int warp_size)
-        : warp_size(warp_size) {
+    FuseGPUThreadLoops(int warp_size, const std::map<std::string, Function> &env)
+        : warp_size(warp_size), env(env) {
     }
 
 protected:
@@ -1539,7 +1541,7 @@ protected:
             // Warp-spec forks become a flat thread partition before block-size
             // analysis, so ExtractBlockSize sums the groups (one flat dim) instead
             // of maxing them. A kernel with no fork is returned unchanged.
-            Stmt loop = flatten_warp_spec_forks(op, warp_size);
+            Stmt loop = flatten_warp_spec_forks(op, warp_size, env);
 
             // Do the analysis of thread block size and shared memory usage.
             ExtractBlockSize block_size;
@@ -1920,22 +1922,36 @@ int max_warps_per_group(const Stmt &s) {
 }
 
 Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
-                           DeviceAPI device_api, int warps_per_group_override = 0) {
+                           DeviceAPI device_api, int warps_per_group_override = 0,
+                           const std::vector<int> &group_index = {}) {
     const std::string ftid = unique_name("warp_flat") + gpu_thread_name(0);
     Expr fv = Variable::make(Int(32), ftid);
     Expr base = 0;
     Stmt body;
+    // PLACEMENT ORDER (F2 explicit warp-group assignment): lay the branches out by ascending
+    // gpu_warp_group index (stable; default = the given branch order). This is pure placement --
+    // it reorders WHICH warp range each branch occupies (same bodies/handshakes/barrier counts),
+    // so e.g. assigning the wgmma consumer index 0 puts it on the first, naturally-aligned warp
+    // group (warps 0-3) with the producers packed after (no alignment gap). NOT folding: same-index
+    // branches are still laid out at distinct (adjacent) bases -- co-residency of two ring
+    // producers on one group needs producer fusion, not shared placement (it deadlocks otherwise).
+    std::vector<int> order(branches.size());
+    for (int i = 0; i < (int)branches.size(); i++) {
+        order[i] = i;
+    }
+    if (!group_index.empty()) {
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int a, int b) { return group_index[a] < group_index[b]; });
+    }
     // COLLECTIVE-AWARE PLACEMENT (the explicit-warp-group-assignment mechanism, F2). A branch
     // that carries a warp-group collective (a warps_per_group=N scope, e.g. the wgmma consumer)
     // must start at a warp-GROUP boundary and occupy N warps -- wgmma faults ("Illegal Instruction
     // Encoding") if its 4-warp group is misaligned. Only such a branch is pinned to a group
     // boundary + group-sized; non-collective branches (producer/DMA warps) need only WARP
-    // alignment and pack tightly. (Earlier this padded EVERY branch to the max warp-group size,
-    // wasting warps -- e.g. 384 threads for a 64x16 tile; collective-aware placement gives the
-    // wgmma group an aligned base while producers stay minimal.) A gap before an aligned
-    // collective base is fine: those lanes are in no branch's guard, so they idle and are excluded
-    // from the per-edge barrier counts (which sum the producing + consuming group sizes).
-    for (const Stmt &branch : branches) {
+    // alignment and pack tightly. A gap before an aligned collective base is fine: those lanes are
+    // in no branch's guard, so they idle and are excluded from the per-edge barrier counts.
+    for (int oi : order) {
+        const Stmt &branch = branches[oi];
         ThreadExtents te;
         branch.accept(&te);
         Expr stride[3], maxe[3], prod = 1;
@@ -1974,14 +1990,31 @@ Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
 class FlattenWarpSpecForks : public IRMutator {
     DeviceAPI device_api = DeviceAPI::None;
     const int warp_size;
+    const std::map<std::string, Function> &env;
     using IRMutator::visit;
 
 public:
-    explicit FlattenWarpSpecForks(int warp_size)
-        : warp_size(warp_size) {
+    FlattenWarpSpecForks(int warp_size, const std::map<std::string, Function> &env)
+        : warp_size(warp_size), env(env) {
     }
 
 private:
+    // The explicit gpu_warp_group placement index of a branch (from its producing Func's
+    // schedule), or -1 if unset. Used to order the flat partition (F2).
+    int branch_group_index(const Stmt &s) const {
+        std::string pname = producer_name_of(s);
+        if (!pname.empty()) {
+            auto it = env.find(pname);
+            if (it != env.end()) {
+                const std::vector<int> &g = it->second.schedule().gpu_warp_group();
+                if (!g.empty()) {
+                    return g[0];
+                }
+            }
+        }
+        return -1;
+    }
+
     static void flatten(const Stmt &s, std::vector<Stmt> &branches) {
         if (const Fork *f = s.as<Fork>()) {
             branches.push_back(f->first);
@@ -2030,12 +2063,26 @@ private:
     Stmt visit(const Fork *op) override {
         std::vector<Stmt> branches;
         flatten(op, branches);
-        return partition_warp_groups(branches, warp_size, device_api);
+        // F2 explicit warp-group assignment: order the flat partition by each branch's
+        // gpu_warp_group index. Unset branches sort AFTER assigned ones (in their flatten order),
+        // so assigning only the consumer index 0 places it first (wgmma on warps 0-3, aligned) with
+        // the producers packed after. All unset => empty => NFC (the flatten order is preserved).
+        const int UNSET = 1 << 30;
+        std::vector<int> gidx(branches.size());
+        bool any = false;
+        for (int i = 0; i < (int)branches.size(); i++) {
+            int g = branch_group_index(branches[i]);
+            gidx[i] = (g < 0) ? UNSET : g;
+            any = any || (g >= 0);
+        }
+        return partition_warp_groups(branches, warp_size, device_api, 0,
+                                     any ? gidx : std::vector<int>{});
     }
 };
 
-Stmt flatten_warp_spec_forks(const Stmt &s, int warp_size) {
-    return FlattenWarpSpecForks(warp_size)(s);
+Stmt flatten_warp_spec_forks(const Stmt &s, int warp_size,
+                             const std::map<std::string, Function> &env) {
+    return FlattenWarpSpecForks(warp_size, env)(s);
 }
 
 // Is `name` a host semaphore of a warp-specialized ring producer? (Those are
@@ -2266,61 +2313,27 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                 }
                 return simplify(((simplify(t) + (warp_size - 1)) / warp_size) * warp_size);
             };
-            // F2 explicit warp-group assignment: producers sharing a `gpu_warp_group` index
-            // co-reside on ONE warp group -- the directive-driven producer fold (As/Bs onto one
-            // group with no compute_with / dim-alignment). Default (unset) = each producer its own
-            // group index, i.e. the prior sequential behavior (NFC). The group of a producer with
-            // index g occupies max(its co-residents' warp counts); both edges' barrier counts use
-            // that group size, and the co-grouped branch BODIES are merged (run sequentially on the
-            // shared warps) into one branch so the partitioner places them at a single base.
-            std::vector<int> pgroup(num_producers);
-            for (int i = 0; i < num_producers; i++) {
-                pgroup[i] = i;  // default: each producer its own group (sequential, NFC)
-                std::string pname = producer_name_of(branches[i]);
-                if (!pname.empty() && env.count(pname)) {
-                    const std::vector<int> &g = env.at(pname).schedule().gpu_warp_group();
-                    if (!g.empty()) {
-                        pgroup[i] = g[0];
-                    }
-                }
-            }
+            // NOTE (F2 consumption WIP): the gpu_warp_group directive is parsed/stored, but the
+            // producer-fold consumption is NOT wired here. Merging co-grouped producers' BODIES
+            // into one branch deadlocks (two ring producers' barrier handshakes run sequentially on
+            // the shared warps don't compose). The correct mechanism is to keep the producer
+            // branches SEPARATE but place same-group branches at the SAME warp-group base (overlap)
+            // in partition_warp_groups -- i.e. thread the group index to the partitioner, not merge
+            // bodies. Until then each producer keeps its own group (sequential), as before.
             std::vector<Expr> ptv(num_producers);
             for (int i = 0; i < num_producers; i++) {
-                Expr g = branch_warp_threads(branches[i]);
-                for (int j = 0; j < num_producers; j++) {
-                    if (j != i && pgroup[j] == pgroup[i]) {
-                        g = max(g, branch_warp_threads(branches[j]));
-                    }
-                }
-                ptv[i] = simplify(g);
+                ptv[i] = branch_warp_threads(branches[i]);
             }
             ScopedValue<std::vector<Expr>> pt(producer_threads, ptv);
             ScopedValue<Expr> ct(consumer_threads, branch_warp_threads(branches[num_groups - 1]));
             std::vector<std::string> lifted;
             std::set<std::string> lifted_seen;
-            // Merge co-grouped producer branches (first-appearance group order), consumer last.
-            std::vector<int> group_order;
-            std::map<int, Stmt> merged;
-            for (int i = 0; i < num_producers; i++) {
-                if (!merged.count(pgroup[i])) {
-                    merged[pgroup[i]] = branches[i];
-                    group_order.push_back(pgroup[i]);
-                } else {
-                    merged[pgroup[i]] = Block::make(merged[pgroup[i]], branches[i]);
-                }
-            }
-            std::vector<Stmt> merged_branches;
-            merged_branches.reserve(group_order.size() + 1);
-            for (int g : group_order) {
-                merged_branches.push_back(merged[g]);
-            }
-            merged_branches.push_back(branches[num_groups - 1]);  // consumer
-            std::vector<Stmt> out(merged_branches.size());
-            for (int i = 0; i < (int)merged_branches.size(); i++) {
-                out[i] = mutate(peel_hoisted(merged_branches[i], lifted, lifted_seen));
+            std::vector<Stmt> out(num_groups);
+            for (int i = 0; i < num_groups; i++) {
+                out[i] = mutate(peel_hoisted(branches[i], lifted, lifted_seen));
             }
             Stmt result = out.back();  // right-nested fork, consumer innermost
-            for (int i = (int)out.size() - 2; i >= 0; i--) {
+            for (int i = num_groups - 2; i >= 0; i--) {
                 result = Fork::make(out[i], result);
             }
             for (auto it = lifted.rbegin(); it != lifted.rend(); ++it) {
@@ -2471,7 +2484,7 @@ class TagGPUVectorScope : public IRMutator {
 };
 }  // namespace
 
-Stmt fuse_gpu_thread_loops(Stmt s, const Target &t) {
+Stmt fuse_gpu_thread_loops(Stmt s, const Target &t, const std::map<std::string, Function> &env) {
     // Tag vectorized collectives with their realization scope before fusion erases the
     // gpu_warps/gpu_lanes loops; codegen reads the tag to decompose into the primitive.
     s = TagGPUVectorScope()(s);
@@ -2479,7 +2492,7 @@ Stmt fuse_gpu_thread_loops(Stmt s, const Target &t) {
     // into the innermost GPU block. FuseGPUThreadLoops would then
     // merge the predicate into the merged GPU thread.
     s = NormalizeIfStatements()(s);
-    s = FuseGPUThreadLoops(t.warp_size())(s);
+    s = FuseGPUThreadLoops(t.warp_size(), env)(s);
     s = ZeroGPULoopMins()(s);
     // Lower the schedule-derived sync_requirement markers to concrete barriers
     // (scope x target). Block scope -> whole-CTA gpu_thread_barrier today.

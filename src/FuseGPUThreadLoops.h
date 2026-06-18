@@ -16,6 +16,8 @@ namespace Internal {
 
 class Function;
 
+class Function;
+
 /** Rewrite all GPU loops to have a min of zero. */
 Stmt zero_gpu_loop_mins(const Stmt &s);
 
@@ -45,7 +47,8 @@ Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env, co
  * shared allocations at the block level out into a single shared
  * memory array, and heap allocations into a slice of a global pool
  * allocated outside the kernel. */
-Stmt fuse_gpu_thread_loops(Stmt s, const Target &t);
+Stmt fuse_gpu_thread_loops(Stmt s, const Target &t,
+                           const std::map<std::string, Function> &env);
 
 }  // namespace Internal
 }  // namespace Halide
