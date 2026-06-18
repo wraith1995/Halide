@@ -449,7 +449,17 @@ class RewriteWarpGroupTiles : public IRMutator {
                 idx_lanes.push_back(frag_slot(f));
             }
             Expr index_vec = Shuffle::make_concat(idx_lanes);
-            return Store::make(op->name, frag_vec, index_vec, op->param, const_true(8),
+            // Mainloop milestone 1a (HL_WGMMA_KACCUM): keep the `+C` read so D accumulates
+            // across a ko serial reduction loop in global (running RMW per hardware slot). NFC
+            // for the single-tile case -- the init stage zeroes C, so 0 + D = D. Each thread
+            // owns the same frag slots across ko (frag map keys on lane, not ko) -> no race.
+            Expr stored = frag_vec;
+            if (getenv("HL_WGMMA_KACCUM")) {
+                Expr c_old = Load::make(op->value.type().with_lanes(8), op->name, index_vec,
+                                        Buffer<>(), op->param, const_true(8), ModulusRemainder());
+                stored = c_old + frag_vec;
+            }
+            return Store::make(op->name, stored, index_vec, op->param, const_true(8),
                                ModulusRemainder());
         }
 
@@ -457,7 +467,14 @@ class RewriteWarpGroupTiles : public IRMutator {
         Expr frag = Call::make(op->value.type(), "wgmma_m64n16k16_f32",
                                {i, n_chunks, load_a, stride_a, load_b, stride_b},
                                Call::Intrinsic);
-        return Store::make(op->name, frag, frag_slot(i), op->param, const_true(),
+        // Mainloop 1a (HL_WGMMA_KACCUM): keep `+C` so D accumulates across ko (see vecfrag above).
+        Expr stored = frag;
+        if (getenv("HL_WGMMA_KACCUM")) {
+            Expr c_old = Load::make(op->value.type(), op->name, frag_slot(i),
+                                    Buffer<>(), op->param, const_true(), ModulusRemainder());
+            stored = c_old + frag;
+        }
+        return Store::make(op->name, stored, frag_slot(i), op->param, const_true(),
                            ModulusRemainder());
     }
 
