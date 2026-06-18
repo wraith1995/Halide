@@ -2222,6 +2222,18 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             // Leave the Fork for the Fork-aware fuser (sum-between, max-within). Here we
             // only inject the cross-group ring barriers (with per-edge counts) and lift
             // shared storage to block level; the fuser sizes/partitions the thread space.
+            // The per-edge barrier count is producer_threads[i] + consumer_threads, so these MUST
+            // match the actual lane ranges partition_warp_groups assigns. That core rounds every
+            // group up to the largest warp-group (warps_per_group) across the branches (so a wgmma
+            // consumer's 4-warp group lands aligned); round here to the SAME group_align, else the
+            // barrier count (sum of warp-rounded sizes) is smaller than the lanes that arrive
+            // (warp-group-rounded) and the kernel deadlocks. NFC for plain async (max_wpg==0 ->
+            // group_align==warp_size = the prior per-warp rounding).
+            int max_wpg = 0;
+            for (const Stmt &b : branches) {
+                max_wpg = std::max(max_wpg, max_warps_per_group(b));
+            }
+            int group_align = (max_wpg > 0 ? max_wpg : 1) * warp_size;
             auto branch_warp_threads = [&](const Stmt &s) {
                 ThreadExtents te;
                 s.accept(&te);
@@ -2231,7 +2243,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                         t = t * te.extent[d];
                     }
                 }
-                return simplify(((simplify(t) + (warp_size - 1)) / warp_size) * warp_size);  // round up to a warp
+                return simplify(((simplify(t) + (group_align - 1)) / group_align) * group_align);
             };
             std::vector<Expr> ptv(num_producers);
             for (int i = 0; i < num_producers; i++) {
