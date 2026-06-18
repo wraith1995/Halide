@@ -197,15 +197,31 @@ public:
 // k_stride==1 -> k is the fast dim (k = idx % K); else role is fast (role = idx % k_stride).
 Expr core_matrix_reencode(const Expr &idx, int k_stride, int reduce_k) {
     int n_chunks = reduce_k / 16;
+    Expr in = idx;
+    // Step 2 (ring_buffer): the dense index may carry a (ko%n)*slot ring/slot offset (storage
+    // hoisted above the mainloop, rotated by the serial loop). The core-matrix re-encode is a
+    // permutation WITHIN one slot, so the ring offset must be split off and re-added in core-
+    // matrix slot units -- NOT fed through the (role,k) decode, which would scramble it (folding
+    // (ko%n)*slot into k/8*64 yields the wrong slot stride for k_stride!=1: 128 vs slot=k*K). The
+    // core-matrix slot has the same element count as the dense slot (it is a permutation), so the
+    // slot offset is identical on both sides; the consumer descriptor keeps the same (ko%n)*slot.
+    Expr ring = make_zero(Int(32));
+    if (k_stride != 1) {
+        int slot = k_stride * reduce_k;  // dense (== core-matrix) slot element count
+        ring = (in / slot) * slot;       // 0 in the non-ring case (in < slot)
+        in = in % slot;                  // intra-slot offset to re-encode
+    }
+    // (k_stride==1 needs no split: role/8*128 already advances by exactly one slot per ring step
+    // for the m64n16k16 N=16 tile, so the ring offset survives the decode unchanged.)
     Expr role, k;
     if (k_stride == 1) {
-        k = idx % reduce_k;
-        role = idx / reduce_k;
+        k = in % reduce_k;
+        role = in / reduce_k;
     } else {
-        role = idx % k_stride;
-        k = idx / k_stride;
+        role = in % k_stride;
+        k = in / k_stride;
     }
-    return simplify((k % 8) + (role % 8) * 8 + (k / 8) * 64 + (role / 8) * (128 * n_chunks));
+    return simplify(ring + (k % 8) + (role % 8) * 8 + (k / 8) * 64 + (role / 8) * (128 * n_chunks));
 }
 
 // Pre-scan: find the natural (dense) shared operands of the wgmma tile reduce and record
