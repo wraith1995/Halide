@@ -548,11 +548,14 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         builder->CreateBr(loop_bb);
         builder->SetInsertPoint(loop_bb);
         llvm::FunctionType *ft = llvm::FunctionType::get(i32_t, {i32_t, i32_t}, false);
+        // LLVM IR-level inline asm: operands are $0/$1/$2 and `%` is literal (NOT a GCC-style
+        // escape), so use a plain block-scoped predicate name `mbar_p` -- `%p` would emit invalid
+        // `%%p` and also collide with the kernel's existing %p<N> predicate bank.
         llvm::InlineAsm *ia = llvm::InlineAsm::get(
             ft,
-            "{ .reg .pred %%p;\n"
-            "  mbarrier.try_wait.parity.shared.b64 %%p, [$1], $2;\n"
-            "  selp.u32 $0, 1, 0, %%p; }",
+            "{ .reg .pred mbar_p;\n"
+            "  mbarrier.try_wait.parity.shared.b64 mbar_p, [$1], $2;\n"
+            "  selp.u32 $0, 1, 0, mbar_p; }",
             "=r,r,r", /*hasSideEffects*/ true);
         llvm::Value *done = builder->CreateCall(ia, {addr, parity});
         llvm::Value *ready = builder->CreateICmpNE(done, ConstantInt::get(i32_t, 0));
