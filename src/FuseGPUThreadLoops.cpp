@@ -1906,18 +1906,16 @@ Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
     Expr fv = Variable::make(Int(32), ftid);
     Expr base = 0;
     Stmt body;
-    // A branch that contains a warp-group collective (a warps_per_group=N scope, e.g. the wgmma
-    // consumer) must start at a warp-GROUP boundary, not just a warp boundary -- wgmma faults
-    // ("Illegal Instruction Encoding") if its 4-warp group is misaligned (e.g. warps 2-5 when a
-    // 2-warp producer precedes it). Round every group's size up to the largest warp-group size
-    // across the branches so all bases are warp-group-aligned. No gaps (padded lanes stay in
-    // their group and still execute the cross-group barriers, so barrier counts hold); NFC for
-    // plain async (max_wpg==0 -> alignment is one warp, the prior behavior).
-    int max_wpg = 0;
-    for (const Stmt &b : branches) {
-        max_wpg = std::max(max_wpg, max_warps_per_group(b));
-    }
-    int group_align = (max_wpg > 0 ? max_wpg : 1) * warp_size;
+    // COLLECTIVE-AWARE PLACEMENT (the explicit-warp-group-assignment mechanism, F2). A branch
+    // that carries a warp-group collective (a warps_per_group=N scope, e.g. the wgmma consumer)
+    // must start at a warp-GROUP boundary and occupy N warps -- wgmma faults ("Illegal Instruction
+    // Encoding") if its 4-warp group is misaligned. Only such a branch is pinned to a group
+    // boundary + group-sized; non-collective branches (producer/DMA warps) need only WARP
+    // alignment and pack tightly. (Earlier this padded EVERY branch to the max warp-group size,
+    // wasting warps -- e.g. 384 threads for a 64x16 tile; collective-aware placement gives the
+    // wgmma group an aligned base while producers stay minimal.) A gap before an aligned
+    // collective base is fine: those lanes are in no branch's guard, so they idle and are excluded
+    // from the per-edge barrier counts (which sum the producing + consuming group sizes).
     for (const Stmt &branch : branches) {
         ThreadExtents te;
         branch.accept(&te);
@@ -1927,14 +1925,19 @@ Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
             maxe[i] = te.extent[i].defined() ? te.extent[i] : Expr(1);
             prod = simplify(prod * maxe[i]);
         }
-        // Group size: an explicit warps_per_group override (the wgmma scope, D2)
-        // fixes it at N warps regardless of the thread tile; otherwise derive it
-        // from the tile, rounded up to a warp-group boundary (group_align; = one warp
-        // when no warp-group collective is present). The thread tile still maps into the
-        // first `prod` lanes (FlattenBranchThreads masks the rest), so the extra warps idle.
+        int branch_wpg = max_warps_per_group(branch);  // >0 => this branch has a warp-group collective
+        // Size: an explicit override (symmetric gpu_warps peel) fixes N warps; else a collective
+        // branch is exactly its N warps and a non-collective branch is the tile rounded to a warp.
         Expr size = warps_per_group_override > 0
                         ? Expr(warps_per_group_override * warp_size)
-                        : simplify(((prod + (group_align - 1)) / group_align) * group_align);
+                        : (branch_wpg > 0
+                               ? Expr(branch_wpg * warp_size)
+                               : simplify(((prod + (warp_size - 1)) / warp_size) * warp_size));
+        // Pin a collective branch's base to a warp-group boundary (round up; a gap may precede it).
+        if (warps_per_group_override == 0 && branch_wpg > 0) {
+            int align = branch_wpg * warp_size;
+            base = simplify(((base + (align - 1)) / align) * align);
+        }
         Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)(branch);
         // Group range guard: only this group's warp range runs the branch (incl. its
         // cross-group barriers), so per-edge barrier counts (= sum of two groups) hold.
@@ -2223,17 +2226,12 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             // only inject the cross-group ring barriers (with per-edge counts) and lift
             // shared storage to block level; the fuser sizes/partitions the thread space.
             // The per-edge barrier count is producer_threads[i] + consumer_threads, so these MUST
-            // match the actual lane ranges partition_warp_groups assigns. That core rounds every
-            // group up to the largest warp-group (warps_per_group) across the branches (so a wgmma
-            // consumer's 4-warp group lands aligned); round here to the SAME group_align, else the
-            // barrier count (sum of warp-rounded sizes) is smaller than the lanes that arrive
-            // (warp-group-rounded) and the kernel deadlocks. NFC for plain async (max_wpg==0 ->
-            // group_align==warp_size = the prior per-warp rounding).
-            int max_wpg = 0;
-            for (const Stmt &b : branches) {
-                max_wpg = std::max(max_wpg, max_warps_per_group(b));
-            }
-            int group_align = (max_wpg > 0 ? max_wpg : 1) * warp_size;
+            // match the actual lane ranges partition_warp_groups assigns (collective-aware): a
+            // collective branch (the wgmma consumer) occupies exactly its N warps; a non-collective
+            // branch (producer/DMA) is the tile rounded to a warp. Mismatching these (e.g. summing
+            // warp-rounded sizes while the partition warp-group-rounds) makes the barrier count
+            // smaller than the arriving lanes -> deadlock. NFC for plain async (no collective ->
+            // per-warp rounding, as before).
             auto branch_warp_threads = [&](const Stmt &s) {
                 ThreadExtents te;
                 s.accept(&te);
@@ -2243,7 +2241,11 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                         t = t * te.extent[d];
                     }
                 }
-                return simplify(((simplify(t) + (group_align - 1)) / group_align) * group_align);
+                int wpg = max_warps_per_group(s);
+                if (wpg > 0) {
+                    return Expr(wpg * warp_size);  // collective: exactly its warp-group size
+                }
+                return simplify(((simplify(t) + (warp_size - 1)) / warp_size) * warp_size);
             };
             std::vector<Expr> ptv(num_producers);
             for (int i = 0; i < num_producers; i++) {
