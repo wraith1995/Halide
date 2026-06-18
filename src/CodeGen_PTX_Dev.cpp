@@ -637,13 +637,17 @@ void CodeGen_PTX_Dev::visit(const Store *op) {
     // following gpu_thread_barrier commits + waits (synchronous; ring_buffer adds overlap).
     if (!emit_atomic_stores && target.get_cuda_capability_lower_bound() >= 80 &&
         get_env_variable("HL_NO_CP_ASYNC").empty() &&
-        is_const_one(op->predicate) && op->value.type().bits() == 32) {
+        is_const_one(op->predicate)) {
         const Ramp *r = op->index.as<Ramp>();
         const Load *ld = op->value.as<Load>();
         const Ramp *lr = ld ? ld->index.as<Ramp>() : nullptr;
+        // cp.async.cg moves a 16-byte chunk; accept any element width whose contiguous
+        // vector is 16 B -- 4-wide 32-bit, or 8-wide 16-bit (the f16 core-matrix ki run
+        // produced by a vectorized operand staging copy, P3/1.2).
+        int payload_bits = r ? op->value.type().bits() * r->lanes : 0;
         if (r && ld && lr && is_const_one(ld->predicate) &&
             is_const_one(r->stride) && is_const_one(lr->stride) &&
-            r->lanes == 4 && lr->lanes == 4) {
+            payload_bits == 128 && lr->lanes == r->lanes) {
             Value *dst = codegen_buffer_pointer(op->name, op->value.type().element_of(), r->base);
             Value *src = codegen_buffer_pointer(ld->name, ld->type.element_of(), lr->base);
             // cp.async copies global (as1) -> shared (as3). dst must be shared; src must be
