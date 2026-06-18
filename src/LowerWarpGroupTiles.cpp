@@ -371,12 +371,23 @@ class RewriteWarpGroupTiles : public IRMutator {
         // The original `+ Load(C)` is dropped -- the fragment IS the accumulator.
         Expr base_a = tile_origin_at_lane(a.base_index, 0);
         Expr base_b = tile_origin_at_lane(b.base_index, 0);
-        Expr stride_a = (n_chunks > 1)
-                            ? simplify(tile_origin_at_lane(a.base_index, K_TILE) - base_a)
-                            : Expr(0);
-        Expr stride_b = (n_chunks > 1)
-                            ? simplify(tile_origin_at_lane(b.base_index, K_TILE) - base_b)
-                            : Expr(0);
+        // Per-chunk descriptor stride (advancing one K_TILE=16 step). For an AUTO-LAYOUT
+        // operand the producer was re-encoded to core-matrix, so the chunk stride is the
+        // core-matrix k-advance = K_TILE/8 = 2 ko, each ko = 64 elems = 128 elems -- NOT the
+        // natural gather's dense k-stride (which would be K_TILE*role_extent). A hand-matched
+        // operand already gathers core-matrix, so the gather delta gives the same 128.
+        const int cm_chunk_stride = (K_TILE / 8) * 64;
+        auto chunk_stride = [&](const Operand &o, const Expr &base) -> Expr {
+            if (n_chunks <= 1) {
+                return Expr(0);
+            }
+            if (natural_operands.count(o.buffer)) {
+                return Expr(cm_chunk_stride);
+            }
+            return simplify(tile_origin_at_lane(o.base_index, K_TILE) - base);
+        };
+        Expr stride_a = chunk_stride(a, base_a);
+        Expr stride_b = chunk_stride(b, base_b);
         Expr load_a = Load::make(a.elem_type, a.buffer, base_a,
                                  Buffer<>(), Parameter(), const_true(), ModulusRemainder());
         Expr load_b = Load::make(b.elem_type, b.buffer, base_b,
