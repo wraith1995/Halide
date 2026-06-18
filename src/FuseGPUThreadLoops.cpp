@@ -1880,12 +1880,44 @@ public:
 // a data-symmetric group split (identical bodies, different group index). The
 // per-group sizing/guard/flat-id math is identical for both; only how the branches
 // are produced differs.
+// The largest warps_per_group (warp-group collective scope, e.g. wgmma) anywhere in a branch,
+// or 0 if none. Used to warp-group-align the flat thread partition so a wgmma consumer's 4-warp
+// group lands on an aligned boundary.
+int max_warps_per_group(const Stmt &s) {
+    class V : public IRVisitor {
+        using IRVisitor::visit;
+        void visit(const For *op) override {
+            if (op->warps_per_group > 0) {
+                m = std::max(m, op->warps_per_group);
+            }
+            IRVisitor::visit(op);
+        }
+
+    public:
+        int m = 0;
+    } v;
+    s.accept(&v);
+    return v.m;
+}
+
 Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
                            DeviceAPI device_api, int warps_per_group_override = 0) {
     const std::string ftid = unique_name("warp_flat") + gpu_thread_name(0);
     Expr fv = Variable::make(Int(32), ftid);
     Expr base = 0;
     Stmt body;
+    // A branch that contains a warp-group collective (a warps_per_group=N scope, e.g. the wgmma
+    // consumer) must start at a warp-GROUP boundary, not just a warp boundary -- wgmma faults
+    // ("Illegal Instruction Encoding") if its 4-warp group is misaligned (e.g. warps 2-5 when a
+    // 2-warp producer precedes it). Round every group's size up to the largest warp-group size
+    // across the branches so all bases are warp-group-aligned. No gaps (padded lanes stay in
+    // their group and still execute the cross-group barriers, so barrier counts hold); NFC for
+    // plain async (max_wpg==0 -> alignment is one warp, the prior behavior).
+    int max_wpg = 0;
+    for (const Stmt &b : branches) {
+        max_wpg = std::max(max_wpg, max_warps_per_group(b));
+    }
+    int group_align = (max_wpg > 0 ? max_wpg : 1) * warp_size;
     for (const Stmt &branch : branches) {
         ThreadExtents te;
         branch.accept(&te);
@@ -1897,12 +1929,12 @@ Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
         }
         // Group size: an explicit warps_per_group override (the wgmma scope, D2)
         // fixes it at N warps regardless of the thread tile; otherwise derive it
-        // from the tile, warp-aligned (D4). The thread tile still maps into the
-        // first `prod` lanes (FlattenBranchThreads masks the rest), so an override
-        // larger than the tile leaves the extra warps idle.
+        // from the tile, rounded up to a warp-group boundary (group_align; = one warp
+        // when no warp-group collective is present). The thread tile still maps into the
+        // first `prod` lanes (FlattenBranchThreads masks the rest), so the extra warps idle.
         Expr size = warps_per_group_override > 0
                         ? Expr(warps_per_group_override * warp_size)
-                        : simplify(((prod + (warp_size - 1)) / warp_size) * warp_size);  // warp-aligned group size
+                        : simplify(((prod + (group_align - 1)) / group_align) * group_align);
         Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)(branch);
         // Group range guard: only this group's warp range runs the branch (incl. its
         // cross-group barriers), so per-edge barrier counts (= sum of two groups) hold.
