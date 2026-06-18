@@ -186,16 +186,35 @@ Expr core_matrix_reencode(const Expr &idx, int k_stride, int reduce_k) {
 // operand has a non-Ramp gather and is left alone (the 1.2 "already matches" case).
 class CollectNaturalOperands : public IRVisitor {
     using IRVisitor::visit;
+    int warps_per_group = -1;
+
+    // Track the enclosing explicit gpu_warps (WarpGroup) group, like the mutator, so we only
+    // re-layout the operands of a genuine wgmma tile reduce -- NOT every vectorized reduce in
+    // the kernel (critical now that auto-layout is always on, not gated).
+    void visit(const For *op) override {
+        int saved = warps_per_group;
+        if (op->for_type == ForType::GPUThread &&
+            (op->warps_per_group > 0 || op->realization == GPUVectorScope::WarpGroup)) {
+            warps_per_group = op->warps_per_group;
+        }
+        IRVisitor::visit(op);
+        warps_per_group = saved;
+    }
+
     void visit(const Store *op) override {
-        const VectorReduce *vr = find_vector_reduce(op->value);
-        Operand a, b;
-        if (vr && parse_operands(vr, a, b)) {
-            int reduce_k = vr->value.type().lanes();
-            for (const Operand *o : {&a, &b}) {
-                const Ramp *r = o->base_index.as<Ramp>();
-                if (r) {
-                    if (auto s = as_const_int(r->stride)) {
-                        layouts[o->buffer] = {(int)*s, reduce_k};
+        if (warps_per_group > 0) {
+            const VectorReduce *vr = find_vector_reduce(op->value);
+            Operand a, b;
+            if (vr && parse_operands(vr, a, b)) {
+                int reduce_k = vr->value.type().lanes();
+                for (const Operand *o : {&a, &b}) {
+                    // Only a plain-Ramp gather is a NATURAL dense operand to re-encode; a
+                    // hand-matched core-matrix operand has a non-Ramp gather -> left alone.
+                    const Ramp *r = o->base_index.as<Ramp>();
+                    if (r) {
+                        if (auto s = as_const_int(r->stride)) {
+                            layouts[o->buffer] = {(int)*s, reduce_k};
+                        }
                     }
                 }
             }
@@ -444,11 +463,11 @@ class RewriteWarpGroupTiles : public IRMutator {
 
 public:
     Stmt run(const Stmt &s) {
-        if (getenv("HL_WGMMA_AUTOLAYOUT")) {
-            CollectNaturalOperands c;
-            s.accept(&c);
-            natural_operands = c.layouts;
-        }
+        // Auto-layout is always on: the pre-scan only records natural (plain-Ramp) operands of
+        // an explicit gpu_warps tile reduce, so hand-matched (non-Ramp) operands are untouched.
+        CollectNaturalOperands c;
+        s.accept(&c);
+        natural_operands = c.layouts;
         return mutate(s);
     }
 };
