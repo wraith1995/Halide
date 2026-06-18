@@ -455,6 +455,113 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         return;
     }
 
+    // F3 (mbarrier completion): the deep cp.async ring pipeline's full edge. The mbarrier
+    // address is carried as a scalar Load(UInt(64), <edge>.full_mbar, slot) so that
+    // ExtractSharedAndHeapAllocations folds the allocation's shared-window offset into the
+    // slot index for free (same path as a normal shared Load); codegen never loads the value,
+    // it derives the addrspace(3) pointer and uses its integer value as the .shared byte offset
+    // (dynamic shared starts at 0 -- identical to the wgmma descriptor's tile origin). Emitted
+    // as inline PTX asm because LLVM 21 NVPTX lacks the parity try_wait intrinsic. See §5e.
+    auto mbar_shared_addr = [&](const Expr &ref) -> llvm::Value * {
+        const Load *m = ref.as<Load>();
+        internal_assert(m) << "mbarrier intrinsic address must be a Load carrier.\n";
+        llvm::Value *ptr = codegen_buffer_pointer(m->name, m->type.element_of(), m->index);
+        return builder->CreatePtrToInt(ptr, i32_t);  // base 0 => int value IS the shared offset
+    };
+    if (op->is_intrinsic() && op->name == "mbarrier_init") {
+        // Arm all N ring slots of a full mbarrier with `count` expected producer arrivals
+        // (= producer warp-group thread count). Done ONCE per block by thread 0 (init is a
+        // single-thread op; multiple inits of one mbarrier race), then a CTA barrier so the
+        // armed barriers are visible before any producer arrive / consumer wait. This marker
+        // is placed at block level (outside the thread loops) so it runs on all threads; the
+        // tid==0 guard + barrier here make it once-per-block. Args: (mbar_base_ref, N, count).
+        internal_assert(op->args.size() == 3u) << "mbarrier_init expects (mbar_base_ref, N, count).\n";
+        const Load *base = op->args[0].as<Load>();
+        auto n = as_const_int(op->args[1]);
+        internal_assert(base && n) << "mbarrier_init args malformed.\n";
+        llvm::Value *count = codegen(op->args[2]);
+
+        // tid = tid.x | tid.y | tid.z; guard tid == 0.
+        auto sreg = [&](llvm::Intrinsic::ID id) {
+            return builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(module.get(), id));
+        };
+        llvm::Value *tid = builder->CreateOr(
+            builder->CreateOr(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_x),
+                              sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_y)),
+            sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_z));
+        llvm::Value *is_thread0 = builder->CreateICmpEQ(tid, ConstantInt::get(i32_t, 0));
+        llvm::Function *fn = builder->GetInsertBlock()->getParent();
+        llvm::BasicBlock *init_bb = llvm::BasicBlock::Create(*context, "mbar_init", fn);
+        llvm::BasicBlock *done_bb = llvm::BasicBlock::Create(*context, "mbar_init_done", fn);
+        builder->CreateCondBr(is_thread0, init_bb, done_bb);
+        builder->SetInsertPoint(init_bb);
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t, i32_t}, false);
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, "mbarrier.init.shared.b64 [$0], $1;",
+                                                   "r,r", /*hasSideEffects*/ true);
+        for (int i = 0; i < (int)*n; i++) {
+            Expr slot = simplify(base->index + i);  // u64 elements; each mbarrier is 8 B
+            llvm::Value *ptr = codegen_buffer_pointer(base->name, base->type.element_of(), slot);
+            llvm::Value *addr = builder->CreatePtrToInt(ptr, i32_t);
+            builder->CreateCall(ia, {addr, count});
+        }
+        builder->CreateBr(done_bb);
+        builder->SetInsertPoint(done_bb);
+        // CTA barrier so every thread sees the armed mbarriers before using them.
+        if (llvm::Function *b = module->getFunction("llvm.nvvm.barrier.cta.sync.aligned.all")) {
+            builder->CreateCall(b, builder->getInt32(0));
+        } else if (llvm::Function *b0 = module->getFunction("llvm.nvvm.barrier0")) {
+            builder->CreateCall(b0);
+        } else {
+            builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                module.get(), llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_all), builder->getInt32(0));
+        }
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
+    if (op->is_intrinsic() && op->name == "cp_async_mbarrier_arrive") {
+        // cp.async.mbarrier.arrive.shared.b64 [addr] -- a DEFERRED arrival: when this thread's
+        // prior cp.async copies complete, the mbarrier's pending count is decremented. The
+        // producer never waits; the consumer's try_wait observes completion. Args: (mbar_ref).
+        internal_assert(op->args.size() == 1u) << "cp_async_mbarrier_arrive expects (mbar_ref).\n";
+        llvm::Value *addr = mbar_shared_addr(op->args[0]);
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t}, false);
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, "cp.async.mbarrier.arrive.shared.b64 [$0];",
+                                                   "r", /*hasSideEffects*/ true);
+        builder->CreateCall(ia, {addr});
+        // This consumes the in-flight cp.async (their completion now arrives on the mbarrier),
+        // so the downstream named/CTA barrier must NOT also commit+wait them (would be redundant
+        // and would re-serialize the producer). Clear the pending-copy flag.
+        emitted_cp_async = false;
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
+    if (op->is_intrinsic() && op->name == "mbarrier_try_wait") {
+        // Spin on mbarrier.try_wait.parity until the awaited phase (parity = (ko/N)&1) completes,
+        // i.e. all producer cp.async into this slot are visible. Args: (mbar_ref, parity). The
+        // try_wait is emitted as asm returning 0/1; the spin loop is built in LLVM IR.
+        internal_assert(op->args.size() == 2u) << "mbarrier_try_wait expects (mbar_ref, parity).\n";
+        llvm::Value *addr = mbar_shared_addr(op->args[0]);
+        llvm::Value *parity = codegen(op->args[1]);
+        llvm::Function *fn = builder->GetInsertBlock()->getParent();
+        llvm::BasicBlock *loop_bb = llvm::BasicBlock::Create(*context, "mbar_wait", fn);
+        llvm::BasicBlock *after_bb = llvm::BasicBlock::Create(*context, "mbar_ready", fn);
+        builder->CreateBr(loop_bb);
+        builder->SetInsertPoint(loop_bb);
+        llvm::FunctionType *ft = llvm::FunctionType::get(i32_t, {i32_t, i32_t}, false);
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(
+            ft,
+            "{ .reg .pred %%p;\n"
+            "  mbarrier.try_wait.parity.shared.b64 %%p, [$1], $2;\n"
+            "  selp.u32 $0, 1, 0, %%p; }",
+            "=r,r,r", /*hasSideEffects*/ true);
+        llvm::Value *done = builder->CreateCall(ia, {addr, parity});
+        llvm::Value *ready = builder->CreateICmpNE(done, ConstantInt::get(i32_t, 0));
+        builder->CreateCondBr(ready, after_bb, loop_bb);
+        builder->SetInsertPoint(after_bb);
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
+
     if (op->is_intrinsic(Call::gpu_thread_barrier)) {
         // Even though we always insert a __syncthreads equivalent
         // (which has both a device and shared memory fence)

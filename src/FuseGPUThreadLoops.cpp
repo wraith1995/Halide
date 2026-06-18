@@ -2158,9 +2158,16 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         int ring_n;     // ring depth (slot = ring_loop % ring_n)
         bool is_empty;  // empty edge (producer waits) vs full edge (consumer waits)
         int producer;   // producing warp-group index (selects its thread count, fork_fuse)
+        std::string mbar_name;  // F3: non-empty on the full (data) edge when HL_WG_MBAR is on ->
+                                // the edge is realized by an mbarrier (cp.async-completion arrive +
+                                // parity try_wait) instead of a named barrier. See §5e.
     };
     std::map<std::string, BarrierInfo> sema_map;
     const int warp_size;
+    // F3: realize the full (cp.async data) edge as an mbarrier completion handshake (deep pipeline,
+    // no loop skew) instead of the synchronous named-barrier + producer wait_group. Empty edge stays
+    // a named barrier. Off by default (NFC); on with HL_WG_MBAR=1.
+    const bool mbar;
     using IRMutator::visit;
 
     // mode 0 = wait, 1 = arrive. id = base + (ring_loop % ring_n) selects the slot.
@@ -2179,6 +2186,14 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                                          {IntImm::make(Int(32), (int)SyncScope::WarpGroup),
                                           id, count, IntImm::make(Int(32), mode)},
                                          Call::Intrinsic));
+    }
+
+    // F3: a Load carrier addressing full mbarrier slot (ring_loop % ring_n). codegen derives the
+    // addrspace(3) pointer from it (and ExtractSharedAndHeapAllocations folds the shared offset).
+    Expr mbar_slot_ref(const BarrierInfo &b) {
+        Expr slot = Variable::make(Int(32), ring_loop) % b.ring_n;
+        return Load::make(UInt(64), b.mbar_name, slot, Buffer<>{}, Parameter{}, const_true(),
+                          ModulusRemainder{});
     }
 
     Stmt visit(const LetStmt *op) override {
@@ -2215,8 +2230,10 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             auto n = as_const_int(env.at(prod).schedule().ring_buffer());
             internal_assert(n) << "ring_buffer extent must be a constant for warp specialization\n";
             int rn = (int)*n;
-            smap[prod + ".semaphore_0"] = {base, rn, /*is_empty*/ false, pi};
-            smap[prod + ".folding_semaphore.ring_buffer"] = {base + rn, rn, /*is_empty*/ true, pi};
+            // Full (data) edge -> mbarrier when enabled; empty (slot-reuse control) edge stays named.
+            smap[prod + ".semaphore_0"] = {base, rn, /*is_empty*/ false, pi,
+                                           mbar ? (prod + ".full_mbar") : std::string()};
+            smap[prod + ".folding_semaphore.ring_buffer"] = {base + rn, rn, /*is_empty*/ true, pi, {}};
             base += 2 * rn;
         }
         // Per-edge participant count: producer warp group + consumer warp group. With
@@ -2336,6 +2353,30 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             for (int i = num_groups - 2; i >= 0; i--) {
                 result = Fork::make(out[i], result);
             }
+            // F3: per-producer full-edge mbarrier. Allocate the N-slot array at block level and arm
+            // it ONCE before the fork (thread-0-guarded + CTA barrier in codegen). EXPECTED arrivals
+            // = the producer branch's thread count (producer_threads[pi]) -- exactly the threads that
+            // run the cp.async.mbarrier.arrive; the consumer only polls, it does not arrive. The
+            // branch arrive/wait reference the array by name (a Load carrier whose shared offset
+            // ExtractSharedAndHeapAllocations folds). The array is live across the whole mainloop
+            // (referenced every ko), so it never coalesces with the As/Bs operand slots.
+            if (mbar) {
+                for (const auto &kv : sema_map) {
+                    const BarrierInfo &b = kv.second;
+                    if (b.mbar_name.empty()) {
+                        continue;  // full (data) edges only
+                    }
+                    Expr base_ref = Load::make(UInt(64), b.mbar_name, 0, Buffer<>{}, Parameter{},
+                                               const_true(), ModulusRemainder{});
+                    Stmt init = Evaluate::make(Call::make(Int(32), "mbarrier_init",
+                                                          {base_ref, Expr(b.ring_n),
+                                                           producer_threads[b.producer]},
+                                                          Call::Intrinsic));
+                    result = Block::make(init, result);
+                    result = Allocate::make(b.mbar_name, UInt(64), MemoryType::GPUShared,
+                                            {Expr(b.ring_n)}, const_true(), result);
+                }
+            }
             for (auto it = lifted.rbegin(); it != lifted.rend(); ++it) {
                 result = HoistedStorage::make(*it, result);
             }
@@ -2373,6 +2414,15 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             if (it != sema_map.end()) {
                 const BarrierInfo &b = it->second;
                 Stmt body = mutate(op->body);
+                if (!b.mbar_name.empty()) {
+                    // F3 full-edge consumer wait: spin on the slot's mbarrier until the producer's
+                    // cp.async copies complete (parity = (ko/N)&1, since the slot is reused every N
+                    // iters and each completion flips the phase). No producer drain -> deep overlap.
+                    Expr parity = (Variable::make(Int(32), ring_loop) / b.ring_n) % 2;
+                    Stmt wait = Evaluate::make(Call::make(Int(32), "mbarrier_try_wait",
+                                                          {mbar_slot_ref(b), parity}, Call::Intrinsic));
+                    return Block::make(wait, body);
+                }
                 Stmt wait = emit_barrier(b, /*wait*/ 0);
                 if (b.is_empty) {
                     // Slots start free: skip the first N empty-waits or iter 0 deadlocks.
@@ -2396,7 +2446,16 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             const Variable *v = c->args[0].as<Variable>();
             auto it = v ? sema_map.find(v->name) : sema_map.end();
             if (it != sema_map.end()) {
-                return emit_barrier(it->second, /*arrive*/ 1);
+                const BarrierInfo &b = it->second;
+                if (!b.mbar_name.empty()) {
+                    // F3 full-edge producer arrive: a DEFERRED cp.async-completion arrive on the
+                    // slot's mbarrier. The producer never waits its own copies (no commit/wait_group);
+                    // their completion decrements the mbarrier the consumer polls. -> copies stay in
+                    // flight across slots = the deep pipeline.
+                    return Evaluate::make(Call::make(Int(32), "cp_async_mbarrier_arrive",
+                                                     {mbar_slot_ref(b)}, Call::Intrinsic));
+                }
+                return emit_barrier(b, /*arrive*/ 1);
             }
         }
         return IRMutator::visit(op);
@@ -2404,7 +2463,8 @@ class LowerGPUWarpAsyncFork : public IRMutator {
 
 public:
     LowerGPUWarpAsyncFork(const std::map<std::string, Function> &env, int warp_size)
-        : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") != "0"), warp_size(warp_size) {
+        : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") != "0"), warp_size(warp_size),
+          mbar(get_env_variable("HL_WG_MBAR") == "1") {
     }
 };
 
