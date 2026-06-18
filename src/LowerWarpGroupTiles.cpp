@@ -161,6 +161,52 @@ public:
     }
 };
 
+// 1.1 auto-layout: re-encode a NATURAL (dense) operand shared-store index into the
+// core-matrix tiling the wgmma descriptor needs. The producer store index is a clean
+// 0-based allocation-relative offset; decode it to (role, k) using the operand's K-stride
+// (role = the M/N dim), then re-encode core-matrix: ki(stride 1) + role%8 (stride 8) +
+// ko(stride 64) + role/8 (stride 8*K = 128*n_chunks). k_stride tells the orientation:
+// k_stride==1 -> k is the fast dim (k = idx % K); else role is fast (role = idx % k_stride).
+Expr core_matrix_reencode(const Expr &idx, int k_stride, int reduce_k) {
+    int n_chunks = reduce_k / 16;
+    Expr role, k;
+    if (k_stride == 1) {
+        k = idx % reduce_k;
+        role = idx / reduce_k;
+    } else {
+        role = idx % k_stride;
+        k = idx / k_stride;
+    }
+    return simplify((k % 8) + (role % 8) * 8 + (k / 8) * 64 + (role / 8) * (128 * n_chunks));
+}
+
+// Pre-scan: find the natural (dense) shared operands of the wgmma tile reduce and record
+// their K-stride, so the producer's shared stores can be re-encoded to core-matrix. Only
+// operands whose reduce-gather is a plain Ramp are "natural" -- a hand-matched core-matrix
+// operand has a non-Ramp gather and is left alone (the 1.2 "already matches" case).
+class CollectNaturalOperands : public IRVisitor {
+    using IRVisitor::visit;
+    void visit(const Store *op) override {
+        const VectorReduce *vr = find_vector_reduce(op->value);
+        Operand a, b;
+        if (vr && parse_operands(vr, a, b)) {
+            int reduce_k = vr->value.type().lanes();
+            for (const Operand *o : {&a, &b}) {
+                const Ramp *r = o->base_index.as<Ramp>();
+                if (r) {
+                    if (auto s = as_const_int(r->stride)) {
+                        layouts[o->buffer] = {(int)*s, reduce_k};
+                    }
+                }
+            }
+        }
+        IRVisitor::visit(op);
+    }
+
+public:
+    std::map<std::string, std::pair<int, int>> layouts;  // buffer -> (k_stride, reduce_k)
+};
+
 // Rewrite recognized WarpGroup tile reduces into the wgmma collective: each of
 // the (unrolled) per-thread reduce stores becomes a store of one wgmma fragment
 // register to the global slot the hardware map assigns, at a NON-AFFINE index
@@ -182,6 +228,11 @@ class RewriteWarpGroupTiles : public IRMutator {
     // frag_col_n*stride_n -- so M/N output tiling over gpu_blocks Just Works.
     bool out_captured = false;
     Expr out_base, out_stride_m, out_stride_n;
+
+    // 1.1 auto-layout: natural (dense) shared operands and their K-stride, populated by the
+    // pre-scan. A producer store to one of these buffers gets its index re-encoded to the
+    // core-matrix tiling. Empty unless HL_WGMMA_AUTOLAYOUT is set (prototype gate).
+    std::map<std::string, std::pair<int, int>> natural_operands;
 
     Stmt visit(const LetStmt *op) override {
         lets[op->name] = op->value;
@@ -258,6 +309,21 @@ class RewriteWarpGroupTiles : public IRMutator {
     }
 
     Stmt visit(const Store *op) override {
+        // 1.1 auto-layout: a store to a natural shared operand is the PRODUCER fill; re-encode
+        // its (clean 0-based allocation-relative) index to the core-matrix tiling so the wgmma
+        // descriptor reads it correctly -- no extra staging stage (the producer writes
+        // core-matrix directly). Only the index changes; the value (the global load) is kept.
+        auto it = natural_operands.find(op->name);
+        if (it != natural_operands.end()) {
+            Expr new_idx = core_matrix_reencode(op->index, it->second.first, it->second.second);
+            if (getenv("HL_DEBUG_WGMMA")) {
+                debug(0) << "[wgtile] auto-layout producer " << op->name
+                         << " (k_stride=" << it->second.first << ") -> core-matrix\n";
+            }
+            Expr value = mutate(op->value);
+            return Store::make(op->name, value, new_idx, op->param, op->predicate, op->alignment);
+        }
+
         // wgmma scope = an EXPLICIT gpu_warps group (warps_per_group > 0).
         if (group_var.empty() || warps_per_group <= 0 || thread_var.empty()) {
             return IRMutator::visit(op);
@@ -367,6 +433,11 @@ class RewriteWarpGroupTiles : public IRMutator {
 
 public:
     Stmt run(const Stmt &s) {
+        if (getenv("HL_WGMMA_AUTOLAYOUT")) {
+            CollectNaturalOperands c;
+            s.accept(&c);
+            natural_operands = c.layouts;
+        }
         return mutate(s);
     }
 };
