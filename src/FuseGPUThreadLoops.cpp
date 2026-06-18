@@ -1883,6 +1883,25 @@ public:
 // The largest warps_per_group (warp-group collective scope, e.g. wgmma) anywhere in a branch,
 // or 0 if none. Used to warp-group-align the flat thread partition so a wgmma consumer's 4-warp
 // group lands on an aligned boundary.
+// The name of the first producing Func in a warp-spec branch (its ProducerConsumer), or "".
+// Used to look up a branch's explicit gpu_warp_group assignment in the environment.
+std::string producer_name_of(const Stmt &s) {
+    class V : public IRVisitor {
+        using IRVisitor::visit;
+        void visit(const ProducerConsumer *op) override {
+            if (op->is_producer && name.empty()) {
+                name = op->name;
+            }
+            IRVisitor::visit(op);
+        }
+
+    public:
+        std::string name;
+    } v;
+    s.accept(&v);
+    return v.name;
+}
+
 int max_warps_per_group(const Stmt &s) {
     class V : public IRVisitor {
         using IRVisitor::visit;
@@ -2247,20 +2266,61 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                 }
                 return simplify(((simplify(t) + (warp_size - 1)) / warp_size) * warp_size);
             };
+            // F2 explicit warp-group assignment: producers sharing a `gpu_warp_group` index
+            // co-reside on ONE warp group -- the directive-driven producer fold (As/Bs onto one
+            // group with no compute_with / dim-alignment). Default (unset) = each producer its own
+            // group index, i.e. the prior sequential behavior (NFC). The group of a producer with
+            // index g occupies max(its co-residents' warp counts); both edges' barrier counts use
+            // that group size, and the co-grouped branch BODIES are merged (run sequentially on the
+            // shared warps) into one branch so the partitioner places them at a single base.
+            std::vector<int> pgroup(num_producers);
+            for (int i = 0; i < num_producers; i++) {
+                pgroup[i] = i;  // default: each producer its own group (sequential, NFC)
+                std::string pname = producer_name_of(branches[i]);
+                if (!pname.empty() && env.count(pname)) {
+                    const std::vector<int> &g = env.at(pname).schedule().gpu_warp_group();
+                    if (!g.empty()) {
+                        pgroup[i] = g[0];
+                    }
+                }
+            }
             std::vector<Expr> ptv(num_producers);
             for (int i = 0; i < num_producers; i++) {
-                ptv[i] = branch_warp_threads(branches[i]);
+                Expr g = branch_warp_threads(branches[i]);
+                for (int j = 0; j < num_producers; j++) {
+                    if (j != i && pgroup[j] == pgroup[i]) {
+                        g = max(g, branch_warp_threads(branches[j]));
+                    }
+                }
+                ptv[i] = simplify(g);
             }
             ScopedValue<std::vector<Expr>> pt(producer_threads, ptv);
             ScopedValue<Expr> ct(consumer_threads, branch_warp_threads(branches[num_groups - 1]));
             std::vector<std::string> lifted;
             std::set<std::string> lifted_seen;
-            std::vector<Stmt> out(num_groups);
-            for (int i = 0; i < num_groups; i++) {
-                out[i] = mutate(peel_hoisted(branches[i], lifted, lifted_seen));
+            // Merge co-grouped producer branches (first-appearance group order), consumer last.
+            std::vector<int> group_order;
+            std::map<int, Stmt> merged;
+            for (int i = 0; i < num_producers; i++) {
+                if (!merged.count(pgroup[i])) {
+                    merged[pgroup[i]] = branches[i];
+                    group_order.push_back(pgroup[i]);
+                } else {
+                    merged[pgroup[i]] = Block::make(merged[pgroup[i]], branches[i]);
+                }
+            }
+            std::vector<Stmt> merged_branches;
+            merged_branches.reserve(group_order.size() + 1);
+            for (int g : group_order) {
+                merged_branches.push_back(merged[g]);
+            }
+            merged_branches.push_back(branches[num_groups - 1]);  // consumer
+            std::vector<Stmt> out(merged_branches.size());
+            for (int i = 0; i < (int)merged_branches.size(); i++) {
+                out[i] = mutate(peel_hoisted(merged_branches[i], lifted, lifted_seen));
             }
             Stmt result = out.back();  // right-nested fork, consumer innermost
-            for (int i = num_groups - 2; i >= 0; i--) {
+            for (int i = (int)out.size() - 2; i >= 0; i--) {
                 result = Fork::make(out[i], result);
             }
             for (auto it = lifted.rbegin(); it != lifted.rend(); ++it) {

@@ -2582,12 +2582,14 @@ Func &Func::ring_buffer(Expr extent) {
     return *this;
 }
 
-Func &Func::gpu_producer_warps(int n) {
+Func &Func::gpu_warp_group(const std::vector<int> &groups) {
     invalidate_cache();
-    user_assert(n >= 1)
-        << "gpu_producer_warps() for Func " << name()
-        << " must be at least 1, but got " << n << "\n";
-    func.schedule().gpu_producer_warps() = n;
+    for (int g : groups) {
+        user_assert(g >= 0)
+            << "gpu_warp_group() for Func " << name()
+            << " takes non-negative warp-group indices, but got " << g << "\n";
+    }
+    func.schedule().gpu_warp_group() = groups;
     return *this;
 }
 

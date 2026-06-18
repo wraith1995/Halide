@@ -178,34 +178,6 @@ int main(int argc, char **argv) {
         },
         W, H);
 
-    // 5. Multiple producer warps via gpu_producer_warps(2).
-    check2d(
-        "producer_warps_2",
-        [](Func &p, Func &c, Var x, Var y) {
-            p(x, y) = x - 2 * y;
-            c(x, y) = p(x, y) + 100;
-        },
-        [](Func &p, Func &c, Var x, Var y) {
-            Var xo("xo"), yo("yo"), xi("xi"), yi("yi");
-            c.compute_root().gpu_tile(x, y, xo, yo, xi, yi, 16, 16);
-            p.compute_at(c, xo).store_in(MemoryType::GPUShared).gpu_threads(x, y).gpu_producer_warps(2).async();
-        },
-        W, H);
-
-    // 6. Multiple producer warps via gpu_producer_warps(4).
-    check2d(
-        "producer_warps_4",
-        [](Func &p, Func &c, Var x, Var y) {
-            p(x, y) = 5 * x + y;
-            c(x, y) = p(x, y) - 3;
-        },
-        [](Func &p, Func &c, Var x, Var y) {
-            Var xo("xo"), yo("yo"), xi("xi"), yi("yi");
-            c.compute_root().gpu_tile(x, y, xo, yo, xi, yi, 16, 16);
-            p.compute_at(c, xo).store_in(MemoryType::GPUShared).gpu_threads(x, y).gpu_producer_warps(4).async();
-        },
-        W, H);
-
     // 7. Producer with a 1D thread decomposition only (gpu_threads(x)).
     check2d(
         "producer_threads_1d",

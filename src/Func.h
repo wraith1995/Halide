@@ -2361,18 +2361,15 @@ public:
      */
     Func &async();
 
-    /** When this Func is scheduled as an asynchronous producer whose compute
-     * level sits inside a GPU block loop but outside the GPU thread loops, it
-     * is lowered via GPU warp specialization: a group of warps in each block is
-     * dedicated to producing this Func (e.g. staging data into shared memory)
-     * while the remaining warps consume it. This directive sets how many warps
-     * are dedicated to production. The default (0) means one producer warp.
-     *
-     * This is currently only supported on the CUDA target. The producer/consumer
-     * split is warp-aligned, so the consumer thread count is rounded up to a
-     * multiple of the warp size and the block is launched with `n` extra warps.
-     */
-    Func &gpu_producer_warps(int n);
+    /** Explicit warp-group assignment (F2). Pin this Func's computation to specific warp-group
+     * index/indices within its GPU block, for warp specialization. The argument is OPTIONAL: with
+     * no list (or an empty one) the assignment is derived from .async()/the collective-aware
+     * placement (the default). A single index pins a role (e.g. a producer/DMA stage -> group g);
+     * a list assigns the stage across several groups (e.g. {0,1} for two MMA consumer warp groups
+     * / ping-pong). Warp groups are placed at warp-group-aligned bases by construction, so a wgmma
+     * consumer assigned to a group is automatically aligned. .async()/compute_with desugar to this.
+     * CUDA only. See research/gpu_recognizer_design.md "Explicit warp-group assignment". */
+    Func &gpu_warp_group(const std::vector<int> &groups = {});
 
     /** Expands the storage of the function by an extra dimension
      * to enable ring buffering. For this to be useful the storage

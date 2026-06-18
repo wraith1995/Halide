@@ -629,12 +629,11 @@ public:
     bool &async();
     bool async() const;
 
-    /** Number of GPU warps dedicated to producing this Function when it is
-     * scheduled as a warp-specialized async producer inside a GPU block. A
-     * value of 0 means "auto" (one producer warp). See \ref
-     * Func::gpu_producer_warps. */
-    int &gpu_producer_warps();
-    int gpu_producer_warps() const;
+    /** Explicit warp-group assignment (F2): the warp-group index/indices this Function runs
+     * on within a GPU block, for warp specialization. Empty = unset (derived). A single index
+     * pins a role; a list spans/splits across several groups. See \ref Func::gpu_warp_group. */
+    std::vector<int> &gpu_warp_group();
+    const std::vector<int> &gpu_warp_group() const;
 
     Expr &ring_buffer();
     Expr &ring_buffer() const;

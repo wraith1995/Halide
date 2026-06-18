@@ -242,10 +242,11 @@ struct FuncScheduleContents {
     SwizzleLayout swizzle;
     bool memoized = false;
     bool async = false;
-    // Number of GPU warps dedicated to producing this Func when it is scheduled
-    // as a warp-specialized async producer inside a GPU block. 0 means "auto"
-    // (use the default of one producer warp). See Func::gpu_producer_warps.
-    int gpu_producer_warps = 0;
+    // Explicit warp-group assignment (F2): the warp-group index/indices this Func runs on within
+    // a GPU block, for warp specialization. Empty = unset (derive from .async()/collective-aware
+    // placement). A single index pins a role (e.g. producer -> group g); a list spans/splits the
+    // stage across several groups (e.g. 2 MMA consumer groups, ping-pong). See Func::gpu_warp_group.
+    std::vector<int> gpu_warp_group;
     // This is an extent of the ring buffer and expected to be a positive integer.
     Expr ring_buffer;
     Expr memoize_eviction_key;
@@ -370,7 +371,7 @@ FuncSchedule FuncSchedule::deep_copy(
     copy.contents->memoized = contents->memoized;
     copy.contents->memoize_eviction_key = contents->memoize_eviction_key;
     copy.contents->async = contents->async;
-    copy.contents->gpu_producer_warps = contents->gpu_producer_warps;
+    copy.contents->gpu_warp_group = contents->gpu_warp_group;
     copy.contents->ring_buffer = contents->ring_buffer;
 
     // Deep-copy wrapper functions.
@@ -423,12 +424,12 @@ bool FuncSchedule::async() const {
     return contents->async;
 }
 
-int &FuncSchedule::gpu_producer_warps() {
-    return contents->gpu_producer_warps;
+std::vector<int> &FuncSchedule::gpu_warp_group() {
+    return contents->gpu_warp_group;
 }
 
-int FuncSchedule::gpu_producer_warps() const {
-    return contents->gpu_producer_warps;
+const std::vector<int> &FuncSchedule::gpu_warp_group() const {
+    return contents->gpu_warp_group;
 }
 
 Expr &FuncSchedule::ring_buffer() {
