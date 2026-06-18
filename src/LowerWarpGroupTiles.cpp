@@ -87,7 +87,11 @@ bool parse_operands(const VectorReduce *vr, Operand &a, Operand &b) {
 // alone would not reduce (e.g. (C.min.0 % 8)*8).
 class ZeroVars : public IRMutator {
     using IRMutator::visit;
+    const std::set<std::string> *only;  // if non-null, zero ONLY these var names (else all)
     Expr visit(const Variable *op) override {
+        if (only && !only->count(op->name)) {
+            return op;  // keep -- e.g. the serial-loop (ring_buffer ko%n) rotation
+        }
         return make_zero(op->type);
     }
     Expr visit(const Call *op) override {
@@ -98,6 +102,7 @@ class ZeroVars : public IRMutator {
     }
 
 public:
+    explicit ZeroVars(const std::set<std::string> *o = nullptr) : only(o) {}
     Expr run(const Expr &e) {
         return mutate(e);
     }
@@ -317,15 +322,24 @@ class RewriteWarpGroupTiles : public IRMutator {
         return e;
     }
 
-    // The shared element offset of the operand tile at vector lane `lane` (k=lane),
-    // with all thread/loop vars + buffer mins zeroed: resolve CSE'd lets, zero vars,
-    // then extract the given lane. lane 0 = the tile origin (k=0). lane 16 = the start
-    // of the next wgmma K-chunk (used to derive the per-chunk descriptor stride for
-    // K>16 accumulation -- the vectorized k tile is a core-matrix gather, so the chunk
-    // stride is the affine address delta over 16 k-steps).
+    // The shared element offset of the operand tile at vector lane `lane` (k=lane): resolve CSE'd
+    // lets, zero ONLY the thread/warp-varying parts (per-lane variation within the warp group) +
+    // any folded buffer-query, then extract the given lane. lane 0 = the tile origin (k=0). lane
+    // 16 = the start of the next wgmma K-chunk (chunk-stride derivation for K>16).
+    // KEY (step 2): serial-loop dependence is KEPT -- with ring_buffer(n) the operand tile lives
+    // in slot (ko % n), so the origin carries a `(ko%n)*slot_size` term the descriptor must follow
+    // across the mainloop. Zeroing only thread_var/group_var preserves it (NFC for the non-ring
+    // case, where the operand address has no serial-loop term -- only thread vars + constants).
     Expr tile_origin_at_lane(Expr base, int lane) {
         base = resolve_lets(base);
-        Expr z = simplify(ZeroVars().run(simplify(base)));
+        std::set<std::string> thread_vars;
+        if (!thread_var.empty()) {
+            thread_vars.insert(thread_var);
+        }
+        if (!group_var.empty()) {
+            thread_vars.insert(group_var);
+        }
+        Expr z = simplify(ZeroVars(&thread_vars).run(simplify(base)));
         if (z.type().lanes() > 1) {
             z = extract_lane(z, lane);
         }
