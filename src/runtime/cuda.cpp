@@ -1156,6 +1156,30 @@ WEAK int halide_cuda_run(void *user_context,
         return error_cuda(user_context, err, "cuModuleGetFunction failed");
     }
 
+    // Dynamic shared memory above the 48KB default static cap requires an explicit
+    // per-function opt-in (Hopper allows up to ~228KB). Halide already emits all shared
+    // memory as a single dynamic extern region (addrspace(3) base 0, sized at launch),
+    // so we just need to raise this function's max dynamic shared size to fit.
+    const int kStaticSharedCap = 48 * 1024;
+    if (shared_mem_bytes > kStaticSharedCap) {
+        if (cuFuncSetAttribute != nullptr) {
+            CUresult attr_err = cuFuncSetAttribute(
+                f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_mem_bytes);
+            if (attr_err != CUDA_SUCCESS) {
+                return error_cuda(user_context, attr_err,
+                                  "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) failed; "
+                                  "requested shared memory may exceed the device limit");
+            }
+            debug(user_context) << "Opted in to " << shared_mem_bytes
+                                << " bytes of dynamic shared memory\n";
+        } else {
+            error(user_context) << "CUDA: kernel requests " << shared_mem_bytes
+                                << " bytes of shared memory (>48KB) but the driver does not "
+                                   "provide cuFuncSetAttribute to opt in\n";
+            return halide_error_code_generic_error;
+        }
+    }
+
     size_t num_args = 0;
     while (arg_sizes[num_args] != 0) {
         debug(user_context) << "    halide_cuda_run " << (int)num_args

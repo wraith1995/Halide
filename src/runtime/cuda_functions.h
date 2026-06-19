@@ -52,6 +52,10 @@ CUDA_FN(CUresult, cuPointerGetAttribute, (void *result, int query, CUdeviceptr p
 
 CUDA_FN_OPTIONAL(CUresult, cuStreamSynchronize, (CUstream hStream));
 
+// Opt in to >48KB dynamic shared memory per block (Hopper allows up to ~228KB).
+// Optional: absent on very old drivers, guarded by a null check at the call site.
+CUDA_FN_OPTIONAL(CUresult, cuFuncSetAttribute, (CUfunction hfunc, CUfunction_attribute attrib, int value));
+
 #undef CUDA_FN
 #undef CUDA_FN_OPTIONAL
 #undef CUDA_FN_3020

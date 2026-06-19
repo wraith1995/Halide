@@ -40,6 +40,19 @@ typedef enum CUjit_option_enum {
     CU_JIT_FALLBACK_STRATEGY = 10
 } CUjit_option;
 
+typedef enum CUfunction_attribute_enum {
+    CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 0,
+    CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1,
+    CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES = 2,
+    CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3,
+    CU_FUNC_ATTRIBUTE_NUM_REGS = 4,
+    CU_FUNC_ATTRIBUTE_PTX_VERSION = 5,
+    CU_FUNC_ATTRIBUTE_BINARY_VERSION = 6,
+    CU_FUNC_ATTRIBUTE_CACHE_MODE_CA = 7,
+    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8,
+    CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9
+} CUfunction_attribute;
+
 typedef enum {
     CUDA_SUCCESS = 0,
     CUDA_ERROR_INVALID_VALUE = 1,
@@ -178,6 +191,7 @@ typedef enum {
     CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_LINEAR_PITCH = 72,        /**< Maximum 2D linear texture pitch in bytes */
     CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_MIPMAPPED_WIDTH = 73,     /**< Maximum mipmapped 2D texture width */
     CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_MIPMAPPED_HEIGHT = 74,    /**< Maximum mipmapped 2D texture height */
+    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97,     /**< Max per-block shared mem with explicit opt-in (>48KB) */
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75,              /**< Major compute capability version number */
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76,              /**< Minor compute capability version number */
     CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_MIPMAPPED_WIDTH = 77,     /**< Maximum mipmapped 1D texture width */
