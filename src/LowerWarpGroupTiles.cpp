@@ -493,8 +493,11 @@ class RewriteWarpGroupTiles : public IRMutator {
                 ri.accept(&sc);
                 out_stride_m = sc.dim(0);
                 out_stride_n = sc.dim(1);
-                out_base = simplify(substitute(thread_var, make_zero(Int(32)),
-                                               substitute(group_var, make_zero(Int(32)), ri)));
+                // KEEP group_var (only zero thread_var): FlattenBranchThreads remaps frag_row_m's
+                // thread to LOCAL per-branch coords (group-local rows 0..63), so out_base must
+                // supply the warp-group M-offset (64*wg). Zeroing group_var made both M3 groups
+                // write rows 0..63. Single warp group: wg extent 1 -> peels to 0 (NFC).
+                out_base = simplify(substitute(thread_var, make_zero(Int(32)), ri));
                 out_captured = true;
             }
             Expr slot = simplify(out_base + frag_row_m(lane, i) * out_stride_m +
@@ -625,8 +628,9 @@ class RewriteWarpGroupTiles : public IRMutator {
             ri.accept(&sc);
             out_stride_m = sc.dim(0);
             out_stride_n = sc.dim(1);
-            out_base = simplify(substitute(thread_var, make_zero(Int(32)),
-                                           substitute(group_var, make_zero(Int(32)), ri)));
+            // KEEP group_var (see the sibling capture above): out_base supplies the warp-group
+            // M-offset; the frag map uses LOCAL per-branch thread coords. NFC for one group.
+            out_base = simplify(substitute(thread_var, make_zero(Int(32)), ri));
             out_captured = true;
         }
 
