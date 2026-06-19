@@ -42,15 +42,22 @@ const VectorReduce *find_vector_reduce(const Expr &e) {
 
 // Count the tile-reduce frag stores in a gpu_warps group body (a Store whose value carries a
 // VectorReduce). The per-thread fragment is N/2 registers, so the wgmma N dimension = 2 * count.
-// DESCENDS into nested gpu_warps (so a register-carried mainloop's OUTER group -- whose own frag
-// stores are the non-reduce `C = prod` epilogue + the zero init -- picks up N from the nested
-// `prod += ...` accumulate group, the only reduce stores; the epilogue then caps at the right N/2).
+// Does NOT descend into a nested gpu_warps For (its own N). The register-carried mainloop's
+// `C = prod` epilogue is a SIBLING group (no reduce stores in its body) -- it reads N from the
+// accumulator it loads instead (accumulator_n), set when the accumulate group was rewritten.
 struct CountFragStores : public IRVisitor {
     using IRVisitor::visit;
     int count = 0;
     void visit(const Store *op) override {
         if (find_vector_reduce(op->value)) {
             count++;
+        }
+        IRVisitor::visit(op);
+    }
+    void visit(const For *op) override {
+        if (op->for_type == ForType::GPUThread &&
+            (op->warps_per_group >= 0 || op->realization == GPUVectorScope::WarpGroup)) {
+            return;  // nested group -> its own N
         }
         IRVisitor::visit(op);
     }
@@ -324,6 +331,11 @@ class RewriteWarpGroupTiles : public IRMutator {
     // that gets the non-affine frag map applied to the OUTPUT index. Populated as we rewrite
     // the accumulator's update (visited before the epilogue copy in the same block).
     std::set<std::string> wgmma_accumulators;
+    // The wgmma N dimension of each recorded accumulator. The C=prod epilogue is a SIBLING group
+    // (block level), not nested under the accumulate group, so its own pre-scan sees no reduce
+    // stores -> wgmma_n defaults to 16 there. The epilogue instead reads N from the accumulator it
+    // loads (recorded when the accumulate group was rewritten, which precedes the epilogue).
+    std::map<std::string, int> accumulator_n;
     // The accumulator's per-thread base index (frag 0's store index), captured per group so the
     // 8 scalar frag stores all read/write prod[base + i].
     Expr acc_base;
@@ -459,8 +471,16 @@ class RewriteWarpGroupTiles : public IRMutator {
         // at hardware (m,n). Only the index changes; the value (Load prod[frag f]) is kept.
         if (getenv("HL_WGMMA_KCARRY") && !wgmma_accumulators.empty() &&
             loads_one_of(op->value, wgmma_accumulators) && !find_vector_reduce(op->value)) {
+            // N from the loaded accumulator (the epilogue group's own pre-scan sees no reduce).
+            int n_epi = wgmma_n;
+            for (const std::string &acc : wgmma_accumulators) {
+                if (loads_one_of(op->value, {acc}) && accumulator_n.count(acc)) {
+                    n_epi = accumulator_n[acc];
+                    break;
+                }
+            }
             int i = frag_index++;
-            if (i >= wgmma_n / 2) {
+            if (i >= n_epi / 2) {
                 return IRMutator::visit(op);
             }
             Expr lane = Variable::make(Int(32), thread_var);
@@ -557,6 +577,7 @@ class RewriteWarpGroupTiles : public IRMutator {
         // and hoists the epilogue out of the loop. scaleD=1 (accumulate) lives in accum8.
         if (getenv("HL_WGMMA_KCARRY")) {
             wgmma_accumulators.insert(op->name);
+            accumulator_n[op->name] = wgmma_n;  // so the sibling epilogue caps at the right N/2
             // The accumulator's per-thread base = frag 0's store index (frags 0..7 land at
             // base+0..7). Emit one SCALAR store per frag prod[base+i] = accum_reg(i, ...), like
             // the M1 scalar+cache path: the wgmma is cached (one per ko body) and seeds D from
