@@ -989,10 +989,12 @@ llvm::Value *CodeGen_PTX_Dev::emit_wgmma(int n, llvm::Value *acc, llvm::Value *d
         tied += std::to_string(i) + ",";
         outs += "=f,";
     }
+    // descA/descB operand numbers: the R tied inputs consume operand slots R..2R-1, so the two
+    // descriptor inputs are $(2R) and $(2R+1) -- NOT $R/$R+1 (which alias the tied accumulators).
     const std::string scale = scale_d ? "1" : "0";
     const std::string asm_str =
         "wgmma.mma_async.sync.aligned.m64n" + std::to_string(n) + "k16.f32.f16.f16 {" +
-        regs + "}, $" + std::to_string(R) + ", $" + std::to_string(R + 1) + ", " +
+        regs + "}, $" + std::to_string(2 * R) + ", $" + std::to_string(2 * R + 1) + ", " +
         scale + ", 1, 1, 0, 0;";
     const std::string constraints = outs + tied + "l,l";  // R outputs, R tied inputs, descA, descB
 
