@@ -84,16 +84,17 @@ protected:
     void codegen_vector_reduce(const VectorReduce *op, const Expr &init) override;
     // @}
 
-    /** Emit one Hopper wgmma.mma_async (m64n16k16, fp16->f32) for the M0 WarpGroup tile
-     * reduce: accumulate the product of the shared tiles described by desc_a/desc_b into the
-     * 8 per-thread f32 accumulator registers (acc, read-modify-write). scale_d selects
-     * accumulate (true, k>0) vs overwrite (false, k==0). Emitted as inline PTX asm (no LLVM
-     * intrinsic exists); the caller wraps the k-loop in wgmma.fence / commit_group /
-     * wait_group. Returns the updated {8 x f32} accumulator. See research/gpu_recognizer_design.md
-     * §5a. NOTE: M0 scaffold; the fragment lane<->element map + descriptor bits are confirmed
-     * against the f64 oracle on H100. */
-    llvm::Value *emit_wgmma_m64n16k16(llvm::Value *acc, llvm::Value *desc_a,
-                                      llvm::Value *desc_b, bool scale_d);
+    /** Emit one Hopper wgmma.mma_async (m64n{N}k16, fp16->f32, N in {16,32,...,256}) for a
+     * WarpGroup tile reduce: accumulate the product of the shared tiles described by
+     * desc_a/desc_b into the N/2 per-thread f32 accumulator registers (acc, read-modify-write).
+     * scale_d selects accumulate (true, k>0) vs overwrite (false, k==0). Emitted as inline PTX
+     * asm (no LLVM intrinsic exists); the caller wraps the k-loop in wgmma.fence / commit_group /
+     * wait_group. Returns the updated {N/2 x f32} accumulator. N is the wgmma N dimension --
+     * large N (n64/n128/n256) is ~95% of peak vs ~38% for n16 (Luo et al. 2402.13499). The
+     * fragment lane<->element map (frag_row_m/frag_col_n) extends to N/2 regs by construction.
+     * See research/gpu_recognizer_design.md §5a/§5f. */
+    llvm::Value *emit_wgmma(int n, llvm::Value *acc, llvm::Value *desc_a,
+                            llvm::Value *desc_b, bool scale_d);
 
     // P1: set when a cp.async copy (vectorized global->shared) was emitted since the last
     // gpu_thread_barrier, so the barrier commits + waits for it (synchronous cp.async).
@@ -356,7 +357,7 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                 llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
                                                              off_b, /*lbo*/ 128, sbo);
                 // scaleD=1 ALWAYS: prod already holds the running sum across prior ko iterations.
-                acc = emit_wgmma_m64n16k16(acc, desc_a, desc_b, /*scale_d*/ true);
+                acc = emit_wgmma(16, acc, desc_a, desc_b, /*scale_d*/ true);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
@@ -432,7 +433,7 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                                                              off_a, /*lbo*/ 128, sbo);
                 llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
                                                              off_b, /*lbo*/ 128, sbo);
-                acc = emit_wgmma_m64n16k16(acc, desc_a, desc_b, /*scale_d*/ c > 0);
+                acc = emit_wgmma(16, acc, desc_a, desc_b, /*scale_d*/ c > 0);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
@@ -962,26 +963,32 @@ llvm::Value *CodeGen_PTX_Dev::build_wgmma_descriptor(const std::string &buffer, 
     return desc;
 }
 
-llvm::Value *CodeGen_PTX_Dev::emit_wgmma_m64n16k16(llvm::Value *acc, llvm::Value *desc_a,
-                                                   llvm::Value *desc_b, bool scale_d) {
-    // The per-thread accumulator fragment is {f32 x 8} (m64n16k16 f32 -> N/2 = 8 regs/thread).
+llvm::Value *CodeGen_PTX_Dev::emit_wgmma(int n, llvm::Value *acc, llvm::Value *desc_a,
+                                         llvm::Value *desc_b, bool scale_d) {
+    // The per-thread accumulator fragment is {f32 x R}, R = N/2 (m64nNk16 f32). The descriptors
+    // are operands $R and $R+1. Build the operand list dynamically so N scales (n16 R=8 ... n256
+    // R=128). wgmma.mma_async.sync.aligned.m64nNk16.f32.f16.f16 {d0..d_{R-1}}, descA, descB,
+    // scaleD, 1, 1, 0, 0; -- R read-modify-write f32 accumulators (outputs tied to inputs).
+    internal_assert(n >= 16 && n % 8 == 0 && n <= 256) << "wgmma N out of range: " << n << "\n";
+    const int R = n / 2;
     llvm::Type *f32 = llvm::Type::getFloatTy(*context);
     llvm::Type *i64 = llvm::Type::getInt64Ty(*context);
-    llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(8, f32));
+    llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(R, f32));
 
-    // wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 {d0..d7}, descA, descB, scaleD, 1, 1, 0, 0;
-    // 8 read-modify-write f32 accumulators (outputs $0..$7 tied to inputs), descA=$16, descB=$17.
+    std::string regs, tied, outs;
+    for (int i = 0; i < R; i++) {
+        regs += (i ? ",$" : "$") + std::to_string(i);
+        tied += std::to_string(i) + ",";
+        outs += "=f,";
+    }
     const std::string scale = scale_d ? "1" : "0";
     const std::string asm_str =
-        "wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 "
-        "{$0,$1,$2,$3,$4,$5,$6,$7}, $16, $17, " +
+        "wgmma.mma_async.sync.aligned.m64n" + std::to_string(n) + "k16.f32.f16.f16 {" +
+        regs + "}, $" + std::to_string(R) + ", $" + std::to_string(R + 1) + ", " +
         scale + ", 1, 1, 0, 0;";
-    const std::string constraints =
-        "=f,=f,=f,=f,=f,=f,=f,=f,"  // 8 outputs: the updated accumulators
-        "0,1,2,3,4,5,6,7,"          // tied inputs: the prior accumulators (read-modify-write)
-        "l,l";                      // descA, descB (64-bit shared matrix descriptors)
+    const std::string constraints = outs + tied + "l,l";  // R outputs, R tied inputs, descA, descB
 
-    std::vector<llvm::Type *> arg_tys(8, f32);
+    std::vector<llvm::Type *> arg_tys(R, f32);
     arg_tys.push_back(i64);
     arg_tys.push_back(i64);
     llvm::FunctionType *fn_ty = llvm::FunctionType::get(acc_ty, arg_tys, false);
@@ -989,8 +996,8 @@ llvm::Value *CodeGen_PTX_Dev::emit_wgmma_m64n16k16(llvm::Value *acc, llvm::Value
     llvm::InlineAsm *ia = llvm::InlineAsm::get(fn_ty, asm_str, constraints, /*hasSideEffects*/ true);
 
     std::vector<llvm::Value *> args;
-    args.reserve(10);
-    for (int i = 0; i < 8; i++) {
+    args.reserve(R + 2);
+    for (int i = 0; i < R; i++) {
         args.push_back(builder->CreateExtractValue(acc, i));
     }
     args.push_back(desc_a);
