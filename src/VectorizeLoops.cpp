@@ -390,6 +390,14 @@ protected:
     // var name and holding vectorized expression.
     Scope<Expr> vector_scope;
 
+    // The realization of the innermost enclosing GPU collective loop
+    // (gpu_warps -> WarpGroup, gpu_lanes -> Warp), threaded in from the
+    // outer VectorizeLoops mutator (the collective For sits ABOVE the
+    // vectorized reduce). Stamped onto VectorReduce nodes at creation so
+    // the collective scope is known during vectorization (was a separate
+    // post-pass, TagGPUVectorScope). See gpu_recognizer_design.md (F8).
+    GPUVectorScope gpu_scope = GPUVectorScope::Register;
+
     // A stack of all containing lets. We need to reinject the scalar
     // version of them if we scalarize inner code.
     vector<pair<string, Expr>> containing_lets;
@@ -1130,7 +1138,7 @@ protected:
             if (store_index.type().is_scalar()) {
                 // The index doesn't depend on the value being
                 // vectorized, so it's a total reduction.
-                b = VectorReduce::make(reduce_op, b, 1, GPUVectorScope::Register);
+                b = VectorReduce::make(reduce_op, b, 1, gpu_scope);
             } else {
 
                 // The output lanes is >1, so there must be at least one
@@ -1189,7 +1197,7 @@ protected:
 
                 if (inner_dup > 1) {
                     int new_lanes = b_shape_mr.total_lanes() / inner_dup;
-                    b = VectorReduce::make(reduce_op, b, new_lanes, GPUVectorScope::Register);
+                    b = VectorReduce::make(reduce_op, b, new_lanes, gpu_scope);
                     b_shape_mr.slice(0, make_zero(b_shape_mr.base.type()));
                 }
 
@@ -1441,7 +1449,8 @@ protected:
     }
 
 public:
-    VectorSubs(const VectorizedVar &vv) {
+    VectorSubs(const VectorizedVar &vv, GPUVectorScope s = GPUVectorScope::Register)
+        : gpu_scope(s) {
         vectorized_vars.push_back(vv);
         update_replacements();
     }
@@ -1625,7 +1634,17 @@ class VectorizeLoops : public IRMutator {
 protected:
     using IRMutator::visit;
 
+    // Realization of the innermost enclosing GPU collective loop (gpu_warps ->
+    // WarpGroup, gpu_lanes -> Warp). Threaded into VectorSubs so a vectorized
+    // reduce is born with its collective scope -- replaces the post-vectorize
+    // TagGPUVectorScope pass. See gpu_recognizer_design.md (F8).
+    GPUVectorScope scope = GPUVectorScope::Register;
+
     Stmt visit(const For *for_loop) override {
+        // Track the innermost collective scope as we descend (the gpu_warps/
+        // gpu_lanes For sits ABOVE the vectorized reduce it governs).
+        ScopedValue<GPUVectorScope> s(
+            scope, for_loop->realization != GPUVectorScope::Register ? for_loop->realization : scope);
         Stmt stmt;
         if (for_loop->for_type == ForType::Vectorized) {
             Expr loop_extent = simplify(for_loop->extent());
@@ -1638,7 +1657,7 @@ protected:
             }
 
             VectorizedVar vectorized_var = {for_loop->name, for_loop->min, (int)extent->value};
-            stmt = VectorSubs(vectorized_var)(for_loop->body);
+            stmt = VectorSubs(vectorized_var, scope)(for_loop->body);
         } else {
             stmt = IRMutator::visit(for_loop);
         }
