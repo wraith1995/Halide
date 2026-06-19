@@ -2418,7 +2418,10 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     // F3 full-edge consumer wait: spin on the slot's mbarrier until the producer's
                     // cp.async copies complete (parity = (ko/N)&1, since the slot is reused every N
                     // iters and each completion flips the phase). No producer drain -> deep overlap.
-                    Expr parity = (Variable::make(Int(32), ring_loop) / b.ring_n) % 2;
+                    // The try_wait.parity convention is ISA-ambiguous; HL_WG_MBAR_PFLIP toggles it
+                    // empirically (start phase 0 vs 1) without a rebuild.
+                    int pflip = get_env_variable("HL_WG_MBAR_PFLIP") == "1" ? 1 : 0;
+                    Expr parity = (Variable::make(Int(32), ring_loop) / b.ring_n + pflip) % 2;
                     Stmt wait = Evaluate::make(Call::make(Int(32), "mbarrier_try_wait",
                                                           {mbar_slot_ref(b), parity}, Call::Intrinsic));
                     return Block::make(wait, body);
