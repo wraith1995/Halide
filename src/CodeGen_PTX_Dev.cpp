@@ -545,9 +545,14 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         // handshake complete the phase?" (plain works) from "does cp.async.mbarrier.arrive's
         // deferred completion fire?" (only cp.async fails). Data is wrong with PLAIN (no copy
         // wait) -- it only answers hang-vs-not.
+        // .noinc is REQUIRED: the default cp.async.mbarrier.arrive INCREMENTS the pending count by 1
+        // immediately then decrements on cp.async completion (net zero) -> EXPECTED is never reached
+        // -> deadlock. .noinc skips the increment, so each thread's arrive nets -1 and the count
+        // (init = producer thread count) reaches 0 when all copies complete. (PLAIN mbarrier.arrive
+        // decrements directly -- that's why it worked; this is the deep-pipeline equivalent.)
         const char *asm_str = get_env_variable("HL_WG_MBAR_PLAIN") == "1"
                                   ? "{ .reg .b64 mbar_s; mbarrier.arrive.shared.b64 mbar_s, [$0]; }"
-                                  : "cp.async.mbarrier.arrive.shared.b64 [$0];";
+                                  : "cp.async.mbarrier.arrive.noinc.shared.b64 [$0];";
         llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, asm_str, "r", /*hasSideEffects*/ true);
         builder->CreateCall(ia, {addr});
         // This consumes the in-flight cp.async (their completion now arrives on the mbarrier),
