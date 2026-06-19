@@ -1377,6 +1377,26 @@ protected:
         return IRMutator::visit(op);
     }
 
+    Expr visit(const Call *op) override {
+        // F3: the mbarrier_init intrinsic WRITES the mbarrier shared state (via inline asm); its
+        // args are Load carriers (base_ref) that would otherwise register as shared READS. Register
+        // the mbar buffer(s) as shared STORES instead, so the produce->consume scan inserts a
+        // correctly-ordered all-threads barrier before the arrive/try_wait reads (CUTLASS's prologue
+        // __syncthreads, emitted by Halide's own mechanism). Don't recurse -> don't double-count the
+        // carriers as loads.
+        if (op->is_intrinsic() && op->name == "mbarrier_init") {
+            for (const Expr &a : op->args) {
+                if (const Load *l = a.as<Load>()) {
+                    if (memory_type_for_name(l->name) == MemoryType::GPUShared) {
+                        shared_stores.insert(l->name);
+                    }
+                }
+            }
+            return op;
+        }
+        return IRMutator::visit(op);
+    }
+
     Stmt visit(const Block *op) override {
         if (!in_threads && op->rest.defined()) {
             // First, we record which loads from shared/device memory occur
@@ -2405,18 +2425,14 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                 }
                 if (!init_args.empty()) {
                     // CUTLASS-style uniform prologue: ONE opaque tid==0-predicated init asm (no
-                    // internal barrier -- it doesn't expose tid to LLVM, so no if(tid==0) region is
-                    // formed) followed by a SEPARATE Block-scope full-CTA barrier. Both are
-                    // block-level siblings of the Fork, BEFORE the flat warp-group partition loop,
-                    // so they run on ALL threads (the uniform prologue). The barrier makes the armed
-                    // mbarriers visible before any producer arrive / consumer wait.
+                    // internal barrier, no tid exposed to LLVM). NO explicit barrier here -- the init
+                    // registers as a shared STORE (see InjectThreadBarriers::visit(Call)), so Halide
+                    // inserts a correctly-ordered all-threads barrier between this block-level init
+                    // and the arrive/try_wait reads. (My own explicit barrier got tail-duplicated by
+                    // the compiler across the warp-select diamond into a tid==0 block -> deadlock.)
                     Stmt init = Evaluate::make(Call::make(Int(32), "mbarrier_init", init_args,
                                                           Call::Intrinsic));
-                    Stmt barrier = Evaluate::make(Call::make(Int(32), Call::sync_requirement,
-                                                  {IntImm::make(Int(32), (int)SyncScope::Block),
-                                                   IntImm::make(Int(32), (int)CodeGen_GPU_Dev::MemoryFenceType::Shared)},
-                                                  Call::Intrinsic));
-                    result = Block::make(init, Block::make(barrier, result));
+                    result = Block::make(init, result);
                     for (const BarrierInfo &b : mbar_allocs) {
                         result = Allocate::make(b.mbar_name, UInt(64), MemoryType::GPUShared,
                                                 {Expr(b.ring_n)}, const_true(), result);
