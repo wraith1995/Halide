@@ -40,6 +40,27 @@ const VectorReduce *find_vector_reduce(const Expr &e) {
     return f.found;
 }
 
+// Count the tile-reduce frag stores directly in a gpu_warps group body (a Store whose value
+// carries a VectorReduce). The per-thread fragment is N/2 registers, so the wgmma N dimension =
+// 2 * count. Does NOT descend into a nested gpu_warps For (a different group's own N).
+struct CountFragStores : public IRVisitor {
+    using IRVisitor::visit;
+    int count = 0;
+    void visit(const Store *op) override {
+        if (find_vector_reduce(op->value)) {
+            count++;
+        }
+        IRVisitor::visit(op);
+    }
+    void visit(const For *op) override {
+        if (op->for_type == ForType::GPUThread &&
+            (op->warps_per_group >= 0 || op->realization == GPUVectorScope::WarpGroup)) {
+            return;  // nested group -> its own N
+        }
+        IRVisitor::visit(op);
+    }
+};
+
 // The two shared operands of a recognized tile reduce, parsed from the reduce
 // value reduce_add(widening_mul(LoadA, LoadB)).
 struct Operand {
@@ -282,6 +303,11 @@ class RewriteWarpGroupTiles : public IRMutator {
     std::string group_var, thread_var;
     int warps_per_group = -1;
     int frag_index = 0;
+    // The wgmma N dimension for the current group, auto-detected from the IR as 2 * (number of
+    // tile-reduce frag stores) -- the per-thread fragment is N/2 f32 registers. n16 (8 frags) is
+    // ~38% of peak; large N (n64/n128/n256) ~95%+ (Luo et al. 2402.13499). Read from the tile
+    // shape, NOT a gate. See §5f.
+    int wgmma_n = 16;
     std::map<std::string, Expr> lets;
 
     // The output-tile epilogue base + strides, captured once per group from the first
@@ -367,7 +393,7 @@ class RewriteWarpGroupTiles : public IRMutator {
 
     Stmt visit(const For *op) override {
         std::string saved_group = group_var, saved_thread = thread_var;
-        int saved_wpg = warps_per_group, saved_frag = frag_index;
+        int saved_wpg = warps_per_group, saved_frag = frag_index, saved_n = wgmma_n;
         bool is_group = false;
         if (op->for_type == ForType::GPUThread) {
             if (op->warps_per_group >= 0 || op->realization == GPUVectorScope::WarpGroup) {
@@ -376,6 +402,11 @@ class RewriteWarpGroupTiles : public IRMutator {
                 is_group = true;
                 frag_index = 0;       // reset the fragment register counter per group
                 out_captured = false;  // re-capture the epilogue base/strides per group
+                // Auto-detect the wgmma N from the tile shape: N/2 frag stores -> N (clamped to the
+                // valid m64nN range; emit_wgmma asserts N%8==0).
+                CountFragStores cfs;
+                op->body.accept(&cfs);
+                wgmma_n = std::max(16, std::min(256, cfs.count * 2));
             } else {
                 thread_var = op->name;
             }
@@ -384,6 +415,7 @@ class RewriteWarpGroupTiles : public IRMutator {
         group_var = saved_group;
         thread_var = saved_thread;
         warps_per_group = saved_wpg;
+        wgmma_n = saved_n;
         if (!is_group) {
             frag_index = saved_frag;
         }
@@ -433,7 +465,7 @@ class RewriteWarpGroupTiles : public IRMutator {
         if (getenv("HL_WGMMA_KCARRY") && !wgmma_accumulators.empty() &&
             loads_one_of(op->value, wgmma_accumulators) && !find_vector_reduce(op->value)) {
             int i = frag_index++;
-            if (i >= 8) {
+            if (i >= wgmma_n / 2) {
                 return IRMutator::visit(op);
             }
             Expr lane = Variable::make(Int(32), thread_var);
@@ -485,7 +517,7 @@ class RewriteWarpGroupTiles : public IRMutator {
                      << "    out store idx=" << simplify(resolve_lets(op->index)) << "\n";
         }
         int i = frag_index++;
-        if (i >= 8) {
+        if (i >= wgmma_n / 2) {
             // More reduce stores than the m64n16k16 fragment has registers --
             // not the M0 shape; leave it for the generic fallback.
             return IRMutator::visit(op);
@@ -541,7 +573,7 @@ class RewriteWarpGroupTiles : public IRMutator {
             Expr d_in = Load::make(op->value.type(), op->name, acc_base,
                                    Buffer<>(), op->param, const_true(), ModulusRemainder());
             Expr call = Call::make(op->value.type(), "wgmma_m64n16k16_f32_accum_reg",
-                                   {i, d_in, n_chunks, load_a, stride_a, load_b, stride_b},
+                                   {i, Expr(wgmma_n), d_in, n_chunks, load_a, stride_a, load_b, stride_b},
                                    Call::Intrinsic);
             if (getenv("HL_DEBUG_WGMMA")) {
                 debug(0) << "[wgtile] 1b accumulate frag #" << i << " -> accum_reg into "
@@ -582,7 +614,7 @@ class RewriteWarpGroupTiles : public IRMutator {
                 return Evaluate::make(0);  // the other 7 frags are folded into the frag-0 vector store
             }
             Expr frag_vec = Call::make(op->value.type().with_lanes(8), "wgmma_m64n16k16_f32_frag8",
-                                       {n_chunks, load_a, stride_a, load_b, stride_b}, Call::Intrinsic);
+                                       {Expr(wgmma_n), n_chunks, load_a, stride_a, load_b, stride_b}, Call::Intrinsic);
             std::vector<Expr> idx_lanes;
             for (int f = 0; f < 8; f++) {
                 idx_lanes.push_back(frag_slot(f));
@@ -604,7 +636,7 @@ class RewriteWarpGroupTiles : public IRMutator {
 
         // Default (scalar) path: register i of the fragment, one scalar store per unrolled frag.
         Expr frag = Call::make(op->value.type(), "wgmma_m64n16k16_f32",
-                               {i, n_chunks, load_a, stride_a, load_b, stride_b},
+                               {i, Expr(wgmma_n), n_chunks, load_a, stride_a, load_b, stride_b},
                                Call::Intrinsic);
         // Mainloop 1a (HL_WGMMA_KACCUM): keep `+C` so D accumulates across ko (see vecfrag above).
         Expr stored = frag;

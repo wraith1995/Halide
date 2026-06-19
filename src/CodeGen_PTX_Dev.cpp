@@ -319,24 +319,28 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         //   - D_in_load is a SCALAR Load marking prod + its per-thread base index; codegen seeds
         //     the accumulator from prod[base+0..7] (the running sum carried across ko by
         //     compute_at), so every chunk uses scaleD=1 (accumulate).
-        //   - The wgmma is emitted ONCE per ko body (cached); the 8 scalar stores extract reg i.
-        internal_assert(op->args.size() == 7u) << "wgmma accum_reg arg count mismatch\n";
+        //   - The wgmma is emitted ONCE per ko body (cached); the R=N/2 scalar stores extract reg i.
+        // Args: (reg, N, D_in_load, n_chunks, LoadA, strideA, LoadB, strideB) -> f32.
+        internal_assert(op->args.size() == 8u) << "wgmma accum_reg arg count mismatch\n";
         auto reg = as_const_int(op->args[0]);
-        const Load *dl = op->args[1].as<Load>();
-        auto n_chunks = as_const_int(op->args[2]);
-        const Load *la = op->args[3].as<Load>();
-        auto stride_a = as_const_int(op->args[4]);
-        const Load *lb = op->args[5].as<Load>();
-        auto stride_b = as_const_int(op->args[6]);
-        internal_assert(reg && dl && n_chunks && la && stride_a && lb && stride_b)
+        auto n_dim = as_const_int(op->args[1]);
+        const Load *dl = op->args[2].as<Load>();
+        auto n_chunks = as_const_int(op->args[3]);
+        const Load *la = op->args[4].as<Load>();
+        auto stride_a = as_const_int(op->args[5]);
+        const Load *lb = op->args[6].as<Load>();
+        auto stride_b = as_const_int(op->args[7]);
+        internal_assert(reg && n_dim && dl && n_chunks && la && stride_a && lb && stride_b)
             << "wgmma accum_reg args malformed\n";
+        const int N = (int)*n_dim;
+        const int R = N / 2;
 
         if (cached_wgmma_acc == nullptr) {
-            // Seed the {f32 x 8} accumulator from prod[base+0..7] (8 scalar loads).
+            // Seed the {f32 x R} accumulator from prod[base+0..R-1] (R scalar loads).
             llvm::Type *f32 = llvm::Type::getFloatTy(*context);
-            llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(8, f32));
+            llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(R, f32));
             llvm::Value *acc = llvm::UndefValue::get(acc_ty);
-            for (int j = 0; j < 8; j++) {
+            for (int j = 0; j < R; j++) {
                 Expr slot = simplify(dl->index + j);
                 Expr load_j = Load::make(dl->type, dl->name, slot, Buffer<>(), dl->param,
                                          const_true(), ModulusRemainder());
@@ -357,7 +361,7 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                 llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
                                                              off_b, /*lbo*/ 128, sbo);
                 // scaleD=1 ALWAYS: prod already holds the running sum across prior ko iterations.
-                acc = emit_wgmma(16, acc, desc_a, desc_b, /*scale_d*/ true);
+                acc = emit_wgmma(N, acc, desc_a, desc_b, /*scale_d*/ true);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
@@ -378,32 +382,37 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         //                                         (vector-native path; PROTOTYPE for 1.x).
         // K = n_chunks*16; each chunk is one wgmma.mma_async accumulating into the same D
         // (scaleD carry). The collective is emitted ONCE per kernel. See §5b/§5c.
+        // Args now carry the wgmma N dimension: scalar (reg, N, n_chunks, LoadA,sA, LoadB,sB),
+        // vector frag8 (N, n_chunks, LoadA,sA, LoadB,sB). R = N/2 per-thread f32 registers.
         bool vec = (op->name == "wgmma_m64n16k16_f32_frag8");
         int b = vec ? 0 : 1;  // arg base: scalar form has reg at [0]
-        internal_assert(op->args.size() == (vec ? 5u : 6u))
+        internal_assert(op->args.size() == (vec ? 6u : 7u))
             << "wgmma_m64n16k16_f32 arg count mismatch\n";
         auto reg = vec ? std::optional<int64_t>(0) : as_const_int(op->args[0]);
-        auto n_chunks = as_const_int(op->args[b + 0]);
-        const Load *la = op->args[b + 1].as<Load>();
-        auto stride_a = as_const_int(op->args[b + 2]);
-        const Load *lb = op->args[b + 3].as<Load>();
-        auto stride_b = as_const_int(op->args[b + 4]);
-        internal_assert(reg && n_chunks && la && stride_a && lb && stride_b)
+        auto n_dim = as_const_int(op->args[b + 0]);
+        auto n_chunks = as_const_int(op->args[b + 1]);
+        const Load *la = op->args[b + 2].as<Load>();
+        auto stride_a = as_const_int(op->args[b + 3]);
+        const Load *lb = op->args[b + 4].as<Load>();
+        auto stride_b = as_const_int(op->args[b + 5]);
+        internal_assert(reg && n_dim && n_chunks && la && stride_a && lb && stride_b)
             << "wgmma_m64n16k16_f32 args malformed\n";
+        const int N = (int)*n_dim;
+        const int R = N / 2;  // per-thread accumulator registers
         if (getenv("HL_DEBUG_WGMMA")) {
             debug(0) << "[wgtile] codegen wgmma " << (vec ? "frag8(vec)" : "reg")
-                     << " n_chunks=" << *n_chunks << " strideA=" << *stride_a
+                     << " N=" << N << " n_chunks=" << *n_chunks << " strideA=" << *stride_a
                      << " strideB=" << *stride_b << "\n";
         }
 
         if (cached_wgmma_acc == nullptr) {
-            // Zeroed {f32 x 8} D fragment. Chunk 0 overwrites (scaleD=0); the zero init
+            // Zeroed {f32 x R} D fragment. Chunk 0 overwrites (scaleD=0); the zero init
             // is belt-and-suspenders. First-guess core-matrix offsets for a 64x16 (A) /
-            // 16x16 (B) f16 K-major tile (Colfax/CUTLASS no-swizzle): LBO 128 B, SBO 256 B.
+            // 16xN (B) f16 K-major tile (Colfax/CUTLASS no-swizzle): LBO 128 B, SBO 256 B.
             llvm::Type *f32 = llvm::Type::getFloatTy(*context);
-            llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(8, f32));
+            llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(R, f32));
             llvm::Value *acc = llvm::UndefValue::get(acc_ty);
-            for (int j = 0; j < 8; j++) {
+            for (int j = 0; j < R; j++) {
                 acc = builder->CreateInsertValue(acc, llvm::ConstantFP::get(f32, 0.0), j);
             }
 
@@ -433,19 +442,18 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                                                              off_a, /*lbo*/ 128, sbo);
                 llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
                                                              off_b, /*lbo*/ 128, sbo);
-                acc = emit_wgmma(16, acc, desc_a, desc_b, /*scale_d*/ c > 0);
+                acc = emit_wgmma(N, acc, desc_a, desc_b, /*scale_d*/ c > 0);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
             cached_wgmma_acc = acc;
         }
         if (vec) {
-            // Vector-native: return the whole fragment as a <8 x f32>. The recognizer stores
-            // it with an 8-lane non-affine scatter index (one vector op, no unroll/reconstruct);
-            // codegen scalarizes the scatter to 8 st.global at the hardware fragment positions.
+            // Vector-native: return the whole fragment as a <R x f32> (R=N/2). The recognizer
+            // stores it with an R-lane non-affine scatter index (one vector op, no unroll).
             llvm::Type *f32 = llvm::Type::getFloatTy(*context);
-            llvm::Value *v = llvm::UndefValue::get(llvm::FixedVectorType::get(f32, 8));
-            for (int j = 0; j < 8; j++) {
+            llvm::Value *v = llvm::UndefValue::get(llvm::FixedVectorType::get(f32, R));
+            for (int j = 0; j < R; j++) {
                 v = builder->CreateInsertElement(v, builder->CreateExtractValue(cached_wgmma_acc, j),
                                                  (uint64_t)j);
             }
