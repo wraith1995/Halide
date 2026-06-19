@@ -525,8 +525,15 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         internal_assert(op->args.size() == 1u) << "cp_async_mbarrier_arrive expects (mbar_ref).\n";
         llvm::Value *addr = mbar_shared_addr(op->args[0]);
         llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t}, false);
-        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, "cp.async.mbarrier.arrive.shared.b64 [$0];",
-                                                   "r", /*hasSideEffects*/ true);
+        // Diagnostic: HL_WG_MBAR_PLAIN swaps the deferred cp.async-completion arrive for a PLAIN
+        // mbarrier.arrive (fires immediately, ignores cp.async). Isolates "does the count/parity
+        // handshake complete the phase?" (plain works) from "does cp.async.mbarrier.arrive's
+        // deferred completion fire?" (only cp.async fails). Data is wrong with PLAIN (no copy
+        // wait) -- it only answers hang-vs-not.
+        const char *asm_str = get_env_variable("HL_WG_MBAR_PLAIN") == "1"
+                                  ? "{ .reg .b64 mbar_s; mbarrier.arrive.shared.b64 mbar_s, [$0]; }"
+                                  : "cp.async.mbarrier.arrive.shared.b64 [$0];";
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, asm_str, "r", /*hasSideEffects*/ true);
         builder->CreateCall(ia, {addr});
         // This consumes the in-flight cp.async (their completion now arrives on the mbarrier),
         // so the downstream named/CTA barrier must NOT also commit+wait them (would be redundant

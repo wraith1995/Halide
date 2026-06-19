@@ -2361,10 +2361,27 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             // ExtractSharedAndHeapAllocations folds). The array is live across the whole mainloop
             // (referenced every ko), so it never coalesces with the As/Bs operand slots.
             if (mbar) {
+                bool mdbg = get_env_variable("HL_WG_MBAR_DEBUG") == "1";
+                if (mdbg) {
+                    std::cerr << "[mbar] num_producers=" << num_producers
+                              << " consumer_threads=" << simplify(consumer_threads) << "\n";
+                }
                 for (const auto &kv : sema_map) {
                     const BarrierInfo &b = kv.second;
                     if (b.mbar_name.empty()) {
                         continue;  // full (data) edges only
+                    }
+                    if (mdbg) {
+                        ThreadExtents te;
+                        branches[b.producer].accept(&te);
+                        Expr unr = 1;
+                        for (int d = 0; d <= te.max_dim; d++) {
+                            if (te.extent[d].defined()) unr = unr * te.extent[d];
+                        }
+                        std::cerr << "[mbar] " << b.mbar_name << " producer=" << b.producer
+                                  << " ring_n=" << b.ring_n
+                                  << " EXPECTED(rounded)=" << simplify(producer_threads[b.producer])
+                                  << " extent(unrounded)=" << simplify(unr) << "\n";
                     }
                     Expr base_ref = Load::make(UInt(64), b.mbar_name, 0, Buffer<>{}, Parameter{},
                                                const_true(), ModulusRemainder{});
