@@ -104,6 +104,12 @@ protected:
     // emitted per kernel (the recognizer's per-element calls all extract from it).
     // Reset per add_kernel. See research/gpu_recognizer_design.md S5b.
     llvm::Value *cached_wgmma_acc = nullptr;
+    // The basic block `cached_wgmma_acc` was emitted into. The cache is only valid within
+    // that block: the recognizer always co-locates the wgmma emit and its fragment extracts
+    // in one straight-line block, so when codegen has moved to a DIFFERENT block (e.g. a
+    // second consumer warp group's partition branch in M3) the cached Value would not
+    // dominate the new uses -- invalidate so that scope re-emits its own wgmma. Reset per kernel.
+    llvm::BasicBlock *cached_wgmma_block = nullptr;
 
     /** Build a 64-bit Hopper wgmma shared matrix descriptor for the operand tile
      * at `tile_origin` (element index) within shared allocation `buffer`. The
@@ -177,6 +183,7 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
     debug(2) << "In CodeGen_PTX_Dev::add_kernel\n";
 
     cached_wgmma_acc = nullptr;
+    cached_wgmma_block = nullptr;
 
     // Now deduce the types of the arguments to our function
     vector<llvm::Type *> arg_types(args.size());
@@ -335,6 +342,10 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         const int N = (int)*n_dim;
         const int R = N / 2;
 
+        // Drop a cache that was built in a different basic block (it would not dominate here).
+        if (cached_wgmma_acc && cached_wgmma_block != builder->GetInsertBlock()) {
+            cached_wgmma_acc = nullptr;
+        }
         if (cached_wgmma_acc == nullptr) {
             // Seed the {f32 x R} accumulator from prod[base+0..R-1] (R scalar loads).
             llvm::Type *f32 = llvm::Type::getFloatTy(*context);
@@ -366,6 +377,7 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
             cached_wgmma_acc = acc;
+            cached_wgmma_block = builder->GetInsertBlock();
         }
         value = builder->CreateExtractValue(cached_wgmma_acc, (unsigned)*reg);
         return;
@@ -405,6 +417,10 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                      << " strideB=" << *stride_b << "\n";
         }
 
+        // Drop a cache that was built in a different basic block (it would not dominate here).
+        if (cached_wgmma_acc && cached_wgmma_block != builder->GetInsertBlock()) {
+            cached_wgmma_acc = nullptr;
+        }
         if (cached_wgmma_acc == nullptr) {
             // Zeroed {f32 x R} D fragment. Chunk 0 overwrites (scaleD=0); the zero init
             // is belt-and-suspenders. First-guess core-matrix offsets for a 64x16 (A) /
@@ -447,6 +463,7 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
             cached_wgmma_acc = acc;
+            cached_wgmma_block = builder->GetInsertBlock();
         }
         if (vec) {
             // Vector-native: return the whole fragment as a <R x f32> (R=N/2). The recognizer

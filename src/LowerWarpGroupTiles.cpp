@@ -385,9 +385,12 @@ class RewriteWarpGroupTiles : public IRMutator {
         if (!thread_var.empty()) {
             thread_vars.insert(thread_var);
         }
-        if (!group_var.empty()) {
-            thread_vars.insert(group_var);
-        }
+        // NOTE: group_var (the warp-group axis) is KEPT, not zeroed. For a single consumer
+        // warp group its extent is 1 so it peels to 0 (NFC). For M3's TWO consumer groups it
+        // carries the M-half (64*wg-row) offset the operand descriptor must follow -- zeroing
+        // it made both groups read the same As slice (row 0). Peeling later specializes wg=0/1,
+        // so each group's descriptor points at its own 64-row tile. (thread_var = per-lane
+        // variation WITHIN a group is still zeroed; lane 0 = the tile origin.)
         Expr z = simplify(ZeroVars(&thread_vars).run(simplify(base)));
         if (z.type().lanes() > 1) {
             z = extract_lane(z, lane);
