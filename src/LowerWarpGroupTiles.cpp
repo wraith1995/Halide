@@ -550,6 +550,19 @@ class RewriteWarpGroupTiles : public IRMutator {
         // The original `+ Load(C)` is dropped -- the fragment IS the accumulator.
         Expr base_a = tile_origin_at_lane(a.base_index, 0);
         Expr base_b = tile_origin_at_lane(b.base_index, 0);
+        // For an AUTO-LAYOUT (natural) operand the producer store was re-encoded to core-matrix,
+        // so the descriptor base -- which addresses that physical store -- must be re-encoded too.
+        // Single warp group: the origin is 0 (reencode-invariant => NFC). M3's 2 groups: the kept
+        // group_var contributes a 64*wg M-SUPERTILE offset in NATURAL units that must map to its
+        // physical core-matrix slot (row 64 -> element 1024 via (role/8)*128). reencode's slot split
+        // also preserves the ring (ko%n)*slot term (dense slot == core-matrix slot). The hand-matched
+        // path already gathers core-matrix, so its operands are not in natural_operands (left as-is).
+        if (auto it = natural_operands.find(a.buffer); it != natural_operands.end()) {
+            base_a = core_matrix_reencode(base_a, it->second.first, it->second.second);
+        }
+        if (auto it = natural_operands.find(b.buffer); it != natural_operands.end()) {
+            base_b = core_matrix_reencode(base_b, it->second.first, it->second.second);
+        }
         // Per-chunk descriptor stride (advancing one K_TILE=16 step). For an AUTO-LAYOUT
         // operand the producer was re-encoded to core-matrix, so the chunk stride is the
         // core-matrix k-advance = K_TILE/8 = 2 ko, each ko = 64 elems = 128 elems -- NOT the
