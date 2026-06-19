@@ -2366,6 +2366,12 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     std::cerr << "[mbar] num_producers=" << num_producers
                               << " consumer_threads=" << simplify(consumer_threads) << "\n";
                 }
+                // ONE combined init for ALL producers' mbarriers (flattened triples
+                // base_ref,ring_n,count) -> a single opaque init+bar.sync asm in codegen. A single,
+                // outermost init lands in the uniform entry region; a second (nested) init asm got
+                // placed inside a tid==0 block by the scheduler, deadlocking its internal barrier.
+                std::vector<Expr> init_args;
+                std::vector<BarrierInfo> mbar_allocs;
                 for (const auto &kv : sema_map) {
                     const BarrierInfo &b = kv.second;
                     if (b.mbar_name.empty()) {
@@ -2392,20 +2398,20 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     Expr count = producer_threads[b.producer];
                     std::string cov = get_env_variable("HL_WG_MBAR_COUNT");
                     if (!cov.empty()) count = Expr(std::atoi(cov.c_str()));
-                    Stmt init = Evaluate::make(Call::make(Int(32), "mbarrier_init",
-                                                          {base_ref, Expr(b.ring_n), count},
+                    init_args.push_back(base_ref);
+                    init_args.push_back(Expr(b.ring_n));
+                    init_args.push_back(count);
+                    mbar_allocs.push_back(b);
+                }
+                if (!init_args.empty()) {
+                    // One init+bar.sync asm arms every slot of every producer; runs on all threads.
+                    Stmt init = Evaluate::make(Call::make(Int(32), "mbarrier_init", init_args,
                                                           Call::Intrinsic));
-                    // A SEPARATE Block-scope barrier (convergent gpu_thread_barrier) makes the armed
-                    // mbarriers visible to all threads before the fork. Emitting it inside the init
-                    // codegen let the compiler conditionalize it on tid==0 (-> deadlock); a
-                    // standalone sync_requirement stays uniform. Shared fence: init writes shared.
-                    Stmt barrier = Evaluate::make(Call::make(Int(32), Call::sync_requirement,
-                                                  {IntImm::make(Int(32), (int)SyncScope::Block),
-                                                   IntImm::make(Int(32), (int)CodeGen_GPU_Dev::MemoryFenceType::Shared)},
-                                                  Call::Intrinsic));
-                    result = Block::make(Block::make(init, barrier), result);
-                    result = Allocate::make(b.mbar_name, UInt(64), MemoryType::GPUShared,
-                                            {Expr(b.ring_n)}, const_true(), result);
+                    result = Block::make(init, result);
+                    for (const BarrierInfo &b : mbar_allocs) {
+                        result = Allocate::make(b.mbar_name, UInt(64), MemoryType::GPUShared,
+                                                {Expr(b.ring_n)}, const_true(), result);
+                    }
                 }
             }
             for (auto it = lifted.rbegin(); it != lifted.rend(); ++it) {

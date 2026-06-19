@@ -475,37 +475,56 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         // armed barriers are visible before any producer arrive / consumer wait. This marker
         // is placed at block level (outside the thread loops) so it runs on all threads; the
         // tid==0 guard + barrier here make it once-per-block. Args: (mbar_base_ref, N, count).
-        internal_assert(op->args.size() == 3u) << "mbarrier_init expects (mbar_base_ref, N, count).\n";
-        const Load *base = op->args[0].as<Load>();
-        auto n = as_const_int(op->args[1]);
-        internal_assert(base && n) << "mbarrier_init args malformed.\n";
-        llvm::Value *count = codegen(op->args[2]);
-
-        // tid = tid.x | tid.y | tid.z. Arm each slot with a BRANCHLESS predicated init
-        // (`@p mbarrier.init`): all threads execute straight-line code, only tid==0's init takes
-        // effect. Branching on tid==0 (a CondBr diamond) lets the compiler sink the trailing CTA
-        // barrier onto the tid==0 path only -> the other lanes skip it -> deadlock. Predication
-        // keeps control flow uniform so the barrier after is reached by every thread.
-        auto sreg = [&](llvm::Intrinsic::ID id) {
-            return builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(module.get(), id));
-        };
-        llvm::Value *tid = builder->CreateOr(
-            builder->CreateOr(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_x),
-                              sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_y)),
-            sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_z));
-        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t, i32_t, i32_t}, false);
-        llvm::InlineAsm *ia = llvm::InlineAsm::get(
-            ft,
-            "{ .reg .pred mbar_e;\n"
-            "  setp.eq.u32 mbar_e, $1, 0;\n"
-            "  @mbar_e mbarrier.init.shared.b64 [$0], $2; }",
-            "r,r,r", /*hasSideEffects*/ true);
-        for (int i = 0; i < (int)*n; i++) {
-            Expr slot = simplify(base->index + i);  // u64 elements; each mbarrier is 8 B
-            llvm::Value *ptr = codegen_buffer_pointer(base->name, base->type.element_of(), slot);
-            llvm::Value *addr = builder->CreatePtrToInt(ptr, i32_t);
-            builder->CreateCall(ia, {addr, tid, count});
+        // Arm EVERY slot of EVERY producer AND barrier in ONE self-contained opaque inline asm:
+        // it reads %tid itself, predicates each `@p mbarrier.init`, then an UNCONDITIONAL
+        // `bar.sync 0`. Init+barrier as a single side-effecting asm is the only robust form -- the
+        // compiler can neither split it nor conditionalize the barrier. Every prior form (CondBr
+        // diamond; predicated init + separate barrier; even per-producer opaque asms) let the
+        // compiler/scheduler place a barrier into an `if(tid==0)` region so other lanes skipped it
+        // -> deadlock. A SINGLE combined init lands in the uniform entry region. Args: flattened
+        // triples (base_ref Load, ring_n, count) per producer.
+        internal_assert(op->args.size() % 3u == 0u && !op->args.empty())
+            << "mbarrier_init expects flattened (base_ref, N, count) triples.\n";
+        std::vector<llvm::Value *> addrs;  // per slot
+        std::vector<llvm::Value *> counts;
+        for (size_t t = 0; t < op->args.size(); t += 3) {
+            const Load *base = op->args[t].as<Load>();
+            auto n = as_const_int(op->args[t + 1]);
+            internal_assert(base && n) << "mbarrier_init triple malformed.\n";
+            llvm::Value *cnt = codegen(op->args[t + 2]);
+            for (int i = 0; i < (int)*n; i++) {
+                Expr slot = simplify(base->index + i);  // u64 elements; each mbarrier is 8 B
+                llvm::Value *ptr = codegen_buffer_pointer(base->name, base->type.element_of(), slot);
+                addrs.push_back(builder->CreatePtrToInt(ptr, i32_t));
+                counts.push_back(cnt);
+            }
         }
+        const int nslots = (int)addrs.size();
+        std::string asm_str =
+            "{ .reg .pred mbar_e; .reg .u32 mbar_t0, mbar_t1;\n"
+            "  mov.u32 mbar_t0, %tid.x;\n"
+            "  mov.u32 mbar_t1, %tid.y;\n"
+            "  or.b32 mbar_t0, mbar_t0, mbar_t1;\n"
+            "  mov.u32 mbar_t1, %tid.z;\n"
+            "  or.b32 mbar_t0, mbar_t0, mbar_t1;\n"
+            "  setp.eq.u32 mbar_e, mbar_t0, 0;\n";
+        std::vector<llvm::Value *> args;
+        std::string constraints;
+        for (int s = 0; s < nslots; s++) {
+            asm_str += "  @mbar_e mbarrier.init.shared.b64 [$" + std::to_string(2 * s) + "], $" +
+                       std::to_string(2 * s + 1) + ";\n";
+            args.push_back(addrs[s]);
+            args.push_back(counts[s]);
+            constraints += (s ? ",r,r" : "r,r");
+        }
+        // NOTE: NO bar.sync inside this asm. Halide guards block-level code (this init) to thread 0,
+        // so a barrier here would be thread-0-only -> deadlock. Visibility relies on the kernel's
+        // existing all-threads CTA barrier between this block-level init and the first mbarrier use.
+        asm_str += " }";
+        std::vector<llvm::Type *> argtys(2 * nslots, i32_t);
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, argtys, false);
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, asm_str, constraints, /*hasSideEffects*/ true);
+        builder->CreateCall(ia, args);
         // NOTE: the CTA barrier that makes the armed mbarriers visible to all threads is emitted
         // SEPARATELY by the lowering (a Block sync_requirement after this init), NOT here. Emitting
         // it inside this handler let the compiler hoist an `if(tid==0)` around the predicated inits
