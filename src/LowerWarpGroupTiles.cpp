@@ -40,22 +40,17 @@ const VectorReduce *find_vector_reduce(const Expr &e) {
     return f.found;
 }
 
-// Count the tile-reduce frag stores directly in a gpu_warps group body (a Store whose value
-// carries a VectorReduce). The per-thread fragment is N/2 registers, so the wgmma N dimension =
-// 2 * count. Does NOT descend into a nested gpu_warps For (a different group's own N).
+// Count the tile-reduce frag stores in a gpu_warps group body (a Store whose value carries a
+// VectorReduce). The per-thread fragment is N/2 registers, so the wgmma N dimension = 2 * count.
+// DESCENDS into nested gpu_warps (so a register-carried mainloop's OUTER group -- whose own frag
+// stores are the non-reduce `C = prod` epilogue + the zero init -- picks up N from the nested
+// `prod += ...` accumulate group, the only reduce stores; the epilogue then caps at the right N/2).
 struct CountFragStores : public IRVisitor {
     using IRVisitor::visit;
     int count = 0;
     void visit(const Store *op) override {
         if (find_vector_reduce(op->value)) {
             count++;
-        }
-        IRVisitor::visit(op);
-    }
-    void visit(const For *op) override {
-        if (op->for_type == ForType::GPUThread &&
-            (op->warps_per_group >= 0 || op->realization == GPUVectorScope::WarpGroup)) {
-            return;  // nested group -> its own N
         }
         IRVisitor::visit(op);
     }
