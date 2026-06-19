@@ -481,7 +481,11 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         internal_assert(base && n) << "mbarrier_init args malformed.\n";
         llvm::Value *count = codegen(op->args[2]);
 
-        // tid = tid.x | tid.y | tid.z; guard tid == 0.
+        // tid = tid.x | tid.y | tid.z. Arm each slot with a BRANCHLESS predicated init
+        // (`@p mbarrier.init`): all threads execute straight-line code, only tid==0's init takes
+        // effect. Branching on tid==0 (a CondBr diamond) lets the compiler sink the trailing CTA
+        // barrier onto the tid==0 path only -> the other lanes skip it -> deadlock. Predication
+        // keeps control flow uniform so the barrier after is reached by every thread.
         auto sreg = [&](llvm::Intrinsic::ID id) {
             return builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(module.get(), id));
         };
@@ -489,32 +493,24 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             builder->CreateOr(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_x),
                               sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_y)),
             sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_z));
-        llvm::Value *is_thread0 = builder->CreateICmpEQ(tid, ConstantInt::get(i32_t, 0));
-        llvm::Function *fn = builder->GetInsertBlock()->getParent();
-        llvm::BasicBlock *init_bb = llvm::BasicBlock::Create(*context, "mbar_init", fn);
-        llvm::BasicBlock *done_bb = llvm::BasicBlock::Create(*context, "mbar_init_done", fn);
-        builder->CreateCondBr(is_thread0, init_bb, done_bb);
-        builder->SetInsertPoint(init_bb);
-        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t, i32_t}, false);
-        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, "mbarrier.init.shared.b64 [$0], $1;",
-                                                   "r,r", /*hasSideEffects*/ true);
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t, i32_t, i32_t}, false);
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(
+            ft,
+            "{ .reg .pred mbar_e;\n"
+            "  setp.eq.u32 mbar_e, $1, 0;\n"
+            "  @mbar_e mbarrier.init.shared.b64 [$0], $2; }",
+            "r,r,r", /*hasSideEffects*/ true);
         for (int i = 0; i < (int)*n; i++) {
             Expr slot = simplify(base->index + i);  // u64 elements; each mbarrier is 8 B
             llvm::Value *ptr = codegen_buffer_pointer(base->name, base->type.element_of(), slot);
             llvm::Value *addr = builder->CreatePtrToInt(ptr, i32_t);
-            builder->CreateCall(ia, {addr, count});
+            builder->CreateCall(ia, {addr, tid, count});
         }
-        builder->CreateBr(done_bb);
-        builder->SetInsertPoint(done_bb);
-        // CTA barrier so every thread sees the armed mbarriers before using them.
-        if (llvm::Function *b = module->getFunction("llvm.nvvm.barrier.cta.sync.aligned.all")) {
-            builder->CreateCall(b, builder->getInt32(0));
-        } else if (llvm::Function *b0 = module->getFunction("llvm.nvvm.barrier0")) {
-            builder->CreateCall(b0);
-        } else {
-            builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
-                module.get(), llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_all), builder->getInt32(0));
-        }
+        // NOTE: the CTA barrier that makes the armed mbarriers visible to all threads is emitted
+        // SEPARATELY by the lowering (a Block sync_requirement after this init), NOT here. Emitting
+        // it inside this handler let the compiler hoist an `if(tid==0)` around the predicated inits
+        // and pull the barrier into it, so the other lanes skipped it -> deadlock. A standalone
+        // convergent gpu_thread_barrier statement stays uniform.
         value = ConstantInt::get(i32_t, 0);
         return;
     }

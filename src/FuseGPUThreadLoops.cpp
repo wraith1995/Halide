@@ -2395,7 +2395,15 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     Stmt init = Evaluate::make(Call::make(Int(32), "mbarrier_init",
                                                           {base_ref, Expr(b.ring_n), count},
                                                           Call::Intrinsic));
-                    result = Block::make(init, result);
+                    // A SEPARATE Block-scope barrier (convergent gpu_thread_barrier) makes the armed
+                    // mbarriers visible to all threads before the fork. Emitting it inside the init
+                    // codegen let the compiler conditionalize it on tid==0 (-> deadlock); a
+                    // standalone sync_requirement stays uniform. Shared fence: init writes shared.
+                    Stmt barrier = Evaluate::make(Call::make(Int(32), Call::sync_requirement,
+                                                  {IntImm::make(Int(32), (int)SyncScope::Block),
+                                                   IntImm::make(Int(32), (int)CodeGen_GPU_Dev::MemoryFenceType::Shared)},
+                                                  Call::Intrinsic));
+                    result = Block::make(Block::make(init, barrier), result);
                     result = Allocate::make(b.mbar_name, UInt(64), MemoryType::GPUShared,
                                             {Expr(b.ring_n)}, const_true(), result);
                 }
