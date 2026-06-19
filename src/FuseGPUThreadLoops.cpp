@@ -2385,9 +2385,15 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     }
                     Expr base_ref = Load::make(UInt(64), b.mbar_name, 0, Buffer<>{}, Parameter{},
                                                const_true(), ModulusRemainder{});
+                    // EXPECTED arrivals = the number of ACTIVE producer lanes that execute the
+                    // arrive. branch_warp_threads warp-ROUNDS (fine for bar.sync, which converges a
+                    // whole warp), but mbarrier.arrive only fires on active lanes -> must match the
+                    // actual count. HL_WG_MBAR_COUNT overrides it for diagnosis.
+                    Expr count = producer_threads[b.producer];
+                    std::string cov = get_env_variable("HL_WG_MBAR_COUNT");
+                    if (!cov.empty()) count = Expr(std::atoi(cov.c_str()));
                     Stmt init = Evaluate::make(Call::make(Int(32), "mbarrier_init",
-                                                          {base_ref, Expr(b.ring_n),
-                                                           producer_threads[b.producer]},
+                                                          {base_ref, Expr(b.ring_n), count},
                                                           Call::Intrinsic));
                     result = Block::make(init, result);
                     result = Allocate::make(b.mbar_name, UInt(64), MemoryType::GPUShared,
