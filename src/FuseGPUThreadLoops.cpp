@@ -2404,10 +2404,19 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     mbar_allocs.push_back(b);
                 }
                 if (!init_args.empty()) {
-                    // One init+bar.sync asm arms every slot of every producer; runs on all threads.
+                    // CUTLASS-style uniform prologue: ONE opaque tid==0-predicated init asm (no
+                    // internal barrier -- it doesn't expose tid to LLVM, so no if(tid==0) region is
+                    // formed) followed by a SEPARATE Block-scope full-CTA barrier. Both are
+                    // block-level siblings of the Fork, BEFORE the flat warp-group partition loop,
+                    // so they run on ALL threads (the uniform prologue). The barrier makes the armed
+                    // mbarriers visible before any producer arrive / consumer wait.
                     Stmt init = Evaluate::make(Call::make(Int(32), "mbarrier_init", init_args,
                                                           Call::Intrinsic));
-                    result = Block::make(init, result);
+                    Stmt barrier = Evaluate::make(Call::make(Int(32), Call::sync_requirement,
+                                                  {IntImm::make(Int(32), (int)SyncScope::Block),
+                                                   IntImm::make(Int(32), (int)CodeGen_GPU_Dev::MemoryFenceType::Shared)},
+                                                  Call::Intrinsic));
+                    result = Block::make(init, Block::make(barrier, result));
                     for (const BarrierInfo &b : mbar_allocs) {
                         result = Allocate::make(b.mbar_name, UInt(64), MemoryType::GPUShared,
                                                 {Expr(b.ring_n)}, const_true(), result);
