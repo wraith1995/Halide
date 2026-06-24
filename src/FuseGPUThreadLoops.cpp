@@ -12,6 +12,7 @@
 #include "ExprUsesVar.h"
 #include "Function.h"
 #include "FuseGPUThreadLoops.h"
+#include "GPUExecutionMap.h"
 #include "IR.h"
 #include "IREquality.h"
 #include "IRMutator.h"
@@ -1270,10 +1271,25 @@ protected:
     const ExtractSharedAndHeapAllocations &block_allocs;
     const ExtractRegisterAllocations &register_allocs;
 
+    // The execution-mapping model (M1): barrier scope = join(active(producer),
+    // active(consumer)) instead of the old unconditional Block. `exec` tracks the
+    // current active set as this mutator descends (enter_for / enter_if / pop). See
+    // research/exec_mapping_model.md, fusegpu_rearch_plan.md C.0/M2.
+    ExecMap &exec;
+
     std::set<std::string> shared_stores;
     std::set<std::string> device_stores;
     std::set<std::string> shared_loads;
     std::set<std::string> device_loads;
+    // Active set of the producing store(s) / consuming load(s) per name (joined over
+    // all occurrences), captured alongside the name sets above.
+    std::map<std::string, ActiveSet> store_active;
+    std::map<std::string, ActiveSet> load_active;
+
+    void record_active(std::map<std::string, ActiveSet> &m, const std::string &name) {
+        auto it = m.find(name);
+        m[name] = (it == m.end()) ? exec.current() : ExecMap::join(it->second, exec.current());
+    }
 
     MemoryType memory_type_for_name(const std::string &name) {
         for (const auto &x : register_allocs.allocations) {
@@ -1310,6 +1326,10 @@ protected:
 
         ScopedValue<bool> old_injected_barrier(injected_barrier, false);
 
+        // Track the active set: descending into a GPU thread/lane/warp-group loop
+        // narrows which lanes execute the body (full extent => no change).
+        exec.enter_for(op);
+        Stmt result;
         if (!is_parallel(op->for_type)) {
             Stmt body = mutate(op->body);
             // Serial for loops at the block level with internal
@@ -1320,11 +1340,30 @@ protected:
                 // synchronizations within the block
                 body = Block::make(body, make_barrier(0));
             }
-            return For::make(op->name, op->min, op->max,
-                             op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+            result = For::make(op->name, op->min, op->max,
+                               op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
         } else {
-            return IRMutator::visit(op);
+            result = IRMutator::visit(op);
         }
+        exec.pop();
+        return result;
+    }
+
+    Stmt visit(const IfThenElse *op) override {
+        Expr condition = mutate(op->condition);
+        // The then-branch executes only on the lanes satisfying the guard.
+        exec.enter_if(op->condition);
+        Stmt then_case = mutate(op->then_case);
+        exec.pop();
+        // The else-branch keeps the enclosing active set (the model does not represent
+        // guard negation; this is conservative => more sync, never less).
+        Stmt else_case = op->else_case.defined() ? mutate(op->else_case) : Stmt();
+        if (condition.same_as(op->condition) &&
+            then_case.same_as(op->then_case) &&
+            else_case.same_as(op->else_case)) {
+            return op;
+        }
+        return IfThenElse::make(condition, then_case, else_case);
     }
 
     Stmt visit(const Store *op) override {
@@ -1334,12 +1373,14 @@ protected:
         case MemoryType::GPUShared:
             debug(4) << "   memory type is shared\n";
             shared_stores.insert(op->name);
+            record_active(store_active, op->name);
             break;
         case MemoryType::Auto:
         case MemoryType::Heap:
         case MemoryType::GPUTexture:
             debug(4) << "   memory type is heap or auto\n";
             device_stores.insert(op->name);
+            record_active(store_active, op->name);
             break;
         case MemoryType::Stack:
         case MemoryType::Register:
@@ -1359,12 +1400,14 @@ protected:
         case MemoryType::GPUShared:
             debug(4) << "   memory type is shared\n";
             shared_loads.insert(op->name);
+            record_active(load_active, op->name);
             break;
         case MemoryType::Auto:
         case MemoryType::Heap:
         case MemoryType::GPUTexture:
             debug(4) << "   memory type is heap or auto\n";
             device_loads.insert(op->name);
+            record_active(load_active, op->name);
             break;
         case MemoryType::Stack:
         case MemoryType::Register:
@@ -1389,6 +1432,7 @@ protected:
                 if (const Load *l = a.as<Load>()) {
                     if (memory_type_for_name(l->name) == MemoryType::GPUShared) {
                         shared_stores.insert(l->name);
+                        record_active(store_active, l->name);
                     }
                 }
             }
@@ -1407,27 +1451,44 @@ protected:
             // of this block
             shared_stores.clear();
             device_stores.clear();
+            store_active.clear();
             Stmt first = mutate(op->first);
 
-            // If there are any loads in the rest part that
-            // load from something stored in first, insert the appropriate
-            // fence type
+            // If there are any loads in the rest part that load from something stored in
+            // first, insert the appropriate fence type AND accumulate the combined active
+            // set of the matched producer stores and consumer loads (M2).
             int mask = 0;
-            for (const auto &st : shared_stores) {
-                auto elem = shared_loads.find(st);
-                if (elem != shared_loads.end()) {
-                    mask |= CodeGen_GPU_Dev::MemoryFenceType::Shared;
-                    break;
+            ActiveSet combined;
+            bool any_match = false;
+            auto consider = [&](const std::set<std::string> &stores,
+                                const std::set<std::string> &loads, int fence) {
+                for (const auto &st : stores) {
+                    if (loads.count(st)) {
+                        mask |= fence;
+                        auto si = store_active.find(st);
+                        auto li = load_active.find(st);
+                        ActiveSet s = (si != store_active.end()) ? si->second : ActiveSet::whole_block();
+                        ActiveSet l = (li != load_active.end()) ? li->second : ActiveSet::whole_block();
+                        ActiveSet pair = ExecMap::join(s, l);
+                        combined = any_match ? ExecMap::join(combined, pair) : pair;
+                        any_match = true;
+                    }
                 }
-            }
-            for (const auto &st : device_stores) {
-                auto elem = device_loads.find(st);
-                if (elem != device_loads.end()) {
-                    mask |= CodeGen_GPU_Dev::MemoryFenceType::Device;
-                    break;
-                }
-            }
+            };
+            consider(shared_stores, shared_loads, CodeGen_GPU_Dev::MemoryFenceType::Shared);
+            consider(device_stores, device_loads, CodeGen_GPU_Dev::MemoryFenceType::Device);
+
             injected_barrier = true;
+            // M2: barrier scope = scope(join(active(producer), active(consumer))). When
+            // that scope is Thread (producer and consumer are the SAME single lane) the
+            // dependency is satisfied by program order and NO barrier is needed -- this is
+            // where the old scope-blindness (make_barrier always Block) dies. Every CURRENT
+            // producer/consumer is cooperative (active = whole block => Block), so this is
+            // byte-identical until an explicit single-thread guard appears (M4 TMA). The
+            // WarpGroup-scope named-barrier (count) refinement lands with the ring (M3).
+            if (any_match && exec.scope(combined) == ExecScope::Thread) {
+                return Block::make(first, rest);
+            }
             return Block::make({first, make_barrier(mask), rest});
         } else {
             return IRMutator::visit(op);
@@ -1435,9 +1496,11 @@ protected:
     }
 
 public:
-    InjectThreadBarriers(ExtractSharedAndHeapAllocations &sha, ExtractRegisterAllocations &ra)
+    InjectThreadBarriers(ExtractSharedAndHeapAllocations &sha, ExtractRegisterAllocations &ra,
+                         ExecMap &exec)
         : block_allocs(sha),
-          register_allocs(ra) {
+          register_allocs(ra),
+          exec(exec) {
     }
 };
 
@@ -1476,7 +1539,13 @@ protected:
 
             if (register_allocs.has_thread_loop) {
                 // If there's no loop over threads, everything is already synchronous.
-                InjectThreadBarriers i{block_allocations, register_allocs};
+                // The execution-mapping model (M1) over this block body supplies the
+                // active set of each producer/consumer so barrier scope is a query, not
+                // an unconditional Block (research/exec_mapping_model.md). The thread
+                // loops are still explicit For GPUThread here (ReplaceForWithIf runs
+                // after), so the active sets are well-defined.
+                ExecMap exec(body);
+                InjectThreadBarriers i{block_allocations, register_allocs, exec};
                 body = i(body);
             }
 
