@@ -1115,6 +1115,100 @@ WEAK int halide_cuda_device_sync(void *user_context, struct halide_buffer_t *) {
     return halide_error_code_success;
 }
 
+// TMA (sm_90+): build a CUtensorMap descriptor for a tiled 2D global operand and return a DEVICE
+// pointer to it (the kernel takes the descriptor by pointer). Called from Halide-generated host code
+// (so it works in both the LLVM host backend and CodeGen_C). The descriptor depends only on the
+// global base/shape/tile/swizzle, so a small cache keyed on the global pointer avoids rebuilding it
+// every launch. dtype is a CUtensorMapDataType; globals are (inner, outer) extents; box is the tile.
+WEAK struct TensorMapCacheEntry {
+    CUdeviceptr global_ptr;
+    uint64_t dim0, dim1;
+    uint32_t box0, box1;
+    int dtype, swizzle;
+    CUdeviceptr device_map;
+} tensor_map_cache[32];
+WEAK int tensor_map_cache_size = 0;
+WEAK halide_mutex tensor_map_cache_lock;
+
+extern "C" WEAK int halide_cuda_create_tensor_map(
+    void *user_context, uint64_t global_ptr, int dtype, int elem_bytes,
+    uint64_t dim0, uint64_t dim1, uint32_t box0, uint32_t box1, int swizzle,
+    uint64_t *out_map_device) {
+    Context ctx(user_context);
+    if (ctx.error()) {
+        return ctx.error();
+    }
+    if (cuTensorMapEncodeTiled == nullptr) {
+        error(user_context) << "CUDA: cuTensorMapEncodeTiled unavailable (needs CUDA 12.0+ driver) "
+                               "-- TMA requires a newer driver.\n";
+        return halide_error_code_generic_error;
+    }
+
+    // Cache: the descriptor is launch-invariant for a given global tile shape.
+    {
+        ScopedMutexLock lock(&tensor_map_cache_lock);
+        for (int i = 0; i < tensor_map_cache_size; i++) {
+            TensorMapCacheEntry &e = tensor_map_cache[i];
+            if (e.global_ptr == (CUdeviceptr)global_ptr && e.dim0 == dim0 && e.dim1 == dim1 &&
+                e.box0 == box0 && e.box1 == box1 && e.dtype == dtype && e.swizzle == swizzle) {
+                *out_map_device = (uint64_t)e.device_map;
+                return halide_error_code_success;
+            }
+        }
+    }
+
+    CUtensorMap map;
+    unsigned long long globalDim[2] = {dim0, dim1};
+    // globalStrides holds the (rank-1) byte strides of dims 1.. ; for a dim0-contiguous 2D operand
+    // the only entry is the byte stride between rows of the outer dim = dim0 * elem_bytes.
+    unsigned long long globalStrides[1] = {(unsigned long long)dim0 * (unsigned long long)elem_bytes};
+    unsigned int boxDim[2] = {box0, box1};
+    unsigned int elementStrides[2] = {1, 1};
+    CUtensorMapSwizzle sw = CU_TENSOR_MAP_SWIZZLE_NONE;
+    if (swizzle == 128) {
+        sw = CU_TENSOR_MAP_SWIZZLE_128B;
+    } else if (swizzle == 64) {
+        sw = CU_TENSOR_MAP_SWIZZLE_64B;
+    } else if (swizzle == 32) {
+        sw = CU_TENSOR_MAP_SWIZZLE_32B;
+    }
+    CUresult err = cuTensorMapEncodeTiled(
+        &map, (CUtensorMapDataType)dtype, 2, (void *)global_ptr, globalDim, globalStrides, boxDim,
+        elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, sw, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (err != CUDA_SUCCESS) {
+        return error_cuda(user_context, err, "cuTensorMapEncodeTiled failed");
+    }
+
+    CUdeviceptr d = 0;
+    err = cuMemAlloc(&d, sizeof(CUtensorMap));
+    if (err != CUDA_SUCCESS) {
+        return error_cuda(user_context, err, "cuMemAlloc for tensor map failed");
+    }
+    err = cuMemcpyHtoD(d, &map, sizeof(CUtensorMap));
+    if (err != CUDA_SUCCESS) {
+        cuMemFree(d);
+        return error_cuda(user_context, err, "cuMemcpyHtoD of tensor map failed");
+    }
+
+    {
+        ScopedMutexLock lock(&tensor_map_cache_lock);
+        if (tensor_map_cache_size < 32) {
+            TensorMapCacheEntry &e = tensor_map_cache[tensor_map_cache_size++];
+            e.global_ptr = (CUdeviceptr)global_ptr;
+            e.dim0 = dim0;
+            e.dim1 = dim1;
+            e.box0 = box0;
+            e.box1 = box1;
+            e.dtype = dtype;
+            e.swizzle = swizzle;
+            e.device_map = d;
+        }
+    }
+    *out_map_device = (uint64_t)d;
+    return halide_error_code_success;
+}
+
 WEAK int halide_cuda_run(void *user_context,
                          void *state_ptr,
                          const char *entry_name,

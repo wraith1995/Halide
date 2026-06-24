@@ -245,6 +245,53 @@ typedef struct CUDA_MEMCPY3D_st {
 
 #define CU_POINTER_ATTRIBUTE_CONTEXT 1
 
+// TMA (Tensor Memory Accelerator), sm_90+. CUtensorMap is a 128-byte opaque, 64-byte-aligned
+// descriptor built host-side by cuTensorMapEncodeTiled and consumed by cp.async.bulk.tensor.
+typedef struct CUtensorMap_st {
+    unsigned long long opaque[16];
+} __attribute__((aligned(64))) CUtensorMap;
+
+typedef enum CUtensorMapDataType_enum {
+    CU_TENSOR_MAP_DATA_TYPE_UINT8 = 0,
+    CU_TENSOR_MAP_DATA_TYPE_UINT16,
+    CU_TENSOR_MAP_DATA_TYPE_UINT32,
+    CU_TENSOR_MAP_DATA_TYPE_INT32,
+    CU_TENSOR_MAP_DATA_TYPE_UINT64,
+    CU_TENSOR_MAP_DATA_TYPE_INT64,
+    CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+    CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+    CU_TENSOR_MAP_DATA_TYPE_FLOAT64,
+    CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+    CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ,
+    CU_TENSOR_MAP_DATA_TYPE_TFLOAT32,
+    CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ
+} CUtensorMapDataType;
+
+typedef enum CUtensorMapInterleave_enum {
+    CU_TENSOR_MAP_INTERLEAVE_NONE = 0,
+    CU_TENSOR_MAP_INTERLEAVE_16B,
+    CU_TENSOR_MAP_INTERLEAVE_32B
+} CUtensorMapInterleave;
+
+typedef enum CUtensorMapSwizzle_enum {
+    CU_TENSOR_MAP_SWIZZLE_NONE = 0,
+    CU_TENSOR_MAP_SWIZZLE_32B,
+    CU_TENSOR_MAP_SWIZZLE_64B,
+    CU_TENSOR_MAP_SWIZZLE_128B
+} CUtensorMapSwizzle;
+
+typedef enum CUtensorMapL2promotion_enum {
+    CU_TENSOR_MAP_L2_PROMOTION_NONE = 0,
+    CU_TENSOR_MAP_L2_PROMOTION_L2_64B,
+    CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+    CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+} CUtensorMapL2promotion;
+
+typedef enum CUtensorMapFloatOOBfill_enum {
+    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE = 0,
+    CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
+} CUtensorMapFloatOOBfill;
+
 }  // namespace Cuda
 }  // namespace Internal
 }  // namespace Runtime

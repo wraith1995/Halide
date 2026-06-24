@@ -56,6 +56,16 @@ CUDA_FN_OPTIONAL(CUresult, cuStreamSynchronize, (CUstream hStream));
 // Optional: absent on very old drivers, guarded by a null check at the call site.
 CUDA_FN_OPTIONAL(CUresult, cuFuncSetAttribute, (CUfunction hfunc, CUfunction_attribute attrib, int value));
 
+// TMA (sm_90+). Builds a CUtensorMap descriptor for a tiled global tensor. CUDA 12.0+ /
+// driver-dependent: optional, null-guarded at the call site.
+CUDA_FN_OPTIONAL(CUresult, cuTensorMapEncodeTiled,
+                 (CUtensorMap * tensorMap, CUtensorMapDataType tensorDataType, unsigned int tensorRank,
+                  void *globalAddress, const unsigned long long *globalDim,
+                  const unsigned long long *globalStrides, const unsigned int *boxDim,
+                  const unsigned int *elementStrides, CUtensorMapInterleave interleave,
+                  CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion,
+                  CUtensorMapFloatOOBfill oobFill));
+
 #undef CUDA_FN
 #undef CUDA_FN_OPTIONAL
 #undef CUDA_FN_3020
