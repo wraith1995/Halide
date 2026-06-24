@@ -1209,6 +1209,40 @@ extern "C" WEAK int halide_cuda_create_tensor_map(
     return halide_error_code_success;
 }
 
+// Host-callable wrapper emitted by Halide codegen (a Call::Extern returning the device tensor-map
+// pointer): derives dtype/extents from the operand buffer, builds + caches the descriptor, returns
+// the device pointer (0 on failure, after a halide_error). box0/box1 = the shared tile (inner,outer);
+// swizzle = 0/32/64/128 bytes (from store_in). The result is passed into the kernel as a u64 arg.
+extern "C" WEAK uint64_t halide_cuda_tensor_map(void *user_context, halide_buffer_t *buf,
+                                                int box0, int box1, int swizzle) {
+    if (buf == nullptr || buf->device == 0) {
+        error(user_context) << "CUDA: halide_cuda_tensor_map needs a device-resident operand.\n";
+        return 0;
+    }
+    int dtype;
+    if (buf->type.code == halide_type_float && buf->type.bits == 16) {
+        dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+    } else if (buf->type.code == halide_type_bfloat && buf->type.bits == 16) {
+        dtype = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    } else if (buf->type.code == halide_type_float && buf->type.bits == 32) {
+        dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+    } else {
+        error(user_context) << "CUDA: halide_cuda_tensor_map unsupported operand type.\n";
+        return 0;
+    }
+    int elem_bytes = buf->type.bits / 8;
+    // 2D operand: dim 0 = inner (contiguous), dim 1 = outer.
+    uint64_t dim0 = (uint64_t)buf->dim[0].extent;
+    uint64_t dim1 = (uint64_t)buf->dim[1].extent;
+    uint64_t out = 0;
+    int err = halide_cuda_create_tensor_map(user_context, (uint64_t)buf->device, dtype, elem_bytes,
+                                            dim0, dim1, (uint32_t)box0, (uint32_t)box1, swizzle, &out);
+    if (err != halide_error_code_success) {
+        return 0;
+    }
+    return out;
+}
+
 WEAK int halide_cuda_run(void *user_context,
                          void *state_ptr,
                          const char *entry_name,
