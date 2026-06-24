@@ -39,6 +39,15 @@ Stmt inject_gpu_warp_specialization(Stmt s, const std::map<std::string, Function
  * before inject_gpu_warp_specialization (which handles the non-ring case). */
 Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env, const Target &t);
 
+/** Lower async-completion requirements (Call::async_issue / async_wait, CompletionKind x
+ * SyncScope x target) to their concrete mechanism. The CpAsyncBulk (sm_90 cp.async.bulk / TMA)
+ * path becomes an mbarrier transaction: async_issue -> mbarrier_arrive_expect_tx, async_wait ->
+ * mbarrier.try_wait.parity. Runs BEFORE fuse_gpu_thread_loops so the mbarrier init (materialized
+ * as a shared store by the emitting recognizer) is seen by InjectThreadBarriers, which GENERATES
+ * the transitive init->use visibility barrier (no hand-placed barrier; the F3 deadlock class
+ * dissolves). See research/fusegpu_rearch_plan.md C.1a. */
+Stmt lower_async_completions(Stmt s, const Target &t);
+
 /** Converts Halide's GPGPU IR to the OpenCL/CUDA/Metal model. Within
  * every loop over gpu block indices, fuse the inner loops over thread
  * indices into a single loop (with predication to turn off

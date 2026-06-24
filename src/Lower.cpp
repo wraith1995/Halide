@@ -374,6 +374,15 @@ void lower_impl(const vector<Function> &output_funcs,
         log("Lowering after recognizing warp-group tile reduces:", s);
     }
 
+    if (t.has_gpu_feature()) {
+        // Lower async-completion requirements (async_issue/async_wait) BEFORE fuse_gpu_thread_loops,
+        // so any mbarrier the selector materializes is seen by InjectThreadBarriers (which generates
+        // the transitive init->use visibility barrier). NFC until a recognizer emits the markers.
+        debug(1) << "Lowering async completions (mbarrier transactions)...\n";
+        s = lower_async_completions(s, t);
+        log("Lowering after async completions:", s);
+    }
+
     if (t.has_gpu_feature() ||
         t.has_feature(Target::Vulkan)) {
         debug(1) << "Injecting per-block gpu synchronization...\n";
