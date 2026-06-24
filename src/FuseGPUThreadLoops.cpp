@@ -2010,6 +2010,36 @@ int max_warps_per_group(const Stmt &s) {
     return v.m;
 }
 
+// The warp-group participant count of a fork branch / warp-group peel: its collective-
+// aware, warp-rounded hardware-lane assignment. THE single source of truth -- both
+// partition_warp_groups (the flat lane partition) and LowerGPUWarpAsyncFork's per-edge
+// barrier count query it, so the "count computed three ways" deadlock (a rounding mismatch
+// between the partition's lane ranges and the barrier's arriving-lane count) cannot recur.
+// This is the execution-mapping model's count(scope = WarpGroup) realized for the
+// PRE-partition Fork: the branch is not yet a thread-guard region (the Fork is split into
+// warp groups later, in fuse), so it is measured by its ThreadExtents. A collective branch
+// (warps_per_group = N, e.g. the wgmma consumer) occupies exactly its N warps; an explicit
+// peel override fixes N warps; a non-collective branch (producer/DMA) is its thread tile
+// rounded up to a whole warp. See research/exec_mapping_model.md, fusegpu_rearch_plan.md
+// C.0/M3 (the model's count query table).
+Expr warp_group_lane_count(const Stmt &branch, int warp_size, int warps_per_group_override = 0) {
+    if (warps_per_group_override > 0) {
+        return Expr(warps_per_group_override * warp_size);  // explicit symmetric peel
+    }
+    if (max_warps_per_group(branch) > 0) {
+        return Expr(max_warps_per_group(branch) * warp_size);  // collective: exactly its N warps
+    }
+    ThreadExtents te;
+    branch.accept(&te);
+    Expr prod = 1;
+    for (int d = 0; d <= te.max_dim; d++) {
+        if (te.extent[d].defined()) {
+            prod = prod * te.extent[d];
+        }
+    }
+    return simplify(((simplify(prod) + (warp_size - 1)) / warp_size) * warp_size);
+}
+
 Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
                            DeviceAPI device_api, int warps_per_group_override = 0,
                            const std::vector<int> &group_index = {}) {
@@ -2050,13 +2080,10 @@ Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
             prod = simplify(prod * maxe[i]);
         }
         int branch_wpg = max_warps_per_group(branch);  // >0 => this branch has a warp-group collective
-        // Size: an explicit override (symmetric gpu_warps peel) fixes N warps; else a collective
-        // branch is exactly its N warps and a non-collective branch is the tile rounded to a warp.
-        Expr size = warps_per_group_override > 0
-                        ? Expr(warps_per_group_override * warp_size)
-                        : (branch_wpg > 0
-                               ? Expr(branch_wpg * warp_size)
-                               : simplify(((prod + (warp_size - 1)) / warp_size) * warp_size));
+        // Size = the warp-group participant count (the single source of truth shared with the ring's
+        // per-edge barrier count): explicit peel override -> N warps; collective -> its N warps;
+        // non-collective -> the tile rounded to a warp. See warp_group_lane_count.
+        Expr size = warp_group_lane_count(branch, warp_size, warps_per_group_override);
         // Pin a collective branch's base to a warp-group boundary (round up; a gap may precede it).
         if (warps_per_group_override == 0 && branch_wpg > 0) {
             int align = branch_wpg * warp_size;
@@ -2397,27 +2424,12 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             // Leave the Fork for the Fork-aware fuser (sum-between, max-within). Here we
             // only inject the cross-group ring barriers (with per-edge counts) and lift
             // shared storage to block level; the fuser sizes/partitions the thread space.
-            // The per-edge barrier count is producer_threads[i] + consumer_threads, so these MUST
-            // match the actual lane ranges partition_warp_groups assigns (collective-aware): a
-            // collective branch (the wgmma consumer) occupies exactly its N warps; a non-collective
-            // branch (producer/DMA) is the tile rounded to a warp. Mismatching these (e.g. summing
-            // warp-rounded sizes while the partition warp-group-rounds) makes the barrier count
-            // smaller than the arriving lanes -> deadlock. NFC for plain async (no collective ->
-            // per-warp rounding, as before).
+            // The per-edge barrier count is producer_threads[i] + consumer_threads, which MUST match
+            // the actual lane ranges partition_warp_groups assigns. Both now query the SAME
+            // warp_group_lane_count, so the rounding can no longer disagree (the count-three-ways
+            // deadlock dissolves). NFC for plain async (no collective -> per-warp rounding, as before).
             auto branch_warp_threads = [&](const Stmt &s) {
-                ThreadExtents te;
-                s.accept(&te);
-                Expr t = 1;
-                for (int d = 0; d <= te.max_dim; d++) {
-                    if (te.extent[d].defined()) {
-                        t = t * te.extent[d];
-                    }
-                }
-                int wpg = max_warps_per_group(s);
-                if (wpg > 0) {
-                    return Expr(wpg * warp_size);  // collective: exactly its warp-group size
-                }
-                return simplify(((simplify(t) + (warp_size - 1)) / warp_size) * warp_size);
+                return warp_group_lane_count(s, warp_size);
             };
             // NOTE (F2 consumption WIP): the gpu_warp_group directive is parsed/stored, but the
             // producer-fold consumption is NOT wired here. Merging co-grouped producers' BODIES
