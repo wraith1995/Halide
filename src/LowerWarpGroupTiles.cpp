@@ -48,9 +48,11 @@ const VectorReduce *find_vector_reduce(const Expr &e) {
 struct CountFragStores : public IRVisitor {
     using IRVisitor::visit;
     int count = 0;
+    std::set<std::string> accum_names;  // buffers targeted by a wgmma-shaped reduce store
     void visit(const Store *op) override {
         if (find_vector_reduce(op->value)) {
             count++;
+            accum_names.insert(op->name);
         }
         IRVisitor::visit(op);
     }
@@ -336,9 +338,12 @@ class RewriteWarpGroupTiles : public IRMutator {
     // stores -> wgmma_n defaults to 16 there. The epilogue instead reads N from the accumulator it
     // loads (recorded when the accumulate group was rewritten, which precedes the epilogue).
     std::map<std::string, int> accumulator_n;
-    // The accumulator's per-thread base index (frag 0's store index), captured per group so the
-    // 8 scalar frag stores all read/write prod[base + i].
-    Expr acc_base;
+    // Register-accumulator buffers + their N, GLOBALLY pre-scanned in run() (the init stage `prod=0`
+    // and the update `prod+=` are SEPARATE For nests, so a per-group scan misses the init's name/N).
+    // init_frag = the per-group running frag index for the unrolled `prod = 0` init.
+    std::set<std::string> all_accumulators;
+    std::map<std::string, int> all_accumulator_n;
+    int init_frag = 0;
 
     Stmt visit(const LetStmt *op) override {
         lets[op->name] = op->value;
@@ -401,9 +406,28 @@ class RewriteWarpGroupTiles : public IRMutator {
         return tile_origin_at_lane(base, 0);
     }
 
+    // The wgmma register accumulator (`prod`) is a per-thread, per-group FLAT register array: warp
+    // group g's (warps_per_group*32) threads each own n/2 contiguous registers. Rebuild a CLEAN
+    // base = group*(threads_per_group*frags) + thread*frags instead of inheriting prod's SCHEDULED
+    // storage index. With ONE consumer group the schedule's fuse-first index already equals
+    // thread*frags (NFC). With TWO groups the explicit cmi-M-split (the named-group_var geometry the
+    // operand/epilogue group-awareness needs) SCRAMBLES prod's register layout AND leaves a cmi
+    // storage-base symbol (`prod.s1.m.cmi.s`) unbound -> host codegen fails. group_var peels to the
+    // branch index (0/1) and thread_var to group-local coords, so this base separates the groups'
+    // register blocks with no collision. group_var empty / extent-1 => group term 0 => NFC.
+    Expr register_base(int n) {
+        int frags = n / 2;
+        Expr base = Variable::make(Int(32), thread_var) * frags;
+        if (!group_var.empty() && warps_per_group > 0) {
+            base = base + Variable::make(Int(32), group_var) * (warps_per_group * 32 * frags);
+        }
+        return base;
+    }
+
     Stmt visit(const For *op) override {
         std::string saved_group = group_var, saved_thread = thread_var;
         int saved_wpg = warps_per_group, saved_frag = frag_index, saved_n = wgmma_n;
+        int saved_init = init_frag;
         bool is_group = false;
         if (op->for_type == ForType::GPUThread) {
             if (op->warps_per_group >= 0 || op->realization == GPUVectorScope::WarpGroup) {
@@ -411,9 +435,12 @@ class RewriteWarpGroupTiles : public IRMutator {
                 warps_per_group = op->warps_per_group;
                 is_group = true;
                 frag_index = 0;       // reset the fragment register counter per group
+                init_frag = 0;        // reset the accumulator-init frag counter per group
                 out_captured = false;  // re-capture the epilogue base/strides per group
                 // Auto-detect the wgmma N from the tile shape: N/2 frag stores -> N (clamped to the
-                // valid m64nN range; emit_wgmma asserts N%8==0).
+                // valid m64nN range; emit_wgmma asserts N%8==0). Also record the accumulator buffer
+                // name(s) so the init store (`prod = 0`, visited before the accumulate populates
+                // wgmma_accumulators) can be rewritten to the clean register base.
                 CountFragStores cfs;
                 op->body.accept(&cfs);
                 wgmma_n = std::max(16, std::min(256, cfs.count * 2));
@@ -426,6 +453,7 @@ class RewriteWarpGroupTiles : public IRMutator {
         thread_var = saved_thread;
         warps_per_group = saved_wpg;
         wgmma_n = saved_n;
+        init_frag = saved_init;
         if (!is_group) {
             frag_index = saved_frag;
         }
@@ -466,6 +494,24 @@ class RewriteWarpGroupTiles : public IRMutator {
             return IRMutator::visit(op);
         }
 
+        // Accumulator INIT (`prod = 0`): a non-reduce store to the register accumulator, visited
+        // before the accumulate records wgmma_accumulators (so we key on the pre-scanned
+        // group_accumulators). The init is frag-unrolled (n/2 stores); rewrite each to the SAME
+        // clean flat register base the accumulate/epilogue use (register_base + frag) -- else it
+        // zeroes prod's SCRAMBLED scheduled slots while the accumulate seeds from the clean slots
+        // (uninitialized register memory) -> garbage. NFC for one group / fuse-first (register_base
+        // == the schedule's own thread*frags index). Caps at n/2 (extra stores fall through).
+        if (getenv("HL_WGMMA_KCARRY") && all_accumulators.count(op->name) &&
+            !find_vector_reduce(op->value) && !loads_one_of(op->value, all_accumulators)) {
+            int n = all_accumulator_n.count(op->name) ? all_accumulator_n[op->name] : wgmma_n;
+            if (init_frag < n / 2) {
+                Expr idx = register_base(n) + init_frag;
+                init_frag++;
+                return Store::make(op->name, mutate(op->value), idx, op->param, op->predicate,
+                                   op->alignment);
+            }
+        }
+
         // 1b epilogue (HL_WGMMA_KCARRY): a store whose value LOADS a recorded register
         // accumulator (`prod`) AND has no vector reduce is the `C = prod` copy-out (the
         // accumulator's OWN update `prod += ...` also loads prod, but carries the reduce -- that
@@ -476,9 +522,13 @@ class RewriteWarpGroupTiles : public IRMutator {
             loads_one_of(op->value, wgmma_accumulators) && !find_vector_reduce(op->value)) {
             // N from the loaded accumulator (the epilogue group's own pre-scan sees no reduce).
             int n_epi = wgmma_n;
+            std::string acc_name;
             for (const std::string &acc : wgmma_accumulators) {
-                if (loads_one_of(op->value, {acc}) && accumulator_n.count(acc)) {
-                    n_epi = accumulator_n[acc];
+                if (loads_one_of(op->value, {acc})) {
+                    acc_name = acc;
+                    if (accumulator_n.count(acc)) {
+                        n_epi = accumulator_n[acc];
+                    }
                     break;
                 }
             }
@@ -502,11 +552,19 @@ class RewriteWarpGroupTiles : public IRMutator {
             }
             Expr slot = simplify(out_base + frag_row_m(lane, i) * out_stride_m +
                                  frag_col_n(lane, i) * out_stride_n);
+            // Read register i of the accumulator from the SAME clean flat base the accumulate path
+            // wrote (register_base + i), not prod's scrambled scheduled load index. NFC for one
+            // group (register_base == thread*frags == the fuse-first schedule's own prod index).
+            Expr value = mutate(op->value);
+            if (!acc_name.empty()) {
+                value = Load::make(op->value.type(), acc_name, register_base(n_epi) + i,
+                                   Buffer<>(), op->param, const_true(), ModulusRemainder());
+            }
             if (getenv("HL_DEBUG_WGMMA")) {
                 debug(0) << "[wgtile] 1b epilogue store #" << i << " " << op->name
                          << " <- accumulator -> frag slot\n";
             }
-            return Store::make(op->name, mutate(op->value), slot, op->param, op->predicate,
+            return Store::make(op->name, value, slot, op->param, op->predicate,
                                op->alignment);
         }
 
@@ -597,15 +655,14 @@ class RewriteWarpGroupTiles : public IRMutator {
         if (getenv("HL_WGMMA_KCARRY")) {
             wgmma_accumulators.insert(op->name);
             accumulator_n[op->name] = wgmma_n;  // so the sibling epilogue caps at the right N/2
-            // The accumulator's per-thread base = frag 0's store index (frags 0..7 land at
-            // base+0..7). Emit one SCALAR store per frag prod[base+i] = accum_reg(i, ...), like
-            // the M1 scalar+cache path: the wgmma is cached (one per ko body) and seeds D from
-            // prod's current value (D_in = Load(prod, base)); scaleD=1 accumulates. No vector
-            // store to register memory -> no per-lane scalarization of the collective.
-            if (i == 0) {
-                acc_base = op->index;
-            }
-            Expr d_in = Load::make(op->value.type(), op->name, acc_base,
+            // The accumulator's per-thread base = the CLEAN flat register base (frags 0..n/2-1 land
+            // at base+0..n/2-1). Emit one SCALAR store per frag prod[base+i] = accum_reg(i, ...),
+            // like the M1 scalar+cache path: the wgmma is cached (one per ko body) and seeds D from
+            // prod's current value (D_in = Load(prod, base)); scaleD=1 accumulates. No vector store
+            // to register memory -> no per-lane scalarization. register_base (not op->index) keeps
+            // the layout clean + group-separated for 2 warp groups (NFC for one group).
+            Expr acc = register_base(wgmma_n);
+            Expr d_in = Load::make(op->value.type(), op->name, acc,
                                    Buffer<>(), op->param, const_true(), ModulusRemainder());
             Expr call = Call::make(op->value.type(), "wgmma_m64n16k16_f32_accum_reg",
                                    {i, Expr(wgmma_n), d_in, n_chunks, load_a, stride_a, load_b, stride_b},
@@ -614,7 +671,7 @@ class RewriteWarpGroupTiles : public IRMutator {
                 debug(0) << "[wgtile] 1b accumulate frag #" << i << " -> accum_reg into "
                          << op->name << " (n_chunks=" << n_chunks << ")\n";
             }
-            return Store::make(op->name, call, op->index, op->param, op->predicate, op->alignment);
+            return Store::make(op->name, call, acc + i, op->param, op->predicate, op->alignment);
         }
 
         // Capture the output-tile epilogue base + strides once per group (frag 0 is the
@@ -692,6 +749,26 @@ public:
         CollectNaturalOperands c;
         s.accept(&c);
         natural_operands = c.layouts;
+        // GLOBAL accumulator pre-scan: a buffer targeted by a wgmma-shaped reduce store is a
+        // register accumulator; record its N (= 2 x #frag stores in its one group). Lets the init
+        // store (`prod = 0`, a SEPARATE stage nest with no reduce) be rewritten to the clean base.
+        // (Plain IRVisitor that descends into group Fors -- unlike CountFragStores, which stops at
+        // group boundaries because it counts a SINGLE group's N.)
+        struct PerAccumCount : public IRVisitor {
+            using IRVisitor::visit;
+            std::map<std::string, int> counts;
+            void visit(const Store *op) override {
+                if (find_vector_reduce(op->value)) {
+                    counts[op->name]++;
+                }
+                IRVisitor::visit(op);
+            }
+        } pac;
+        s.accept(&pac);
+        for (const auto &kv : pac.counts) {
+            all_accumulators.insert(kv.first);
+            all_accumulator_n[kv.first] = std::max(16, std::min(256, kv.second * 2));
+        }
         return mutate(s);
     }
 };
