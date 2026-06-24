@@ -142,6 +142,7 @@ tests(
     gpu_data_flows.cpp
     gpu_different_blocks_threads_dimensions.cpp
     gpu_dynamic_shared.cpp
+    gpu_execution_map.cpp
     gpu_f16_intrinsics.cpp
     gpu_free_sync.cpp
     gpu_give_input_buffers_device_allocations.cpp
