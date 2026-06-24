@@ -619,6 +619,8 @@ constexpr const char *intrinsic_op_names[] = {
     "absd",
     "add_image_checks_marker",
     "alloca",
+    "async_issue",
+    "async_wait",
     "bitwise_and",
     "bitwise_not",
     "bitwise_or",

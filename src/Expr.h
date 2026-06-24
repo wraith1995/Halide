@@ -505,6 +505,16 @@ enum class SyncScope {
     Cluster,    // CTAs of a cluster, sm_90+ (cluster barrier / DSMEM)
 };
 
+/** The kind of asynchronous completion an async_issue/async_wait requirement tracks. Like
+ * SyncScope for barriers, this is target-independent; the selector lowers (CompletionKind x
+ * SyncScope x target) to a concrete completion mechanism (cp.async commit/wait_group, an mbarrier
+ * transaction on sm_90, or wgmma.commit/wait_group). See research/fusegpu_rearch_plan.md. */
+enum class CompletionKind {
+    CpAsyncGroup,  // cp.async (per-thread) -> commit_group / wait_group
+    CpAsyncBulk,   // bulk/tensor copy (sm_90 cp.async.bulk / TMA) -> mbarrier transaction (expect_tx)
+    WgmmaGroup,    // wgmma.mma_async -> wgmma.commit_group / wait_group
+};
+
 /** Check if for_type executes for loop iterations in parallel and unordered. */
 bool is_unordered_parallel(ForType for_type);
 
