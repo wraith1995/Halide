@@ -588,6 +588,47 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         value = ConstantInt::get(i32_t, 0);
         return;
     }
+    if (op->is_intrinsic() && op->name == "mbarrier_arrive_expect_tx") {
+        // TMA (F4): the issuing thread arms the mbarrier with the EXPECTED transaction byte count of
+        // an in-flight bulk-tensor copy. cp.async.bulk.tensor decrements this tx count as the bytes
+        // land; the consumer's try_wait.parity then observes completion (reusing the F3 mbarrier
+        // wait). Issued ONCE by the elected thread (the recognizer guards it). Args: (mbar_ref, bytes).
+        internal_assert(op->args.size() == 2u) << "mbarrier_arrive_expect_tx expects (mbar_ref, bytes).\n";
+        llvm::Value *addr = mbar_shared_addr(op->args[0]);
+        llvm::Value *bytes = codegen(op->args[1]);
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t, i32_t}, false);
+        const char *asm_str =
+            "{ .reg .b64 tma_st; mbarrier.arrive.expect_tx.shared::cta.b64 tma_st, [$0], $1; }";
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, asm_str, "r,r", /*hasSideEffects*/ true);
+        builder->CreateCall(ia, {addr, bytes});
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
+    if (op->is_intrinsic() && op->name == "tma_load_2d") {
+        // TMA (F4): bulk tile load global->shared through a CUtensorMap descriptor, with mbarrier
+        // transaction completion. ONE inline asm replaces the whole cooperative per-thread cp.async
+        // fill -- the hardware generates the addresses + applies the tensor-map swizzle. Issued by
+        // one elected thread (the recognizer guards it). On sm_90 each CTA is a size-1 cluster, so
+        // the .shared::cluster destination addressing works with no explicit cluster launch.
+        // Args: (dst_smem_ref, tensor_map_ptr_u64, coord_x, coord_y, mbar_ref). dst/mbar are Load
+        // carriers (shared byte offset = the addrspace(3) ptr's int value, dynamic shared base 0).
+        internal_assert(op->args.size() == 5u) << "tma_load_2d expects (dst, map, x, y, mbar).\n";
+        llvm::Value *dst = mbar_shared_addr(op->args[0]);
+        llvm::Value *map = codegen(op->args[1]);
+        llvm::Value *x = codegen(op->args[2]);
+        llvm::Value *y = codegen(op->args[3]);
+        llvm::Value *mbar = mbar_shared_addr(op->args[4]);
+        llvm::FunctionType *ft =
+            llvm::FunctionType::get(void_t, {i32_t, i64_t, i32_t, i32_t, i32_t}, false);
+        const char *asm_str =
+            "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+            " [$0], [$1, {$2, $3}], [$4];";
+        llvm::InlineAsm *ia =
+            llvm::InlineAsm::get(ft, asm_str, "r,l,r,r,r", /*hasSideEffects*/ true);
+        builder->CreateCall(ia, {dst, map, x, y, mbar});
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
     if (op->is_intrinsic() && op->name == "mbarrier_try_wait") {
         // Spin on mbarrier.try_wait.parity until the awaited phase (parity = (ko/N)&1) completes,
         // i.e. all producer cp.async into this slot are visible. Args: (mbar_ref, parity). The
