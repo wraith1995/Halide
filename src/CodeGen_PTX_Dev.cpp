@@ -119,7 +119,11 @@ protected:
      * layout (M0 first guesses, pinned against the f64 oracle on H100). swizzle=0
      * (no swizzle) for M0. See research/gpu_recognizer_design.md S5b. */
     llvm::Value *build_wgmma_descriptor(const std::string &buffer, Type elem_type,
-                                        const Expr &tile_origin, int lbo_bytes, int sbo_bytes);
+                                        const Expr &tile_origin, int lbo_bytes, int sbo_bytes,
+                                        int swizzle_bytes = 0);
+    // The wgmma descriptor swizzle mode for a shared operand: read from the operand's
+    // recorded store_in SwizzleLayout (so it matches the TMA tensor-map swizzle). 0 if none.
+    int operand_swizzle_bytes(const std::string &buffer) const;
 
     /** Apply a shared-memory bank-conflict swizzle (recorded per allocation in
      * visit(Allocate)) to the element index, at the address seam. Identity for
@@ -368,9 +372,11 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                 Expr off_a = simplify(la->index + Expr((int)(*stride_a) * c));
                 Expr off_b = simplify(lb->index + Expr((int)(*stride_b) * c));
                 llvm::Value *desc_a = build_wgmma_descriptor(la->name, la->type.element_of(),
-                                                             off_a, /*lbo*/ 128, sbo);
+                                                             off_a, /*lbo*/ 128, sbo,
+                                                             operand_swizzle_bytes(la->name));
                 llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
-                                                             off_b, /*lbo*/ 128, sbo);
+                                                             off_b, /*lbo*/ 128, sbo,
+                                                             operand_swizzle_bytes(lb->name));
                 // scaleD=1 ALWAYS: prod already holds the running sum across prior ko iterations.
                 acc = emit_wgmma(N, acc, desc_a, desc_b, /*scale_d*/ true);
             }
@@ -455,9 +461,11 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                 Expr off_a = simplify(la->index + Expr((int)(*stride_a) * c));
                 Expr off_b = simplify(lb->index + Expr((int)(*stride_b) * c));
                 llvm::Value *desc_a = build_wgmma_descriptor(la->name, la->type.element_of(),
-                                                             off_a, /*lbo*/ 128, sbo);
+                                                             off_a, /*lbo*/ 128, sbo,
+                                                             operand_swizzle_bytes(la->name));
                 llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
-                                                             off_b, /*lbo*/ 128, sbo);
+                                                             off_b, /*lbo*/ 128, sbo,
+                                                             operand_swizzle_bytes(lb->name));
                 acc = emit_wgmma(N, acc, desc_a, desc_b, /*scale_d*/ c > 0);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
@@ -1009,7 +1017,8 @@ class RewriteLoadsAs32Bit : public IRMutator {
 };
 
 llvm::Value *CodeGen_PTX_Dev::build_wgmma_descriptor(const std::string &buffer, Type elem_type,
-                                                    const Expr &tile_origin, int lbo_bytes, int sbo_bytes) {
+                                                    const Expr &tile_origin, int lbo_bytes, int sbo_bytes,
+                                                    int swizzle_bytes) {
     // Pointer to the operand tile origin. The shared base is null in addrspace(3)
     // (see visit(Allocate)), so the addrspace(3) pointer's integer value IS the
     // shared-window byte offset of the tile -- exactly the descriptor's start
@@ -1038,8 +1047,23 @@ llvm::Value *CodeGen_PTX_Dev::build_wgmma_descriptor(const std::string &buffer, 
     };
     or_field((uint64_t)lbo_bytes, 16);
     or_field((uint64_t)sbo_bytes, 32);
-    // base offset (bits [49:52)) and swizzle (bits [62:64)) stay 0 for M0.
+    // Swizzle mode (bits [62:64)): 0 none / 1 128B / 2 64B / 3 32B. The operand's shared layout
+    // is the store_in/TMA swizzle, so the descriptor must read it with the matching mode (M5b).
+    int swz_mode = swizzle_bytes == 128 ? 1 : swizzle_bytes == 64 ? 2 :
+                   swizzle_bytes == 32  ? 3 : 0;
+    if (swz_mode) {
+        desc = builder->CreateOr(desc, llvm::ConstantInt::get(i64_t, (uint64_t)swz_mode << 62));
+    }
     return desc;
+}
+
+int CodeGen_PTX_Dev::operand_swizzle_bytes(const std::string &buffer) const {
+    auto it = shared_swizzles.find(buffer);
+    if (it == shared_swizzles.end()) {
+        return 0;
+    }
+    const SwizzleLayout &s = it->second.first;
+    return s.defined() ? (1 << (s.bits + 4)) : 0;  // bits 1/2/3 -> 32/64/128 B
 }
 
 llvm::Value *CodeGen_PTX_Dev::emit_wgmma(int n, llvm::Value *acc, llvm::Value *desc_a,
