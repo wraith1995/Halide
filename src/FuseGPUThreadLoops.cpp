@@ -2788,23 +2788,34 @@ class LowerAsyncCompletions : public IRMutator {
 // and fusegpu_rearch_plan.md C.3/C.4a/M4.
 class InjectTmaCopies : public IRMutator {
     std::set<std::string> shared_allocs;  // names allocated in GPUShared in scope
+    std::map<std::string, SwizzleLayout> shared_swizzle;  // store_in swizzle per shared alloc
     // Tensor-map lets to wrap around the current gpu_block (host scope -> kernel arg).
     struct MapLet {
         std::string var;    // tensor-map variable name (referenced by tma_load_2d)
         std::string src;    // global source buffer name (its .buffer is the descriptor input)
         Expr box0, box1;    // tile inner/outer extents (descriptor box)
+        int swizzle;        // shared swizzle in bytes (0/32/64/128) -- must match the wgmma descriptor
     };
     std::vector<MapLet> pending_maps;
     using IRMutator::visit;
+
+    // The shared swizzle in BYTES (0/32/64/128) the tensor map must apply so its shared layout
+    // matches the consumer's store_in swizzle (and, for a wgmma operand, the descriptor swizzle).
+    // SwizzleLayout::bits is 1/2/3 for 32/64/128 B (resolve_swizzle); 0 = none.
+    static int swizzle_bytes(const SwizzleLayout &s) {
+        return s.defined() ? (1 << (s.bits + 4)) : 0;
+    }
 
     Stmt visit(const Allocate *op) override {
         bool shared = op->memory_type == MemoryType::GPUShared;
         if (shared) {
             shared_allocs.insert(op->name);
+            shared_swizzle[op->name] = op->swizzle;
         }
         Stmt s = IRMutator::visit(op);
         if (shared) {
             shared_allocs.erase(op->name);
+            shared_swizzle.erase(op->name);
         }
         return s;
     }
@@ -2820,10 +2831,11 @@ class InjectTmaCopies : public IRMutator {
         Stmt block = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy,
                                op->device_api, body, op->realization, op->warps_per_group);
         for (auto it = pending_maps.rbegin(); it != pending_maps.rend(); ++it) {
-            // box dims are descriptor parameters (inner contiguous, then outer); swizzle 0 = NONE.
+            // box dims are descriptor parameters (inner contiguous, then outer); swizzle in bytes
+            // (0 = NONE) = the consumer's store_in swizzle, so the TMA shared layout matches.
             Expr buf = Variable::make(type_of<halide_buffer_t *>(), it->src + ".buffer");
             Expr call = Call::make(UInt(64), "halide_cuda_tensor_map",
-                                   {buf, it->box0, it->box1, 0}, Call::Extern);
+                                   {buf, it->box0, it->box1, it->swizzle}, Call::Extern);
             block = LetStmt::make(it->var, call, block);
         }
         return block;
@@ -2884,7 +2896,8 @@ class InjectTmaCopies : public IRMutator {
 
         std::string mbar = op->name + ".tma_mbar";
         std::string tmap = op->name + ".tma_map";
-        pending_maps.push_back({tmap, tc.src, tc.box0, tc.box1});
+        int swz = swizzle_bytes(shared_swizzle[op->name]);
+        pending_maps.push_back({tmap, tc.src, tc.box0, tc.box1, swz});
 
         Expr mbar_ref = Load::make(UInt(64), mbar, 0, Buffer<>{}, Parameter{}, const_true(),
                                    ModulusRemainder{});
