@@ -597,8 +597,15 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         llvm::Value *addr = mbar_shared_addr(op->args[0]);
         llvm::Value *bytes = codegen(op->args[1]);
         llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t, i32_t}, false);
+        // Self-elect thread 0: the recognizer places this at block level (all threads), so the
+        // arm must fire ONCE -- a single expect_tx sets the whole tile's expected byte count.
+        // (Mirrors mbarrier_init's %tid self-guard; %tid.{x,y,z} always exist in PTX.)
         const char *asm_str =
-            "{ .reg .b64 tma_st; mbarrier.arrive.expect_tx.shared::cta.b64 tma_st, [$0], $1; }";
+            "{ .reg .pred tma_e; .reg .u32 tma_t0, tma_t1; .reg .b64 tma_st;\n"
+            "  mov.u32 tma_t0, %tid.x; mov.u32 tma_t1, %tid.y; or.b32 tma_t0, tma_t0, tma_t1;\n"
+            "  mov.u32 tma_t1, %tid.z; or.b32 tma_t0, tma_t0, tma_t1;\n"
+            "  setp.eq.u32 tma_e, tma_t0, 0;\n"
+            "  @tma_e mbarrier.arrive.expect_tx.shared::cta.b64 tma_st, [$0], $1; }";
         llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, asm_str, "r,r", /*hasSideEffects*/ true);
         builder->CreateCall(ia, {addr, bytes});
         value = ConstantInt::get(i32_t, 0);
@@ -620,9 +627,15 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         llvm::Value *mbar = mbar_shared_addr(op->args[4]);
         llvm::FunctionType *ft =
             llvm::FunctionType::get(void_t, {i32_t, i64_t, i32_t, i32_t, i32_t}, false);
+        // Self-elect thread 0: block-level placement (all threads) but the bulk copy must issue
+        // ONCE (the hardware generates all addresses). Mirrors mbarrier_init's %tid self-guard.
         const char *asm_str =
-            "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
-            " [$0], [$1, {$2, $3}], [$4];";
+            "{ .reg .pred tma_e; .reg .u32 tma_t0, tma_t1;\n"
+            "  mov.u32 tma_t0, %tid.x; mov.u32 tma_t1, %tid.y; or.b32 tma_t0, tma_t0, tma_t1;\n"
+            "  mov.u32 tma_t1, %tid.z; or.b32 tma_t0, tma_t0, tma_t1;\n"
+            "  setp.eq.u32 tma_e, tma_t0, 0;\n"
+            "  @tma_e cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+            ".mbarrier::complete_tx::bytes [$0], [$1, {$2, $3}], [$4]; }";
         llvm::InlineAsm *ia =
             llvm::InlineAsm::get(ft, asm_str, "r,l,r,r,r", /*hasSideEffects*/ true);
         builder->CreateCall(ia, {dst, map, x, y, mbar});

@@ -1438,6 +1438,19 @@ protected:
             }
             return op;
         }
+        if (op->is_intrinsic() && op->name == "tma_load_2d") {
+            // tma_load_2d WRITES its shared destination (arg 0, a Load carrier) -- the bulk copy
+            // lands the tile in shared. Register it as a shared STORE so the produce->consume scan
+            // GENERATES the CTA broadcast barrier (and lets the mbarrier args register as reads).
+            // Mirrors the mbarrier_init case. See fusegpu_rearch_plan.md C.4b/M4.
+            if (const Load *dst = op->args[0].as<Load>()) {
+                if (memory_type_for_name(dst->name) == MemoryType::GPUShared) {
+                    shared_stores.insert(dst->name);
+                    record_active(store_active, dst->name);
+                }
+            }
+            return op;
+        }
         return IRMutator::visit(op);
     }
 
@@ -2732,7 +2745,145 @@ class LowerAsyncCompletions : public IRMutator {
         return IRMutator::visit(op);
     }
 };
+
+// Recognize a block-scope tile copy (a cooperative global->shared staging fill) and rewrite
+// it to a TMA bulk-tensor load completed by an mbarrier (sm_90). See inject_tma_copies (.h)
+// and fusegpu_rearch_plan.md C.3/C.4a/M4.
+class InjectTmaCopies : public IRMutator {
+    std::set<std::string> shared_allocs;  // names allocated in GPUShared in scope
+    // Tensor-map lets to wrap around the current gpu_block (host scope -> kernel arg).
+    struct MapLet {
+        std::string var;    // tensor-map variable name (referenced by tma_load_2d)
+        std::string src;    // global source buffer name (its .buffer is the descriptor input)
+        Expr box0, box1;    // tile inner/outer extents (descriptor box)
+    };
+    std::vector<MapLet> pending_maps;
+    using IRMutator::visit;
+
+    Stmt visit(const Allocate *op) override {
+        bool shared = op->memory_type == MemoryType::GPUShared;
+        if (shared) {
+            shared_allocs.insert(op->name);
+        }
+        Stmt s = IRMutator::visit(op);
+        if (shared) {
+            shared_allocs.erase(op->name);
+        }
+        return s;
+    }
+
+    Stmt visit(const For *op) override {
+        if (!ends_with(op->name, gpu_block_name(0))) {
+            return IRMutator::visit(op);
+        }
+        // At the innermost gpu_block: rewrite any TMA-eligible producers inside, then wrap the
+        // block in one host tensor-map let per rewritten producer (closure -> kernel arg).
+        ScopedValue<std::vector<MapLet>> save(pending_maps, {});
+        Stmt body = mutate(op->body);
+        Stmt block = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy,
+                               op->device_api, body, op->realization, op->warps_per_group);
+        for (auto it = pending_maps.rbegin(); it != pending_maps.rend(); ++it) {
+            // box dims are descriptor parameters (inner contiguous, then outer); swizzle 0 = NONE.
+            Expr buf = Variable::make(type_of<halide_buffer_t *>(), it->src + ".buffer");
+            Expr call = Call::make(UInt(64), "halide_cuda_tensor_map",
+                                   {buf, it->box0, it->box1, 0}, Call::Extern);
+            block = LetStmt::make(it->var, call, block);
+        }
+        return block;
+    }
+
+    // Match `for (m) { for (k) { As[dst] = Src[src] } }`: a 2D tile copy, inner loop contiguous.
+    // Returns true + fills the fields on a match.
+    struct TileCopy {
+        std::string dst, src;        // shared dst buffer, global src buffer
+        Expr mmin, kmin, box1, box0; // outer (M) min/extent, inner (K) min/extent
+        Type elem;                   // element type of the copy
+    };
+    static bool match_tile_copy(const Stmt &produce_body, const std::string &name, TileCopy *tc) {
+        const For *mo = produce_body.as<For>();
+        if (!mo) {
+            return false;
+        }
+        const For *ki = mo->body.as<For>();
+        if (!ki) {
+            return false;
+        }
+        const Store *st = ki->body.as<Store>();
+        if (!st || st->name != name) {
+            return false;
+        }
+        const Load *ld = st->value.as<Load>();  // direct copy (no cast): As(k,m) = Src(k,m)
+        if (!ld) {
+            return false;
+        }
+        // Inner/outer loop vars must actually index the copy (a real 2D tile).
+        if (!expr_uses_var(ld->index, ki->name) || !expr_uses_var(ld->index, mo->name)) {
+            return false;
+        }
+        tc->dst = name;
+        tc->src = ld->name;
+        tc->mmin = mo->min;
+        tc->box1 = mo->extent();
+        tc->kmin = ki->min;
+        tc->box0 = ki->extent();
+        tc->elem = st->value.type();
+        return true;
+    }
+
+    Stmt visit(const ProducerConsumer *op) override {
+        if (!op->is_producer || !shared_allocs.count(op->name)) {
+            return IRMutator::visit(op);
+        }
+        TileCopy tc;
+        if (!match_tile_copy(op->body, op->name, &tc)) {
+            return IRMutator::visit(op);
+        }
+        // Tile coords are element offsets from the source buffer's origin (its device ptr).
+        Expr min0 = Variable::make(Int(32), tc.src + ".min.0");
+        Expr min1 = Variable::make(Int(32), tc.src + ".min.1");
+        Expr coordX = simplify(tc.kmin - min0);  // inner (dim 0, contiguous)
+        Expr coordY = simplify(tc.mmin - min1);  // outer (dim 1)
+        Expr bytes = simplify(tc.box0 * tc.box1 * (tc.elem.bits() / 8));
+
+        std::string mbar = op->name + ".tma_mbar";
+        std::string tmap = op->name + ".tma_map";
+        pending_maps.push_back({tmap, tc.src, tc.box0, tc.box1});
+
+        Expr mbar_ref = Load::make(UInt(64), mbar, 0, Buffer<>{}, Parameter{}, const_true(),
+                                   ModulusRemainder{});
+        Expr dst_ref = Load::make(tc.elem, tc.dst, 0, Buffer<>{}, Parameter{}, const_true(),
+                                  ModulusRemainder{});
+        Expr map_var = Variable::make(UInt(64), tmap);
+
+        // Single-slot mbarrier, one expected arrive (the elected thread's expect_tx). The TMA
+        // intrinsics self-elect thread 0 in codegen, so these run block-level (no IR thread guard);
+        // InjectThreadBarriers GENERATES the init->use + produce->consume Block barriers (mbarrier_init
+        // and tma_load_2d both register as shared stores).
+        Stmt init = Evaluate::make(Call::make(Int(32), "mbarrier_init",
+                                              {mbar_ref, Expr(1), Expr(1)}, Call::Intrinsic));
+        Stmt issue = Evaluate::make(Call::make(Int(32), Call::async_issue,
+                                               {Expr((int)CompletionKind::CpAsyncBulk), mbar_ref, bytes},
+                                               Call::Intrinsic));
+        Stmt load = Evaluate::make(Call::make(Int(32), "tma_load_2d",
+                                              {dst_ref, map_var, coordX, coordY, mbar_ref},
+                                              Call::Intrinsic));
+        Stmt wait = Evaluate::make(Call::make(Int(32), Call::async_wait,
+                                              {Expr((int)CompletionKind::CpAsyncBulk),
+                                               Expr((int)SyncScope::Block), mbar_ref, Expr(0)},
+                                              Call::Intrinsic));
+        Stmt seq = Block::make({init, issue, load, wait});
+        seq = Allocate::make(mbar, UInt(64), MemoryType::GPUShared, {Expr(1)}, const_true(), seq);
+        return ProducerConsumer::make(op->name, true, seq);
+    }
+};
 }  // namespace
+
+Stmt inject_tma_copies(Stmt s, const Target &t) {
+    if (!t.has_feature(Target::CUDACapability90) || get_env_variable("HL_WG_TMA") != "1") {
+        return s;
+    }
+    return InjectTmaCopies()(s);
+}
 
 Stmt lower_async_completions(Stmt s, const Target &t) {
     // The mbarrier completion mechanism is sm_90+. On other targets, async completions fall back to

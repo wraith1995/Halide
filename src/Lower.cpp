@@ -375,6 +375,15 @@ void lower_impl(const vector<Function> &output_funcs,
     }
 
     if (t.has_gpu_feature()) {
+        // Recognize block-scope tile copies (store_in(GPUShared)) and rewrite them to TMA bulk
+        // loads (sm_90, HL_WG_TMA). Emits async_issue/async_wait markers + a host tensor-map let;
+        // the markers are lowered just below, the produce->consume barrier by fuse. NFC unless gated.
+        debug(1) << "Recognizing TMA tile copies...\n";
+        s = inject_tma_copies(s, t);
+        log("Lowering after recognizing TMA tile copies:", s);
+    }
+
+    if (t.has_gpu_feature()) {
         // Lower async-completion requirements (async_issue/async_wait) BEFORE fuse_gpu_thread_loops,
         // so any mbarrier the selector materializes is seen by InjectThreadBarriers (which generates
         // the transitive init->use visibility barrier). NFC until a recognizer emits the markers.
