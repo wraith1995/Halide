@@ -327,6 +327,13 @@ class RewriteWarpGroupTiles : public IRMutator {
     // core-matrix tiling. Empty unless HL_WGMMA_AUTOLAYOUT is set (prototype gate).
     std::map<std::string, std::pair<int, int>> natural_operands;
 
+    // M5b: natural operands stored with a store_in swizzle (TMA-fillable). For these the swizzle
+    // IS the wgmma layout, so the producer store is NOT core-matrix re-encoded (the F7 hook applies
+    // the swizzle at codegen), the descriptor base is the NATURAL tile origin (no reencode), the
+    // per-chunk K stride is the natural K_TILE advance (16), and the descriptor carries the swizzle
+    // mode. See fusegpu_rearch_plan.md M5b.
+    std::set<std::string> swizzled_operands;
+
     // Mainloop 1b (HL_WGMMA_KCARRY, Option A): buffers that are wgmma REGISTER accumulators
     // (the `prod` Func). Their wgmma reduce store accumulates into the carried D fragment
     // (accum8, scaleD=1) instead of overwriting; their copy-out (`C = prod`) is the epilogue
@@ -479,7 +486,7 @@ class RewriteWarpGroupTiles : public IRMutator {
         // descriptor reads it correctly -- no extra staging stage (the producer writes
         // core-matrix directly). Only the index changes; the value (the global load) is kept.
         auto it = natural_operands.find(op->name);
-        if (it != natural_operands.end()) {
+        if (it != natural_operands.end() && !swizzled_operands.count(op->name)) {
             Expr new_idx = core_matrix_reencode(op->index, it->second.first, it->second.second);
             if (getenv("HL_DEBUG_WGMMA")) {
                 debug(0) << "[wgtile] auto-layout producer " << op->name
@@ -618,10 +625,15 @@ class RewriteWarpGroupTiles : public IRMutator {
         // physical core-matrix slot (row 64 -> element 1024 via (role/8)*128). reencode's slot split
         // also preserves the ring (ko%n)*slot term (dense slot == core-matrix slot). The hand-matched
         // path already gathers core-matrix, so its operands are not in natural_operands (left as-is).
-        if (auto it = natural_operands.find(a.buffer); it != natural_operands.end()) {
+        // Swizzled operands keep the NATURAL tile origin (the swizzle, not a reencode, is the
+        // layout; the descriptor's swizzle mode tells the HW). Non-swizzled natural operands are
+        // re-encoded to the dense core-matrix layout the no-swizzle descriptor reads.
+        if (auto it = natural_operands.find(a.buffer);
+            it != natural_operands.end() && !swizzled_operands.count(a.buffer)) {
             base_a = core_matrix_reencode(base_a, it->second.first, it->second.second);
         }
-        if (auto it = natural_operands.find(b.buffer); it != natural_operands.end()) {
+        if (auto it = natural_operands.find(b.buffer);
+            it != natural_operands.end() && !swizzled_operands.count(b.buffer)) {
             base_b = core_matrix_reencode(base_b, it->second.first, it->second.second);
         }
         // Per-chunk descriptor stride (advancing one K_TILE=16 step). For an AUTO-LAYOUT
@@ -633,6 +645,12 @@ class RewriteWarpGroupTiles : public IRMutator {
         auto chunk_stride = [&](const Operand &o, const Expr &base) -> Expr {
             if (n_chunks <= 1) {
                 return Expr(0);
+            }
+            if (swizzled_operands.count(o.buffer)) {
+                // Natural K-contiguous swizzled layout: advance one K_TILE step = K_TILE elements
+                // (the HW applies the swizzle to the logical address). Matches fast.cu's
+                // &sA[k_it*WGMMA_K]. See M5b.
+                return Expr(K_TILE);
             }
             if (natural_operands.count(o.buffer)) {
                 return Expr(cm_chunk_stride);
@@ -749,6 +767,19 @@ public:
         CollectNaturalOperands c;
         s.accept(&c);
         natural_operands = c.layouts;
+        // Record natural operands whose shared allocation carries a store_in swizzle (M5b).
+        struct CollectSwizzled : public IRVisitor {
+            using IRVisitor::visit;
+            std::set<std::string> names;
+            void visit(const Allocate *op) override {
+                if (op->memory_type == MemoryType::GPUShared && op->swizzle.defined()) {
+                    names.insert(op->name);
+                }
+                IRVisitor::visit(op);
+            }
+        } cs;
+        s.accept(&cs);
+        swizzled_operands = std::move(cs.names);
         // GLOBAL accumulator pre-scan: a buffer targeted by a wgmma-shaped reduce store is a
         // register accumulator; record its N (= 2 x #frag stores in its one group). Lets the init
         // store (`prod = 0`, a SEPARATE stage nest with no reduce) be rewritten to the clean base.

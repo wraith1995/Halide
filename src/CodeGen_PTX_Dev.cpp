@@ -1045,12 +1045,20 @@ llvm::Value *CodeGen_PTX_Dev::build_wgmma_descriptor(const std::string &buffer, 
             desc = builder->CreateOr(desc, llvm::ConstantInt::get(i64_t, f));
         }
     };
-    or_field((uint64_t)lbo_bytes, 16);
-    or_field((uint64_t)sbo_bytes, 32);
-    // Swizzle mode (bits [62:64)): 0 none / 1 128B / 2 64B / 3 32B. The operand's shared layout
-    // is the store_in/TMA swizzle, so the descriptor must read it with the matching mode (M5b).
+    // Swizzle mode (bits [62:64)): 0 none / 1 128B / 2 64B / 3 32B (CUTLASS LayoutType). The
+    // operand's shared layout is the store_in/TMA swizzle, so the descriptor reads it with the
+    // matching mode (M5b). For a swizzled descriptor the LBO/SBO are the canonical swizzle-atom
+    // values, NOT the dense core-matrix ones the caller passes -- the hardware derives the core
+    // matrices from (start, swizzle). 128B K-major f16: LBO=16, SBO=1024 (fast.cu matmul_3
+    // make_smem_desc; the address is the per-chunk LOGICAL tile offset, swizzle applied by HW).
     int swz_mode = swizzle_bytes == 128 ? 1 : swizzle_bytes == 64 ? 2 :
                    swizzle_bytes == 32  ? 3 : 0;
+    if (swz_mode) {
+        lbo_bytes = 16;
+        sbo_bytes = swizzle_bytes == 128 ? 1024 : swizzle_bytes == 64 ? 512 : 256;
+    }
+    or_field((uint64_t)lbo_bytes, 16);
+    or_field((uint64_t)sbo_bytes, 32);
     if (swz_mode) {
         desc = builder->CreateOr(desc, llvm::ConstantInt::get(i64_t, (uint64_t)swz_mode << 62));
     }
