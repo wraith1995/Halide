@@ -2863,23 +2863,32 @@ class InjectTmaCopies : public IRMutator {
         return block;
     }
 
-    // Match `for (m) { for (k) { As[dst] = Src[src] } }`: a 2D tile copy, inner loop contiguous.
-    // Returns true + fills the fields on a match.
+    // Match `for (a) { for (b) { As[dst] = Src[src] } }`: a 2D tile copy. The TMA descriptor's
+    // dim 0 is the CONTIGUOUS (unit-stride) axis -- which is NOT necessarily the inner loop: a
+    // wgmma A operand is stored M-outer / K-contiguous, so the K loop (the contiguous one) is the
+    // OUTER loop in the natural nest. We therefore key box0/coordX on whichever loop strides the
+    // source with stride 1, not on loop nesting. Returns true + fills the fields on a match.
     struct TileCopy {
         std::string dst, src;        // shared dst buffer, global src buffer
-        Expr mmin, kmin, box1, box0; // outer (M) min/extent, inner (K) min/extent
+        Expr box0, box1;             // contiguous (dim 0) tile extent, then outer (dim 1) extent
+        Expr coordX, coordY;         // tile origin: contiguous-axis coord (c0), then outer-axis (c1)
         Type elem;                   // element type of the copy
     };
+    // Source stride of `var` in `index` (the change in index per unit step of var); a unit result
+    // marks the contiguous axis.
+    static Expr loop_source_stride(const std::string &var, const Expr &index) {
+        return simplify(substitute(var, Variable::make(Int(32), var) + 1, index) - index);
+    }
     static bool match_tile_copy(const Stmt &produce_body, const std::string &name, TileCopy *tc) {
-        const For *mo = produce_body.as<For>();
-        if (!mo) {
+        const For *lo = produce_body.as<For>();
+        if (!lo) {
             return false;
         }
-        const For *ki = mo->body.as<For>();
-        if (!ki) {
+        const For *li = lo->body.as<For>();
+        if (!li) {
             return false;
         }
-        const Store *st = ki->body.as<Store>();
+        const Store *st = li->body.as<Store>();
         if (!st || st->name != name) {
             return false;
         }
@@ -2887,17 +2896,53 @@ class InjectTmaCopies : public IRMutator {
         if (!ld) {
             return false;
         }
-        // Inner/outer loop vars must actually index the copy (a real 2D tile).
-        if (!expr_uses_var(ld->index, ki->name) || !expr_uses_var(ld->index, mo->name)) {
+        // Both loop vars must actually index the copy (a real 2D tile).
+        if (!expr_uses_var(ld->index, li->name) || !expr_uses_var(ld->index, lo->name)) {
             return false;
         }
+        // The contiguous (unit-stride) loop becomes the descriptor's dim 0; the other is dim 1.
+        const For *contig = nullptr, *outer = nullptr;
+        if (is_const_one(loop_source_stride(li->name, ld->index))) {
+            contig = li;
+            outer = lo;
+        } else if (is_const_one(loop_source_stride(lo->name, ld->index))) {
+            contig = lo;
+            outer = li;
+        } else {
+            return false;  // no unit-stride axis -> not a TMA-shaped tile copy
+        }
+        // Which source dim is contiguous: its min appears with coefficient 1 in the index's
+        // constant (min-subtraction) term `-(sum_d src.min.d * src.stride.d)`.
+        Expr base = simplify(substitute({{li->name, Expr(0)}, {lo->name, Expr(0)}}, ld->index));
+        int cdim = 0;
+        for (int d = 0; d < 2; d++) {
+            std::string md = ld->name + ".min." + std::to_string(d);
+            if (!expr_uses_var(base, md)) {
+                continue;
+            }
+            Expr coeff = simplify(substitute(md, Expr(1), base) - substitute(md, Expr(0), base));
+            if (auto c = as_const_int(coeff)) {
+                if (*c == -1 || *c == 1) {
+                    cdim = d;
+                }
+            }
+        }
+        int odim = 1 - cdim;
+        Expr cmin = Variable::make(Int(32), ld->name + ".min." + std::to_string(cdim));
+        Expr omin = Variable::make(Int(32), ld->name + ".min." + std::to_string(odim));
         tc->dst = name;
         tc->src = ld->name;
-        tc->mmin = mo->min;
-        tc->box1 = mo->extent();
-        tc->kmin = ki->min;
-        tc->box0 = ki->extent();
+        tc->box0 = contig->extent();
+        tc->box1 = outer->extent();
+        tc->coordX = simplify(contig->min - cmin);  // contiguous-axis origin (c0)
+        tc->coordY = simplify(outer->min - omin);   // outer-axis origin (c1)
         tc->elem = st->value.type();
+        if (get_env_variable("HL_TMA_DEBUG") == "1") {
+            debug(0) << "TMA_DEBUG name=" << name << " src=" << ld->name
+                     << " contig_loop=" << contig->name << " cdim=" << cdim
+                     << "\n  box0(contig)=" << tc->box0 << " box1(outer)=" << tc->box1
+                     << "\n  coordX(c0)=" << tc->coordX << " coordY(c1)=" << tc->coordY << "\n";
+        }
         return true;
     }
 
@@ -2909,11 +2954,10 @@ class InjectTmaCopies : public IRMutator {
         if (!match_tile_copy(op->body, op->name, &tc)) {
             return IRMutator::visit(op);
         }
-        // Tile coords are element offsets from the source buffer's origin (its device ptr).
-        Expr min0 = Variable::make(Int(32), tc.src + ".min.0");
-        Expr min1 = Variable::make(Int(32), tc.src + ".min.1");
-        Expr coordX = simplify(tc.kmin - min0);  // inner (dim 0, contiguous)
-        Expr coordY = simplify(tc.mmin - min1);  // outer (dim 1)
+        // Tile coords (element offsets from the source buffer's origin) are computed contiguity-
+        // aware in match_tile_copy: coordX = dim-0 (contiguous) axis, coordY = dim-1 (outer) axis.
+        Expr coordX = tc.coordX;
+        Expr coordY = tc.coordY;
         Expr bytes = simplify(tc.box0 * tc.box1 * (tc.elem.bits() / 8));
 
         std::string mbar = op->name + ".tma_mbar";

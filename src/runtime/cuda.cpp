@@ -1231,9 +1231,13 @@ extern "C" WEAK uint64_t halide_cuda_tensor_map(void *user_context, halide_buffe
         return 0;
     }
     int elem_bytes = buf->type.bits / 8;
-    // 2D operand: dim 0 = inner (contiguous), dim 1 = outer.
-    uint64_t dim0 = (uint64_t)buf->dim[0].extent;
-    uint64_t dim1 = (uint64_t)buf->dim[1].extent;
+    // The TMA descriptor's dim 0 must be the CONTIGUOUS (unit-stride) operand axis; box0 (from the
+    // recognizer) is already keyed on that axis. The Halide buffer's contiguous axis is whichever
+    // dim has stride 1 -- usually dim 0, but a wgmma A operand is M-outer / K-contiguous (dim 1).
+    int cdim = (buf->dim[1].stride == 1 && buf->dim[0].stride != 1) ? 1 : 0;
+    int odim = 1 - cdim;
+    uint64_t dim0 = (uint64_t)buf->dim[cdim].extent;   // contiguous axis extent
+    uint64_t dim1 = (uint64_t)buf->dim[odim].extent;   // outer axis extent
     uint64_t out = 0;
     int err = halide_cuda_create_tensor_map(user_context, (uint64_t)buf->device, dtype, elem_bytes,
                                             dim0, dim1, (uint32_t)box0, (uint32_t)box1, swizzle, &out);
