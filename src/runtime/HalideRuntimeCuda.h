@@ -37,6 +37,13 @@ extern int halide_cuda_run(void *user_context,
 extern void halide_cuda_finalize_kernels(void *user_context, void *state_ptr);
 // @}
 
+/** Build (and cache) a CUtensorMap descriptor for a device-resident 2D operand and
+ *  return a device pointer to it (for cp.async.bulk.tensor / TMA). box0/box1 are the
+ *  tile dimensions (inner contiguous, then outer); swizzle selects the shared swizzle
+ *  mode (0 = none). Emitted by the TMA tile-copy recognizer; not for direct client use. */
+extern uint64_t halide_cuda_tensor_map(void *user_context, struct halide_buffer_t *buf,
+                                       int box0, int box1, int swizzle);
+
 /** Set the underlying cuda device pointer for a buffer. The device
  * pointer should be allocated using cuMemAlloc or similar and must
  * have an extent large enough to cover that specified by the
