@@ -793,6 +793,29 @@ protected:
 public:
     Stmt rewrap_block(Stmt s, const ExtractBlockSize &bs) {
 
+        // Shared buffers that are the destination of a TMA bulk load (cp.async.bulk.tensor)
+        // need a 128-byte-aligned base; round their packed offset up below. Empty unless the
+        // TMA recognizer fired (HL_WG_TMA), so this is NFC for every other path.
+        std::set<std::string> tma_targets;
+        {
+            class FindTmaDsts : public IRVisitor {
+                using IRVisitor::visit;
+                void visit(const Call *op) override {
+                    if (op->is_intrinsic() && op->name == "tma_load_2d" && !op->args.empty()) {
+                        if (const Load *l = op->args[0].as<Load>()) {
+                            names.insert(l->name);
+                        }
+                    }
+                    IRVisitor::visit(op);
+                }
+
+            public:
+                std::set<std::string> names;
+            } f;
+            s.accept(&f);
+            tma_targets = std::move(f.names);
+        }
+
         // Combine the allocations into groups that have disjoint
         // lifetimes, and then cluster the groups according to which
         // ones can share a single allocation. For cuda, opencl, and
@@ -982,6 +1005,20 @@ public:
                         // Base address for shared memory is zero
                         offset = 0;
                     }
+                }
+
+                // A TMA bulk-load destination must start on a 128-byte boundary
+                // (cp.async.bulk.tensor); round this group's offset up. The next group builds
+                // off the bumped offset, so the cluster stays packed after the gap.
+                bool is_tma = false;
+                for (const SharedAllocation &a : cluster[i].group) {
+                    if (tma_targets.count(a.name)) {
+                        is_tma = true;
+                    }
+                }
+                if (is_tma) {
+                    int align_units = std::max(1, 128 / widest_type.bytes());
+                    offset = simplify(((offset + (align_units - 1)) / align_units) * align_units);
                 }
 
                 s = LetStmt::make(group_offset.as<Variable>()->name, simplify(offset), s);
