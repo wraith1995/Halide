@@ -845,8 +845,19 @@ public:
                  });
 
             for (const auto &alloc : mem_allocs) {
-                Type t = may_merge_allocs_of_different_type ? UInt(8) : alloc.widest_type;
-                string disc = alloc.swizzle.defined() ? alloc.name : string();
+                // Swizzled allocations are kept as their own (uncoalesced) GROUP, but allocations
+                // with the SAME swizzle share one CLUSTER (disc keyed on the swizzle params, not the
+                // name): the existing per-group cumulative offsets then give them distinct,
+                // non-overlapping bases (two swizzled operands As/Bs no longer collide at offset 0),
+                // and the cluster keeps its element type (not the UInt8 merge) so the swizzle-hook
+                // params stay in element units. The group-offset alignment below rounds each group to
+                // the swizzle super-period so swizzle(off+i) == off+swizzle(i) stays phase-correct.
+                bool swz = alloc.swizzle.defined();
+                Type t = (swz || !may_merge_allocs_of_different_type) ? alloc.widest_type : UInt(8);
+                string disc = swz ? ("swz_" + std::to_string(alloc.swizzle.bits) + "_" +
+                                     std::to_string(alloc.swizzle.base) + "_" +
+                                     std::to_string(alloc.swizzle.shift))
+                                  : string();
                 std::tuple<MemoryType, Type, string> key{alloc.memory_type, t, disc};
                 clustered_allocs[key].push_back(alloc);
             }
@@ -1011,14 +1022,24 @@ public:
                 // must start on a 128-byte boundary: TMA writes / the wgmma descriptor's swizzle
                 // mode reads relative to the tile base, and base_offset=0 assumes swizzle-atom
                 // alignment. Round this group's offset up; the next group packs after the gap.
-                bool needs_align = cluster[i].swizzle.defined();
+                bool is_tma = false;
                 for (const SharedAllocation &a : cluster[i].group) {
                     if (tma_targets.count(a.name)) {
-                        needs_align = true;
+                        is_tma = true;
                     }
                 }
-                if (needs_align) {
-                    int align_units = std::max(1, 128 / widest_type.bytes());
+                if (cluster[i].swizzle.defined() || is_tma) {
+                    // Swizzled groups align to the swizzle SUPER-period (2^(shift+bits) elements of
+                    // the swizzle's own type): only a base that is a multiple of it leaves the XOR
+                    // field of every access undisturbed, so swizzle(off+i) == off + swizzle(i). A
+                    // plain TMA destination just needs 128B. (offset is in widest_type units.)
+                    int align_units;
+                    if (cluster[i].swizzle.defined()) {
+                        const SwizzleLayout &s = cluster[i].swizzle;
+                        align_units = 1 << (s.shift + s.bits);
+                    } else {
+                        align_units = std::max(1, 128 / widest_type.bytes());
+                    }
                     offset = simplify(((offset + (align_units - 1)) / align_units) * align_units);
                 }
 
