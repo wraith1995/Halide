@@ -1007,16 +1007,17 @@ public:
                     }
                 }
 
-                // A TMA bulk-load destination must start on a 128-byte boundary
-                // (cp.async.bulk.tensor); round this group's offset up. The next group builds
-                // off the bumped offset, so the cluster stays packed after the gap.
-                bool is_tma = false;
+                // A TMA bulk-load destination (cp.async.bulk.tensor) OR a swizzled wgmma operand
+                // must start on a 128-byte boundary: TMA writes / the wgmma descriptor's swizzle
+                // mode reads relative to the tile base, and base_offset=0 assumes swizzle-atom
+                // alignment. Round this group's offset up; the next group packs after the gap.
+                bool needs_align = cluster[i].swizzle.defined();
                 for (const SharedAllocation &a : cluster[i].group) {
                     if (tma_targets.count(a.name)) {
-                        is_tma = true;
+                        needs_align = true;
                     }
                 }
-                if (is_tma) {
+                if (needs_align) {
                     int align_units = std::max(1, 128 / widest_type.bytes());
                     offset = simplify(((offset + (align_units - 1)) / align_units) * align_units);
                 }
