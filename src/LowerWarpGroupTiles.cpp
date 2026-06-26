@@ -413,22 +413,20 @@ class RewriteWarpGroupTiles : public IRMutator {
         return tile_origin_at_lane(base, 0);
     }
 
-    // The wgmma register accumulator (`prod`) is a per-thread, per-group FLAT register array: warp
-    // group g's (warps_per_group*32) threads each own n/2 contiguous registers. Rebuild a CLEAN
-    // base = group*(threads_per_group*frags) + thread*frags instead of inheriting prod's SCHEDULED
-    // storage index. With ONE consumer group the schedule's fuse-first index already equals
-    // thread*frags (NFC). With TWO groups the explicit cmi-M-split (the named-group_var geometry the
-    // operand/epilogue group-awareness needs) SCRAMBLES prod's register layout AND leaves a cmi
-    // storage-base symbol (`prod.s1.m.cmi.s`) unbound -> host codegen fails. group_var peels to the
-    // branch index (0/1) and thread_var to group-local coords, so this base separates the groups'
-    // register blocks with no collision. group_var empty / extent-1 => group term 0 => NFC.
-    Expr register_base(int n) {
-        int frags = n / 2;
-        Expr base = Variable::make(Int(32), thread_var) * frags;
-        if (!group_var.empty() && warps_per_group > 0) {
-            base = base + Variable::make(Int(32), group_var) * (warps_per_group * 32 * frags);
-        }
-        return base;
+    // The wgmma register accumulator (`prod`) is store_in(Register) => a PER-THREAD allocation: each
+    // thread owns its own n/2 f32 fragment, indexed by the unrolled frag # alone (0..n/2-1). We do NOT
+    // add a thread_var*frags / group_var*(...) offset: prod is already per-thread, so that offset is
+    // redundant AND it makes the index DYNAMIC (thread_id_x) -> LLVM cannot mem2reg-promote the alloca
+    // -> it lands in local memory (a block-wide-sized 64KB/thread stack frame, the matmul_3 PTX-diff
+    // gap; the reference keeps d[] in registers via static-index access). A 0 base => the three prod
+    // accesses (init `prod=0`, the wgmma store, the C=prod epilogue load) all use the SAME static
+    // frag index, so they agree per-thread and SROA promotes the fragment to registers. This still
+    // avoids prod's SCRAMBLED scheduled storage index (the unbound `prod.s1.m.cmi.s` symbol from the
+    // explicit cmi-M-split). Two groups don't collide: they are DIFFERENT threads, hence different
+    // per-thread allocations -- no block-flat index needed. (See visit(Allocate): the prod allocation
+    // is also resized to n/2 so the per-thread alloca is the fragment, not the block-wide tile.)
+    Expr register_base(int) {
+        return Expr(0);
     }
 
     Stmt visit(const For *op) override {
