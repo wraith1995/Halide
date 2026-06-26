@@ -2203,6 +2203,34 @@ Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
                      Partition::Never, device_api, body, GPUVectorScope::Register, -1);
 }
 
+// Loop-fuse two co-resident producer branches placed on the same warp. Each is `lets...; For(ko, ...)`
+// over the SAME ring loop. INTERLEAVE them -> `lets_a; lets_b; For(ko, ..., {body_a; body_b})` so one
+// elected lane issues BOTH operands' transfers PER ko iteration (the matmul_4 shape). Sequential
+// concatenation (`{For(ko){A}; For(ko){B}}`) instead deadlocks the empty/WAR edge at ring wrap: the A
+// loop's empty-wait at ko=Q blocks because the consumer can't free slot 0 without B[0], which the B loop
+// hasn't produced yet. Falls back to Block (sequential) if the two branches aren't matching For loops.
+Stmt fuse_coresident_producers(const Stmt &a, const Stmt &b) {
+    std::vector<const LetStmt *> a_lets, b_lets;
+    Stmt sa = a, sb = b;
+    while (const LetStmt *l = sa.as<LetStmt>()) { a_lets.push_back(l); sa = l->body; }
+    while (const LetStmt *l = sb.as<LetStmt>()) { b_lets.push_back(l); sb = l->body; }
+    const For *fa = sa.as<For>();
+    const For *fb = sb.as<For>();
+    if (fa && fb && fa->name == fb->name && equal(fa->min, fb->min) && equal(fa->max, fb->max)) {
+        Stmt merged = For::make(fa->name, fa->min, fa->max, fa->for_type, fa->partition_policy,
+                                fa->device_api, Block::make(fa->body, fb->body),
+                                fa->realization, fa->warps_per_group);
+        for (auto it = b_lets.rbegin(); it != b_lets.rend(); ++it) {
+            merged = LetStmt::make((*it)->name, (*it)->value, merged);
+        }
+        for (auto it = a_lets.rbegin(); it != a_lets.rend(); ++it) {
+            merged = LetStmt::make((*it)->name, (*it)->value, merged);
+        }
+        return merged;
+    }
+    return Block::make(a, b);
+}
+
 // Convert a device warp-spec Fork into a flat 1D thread partition by collecting its
 // branches and handing them to partition_warp_groups (the source-agnostic core).
 class FlattenWarpSpecForks : public IRMutator {
@@ -2337,7 +2365,7 @@ private:
                 bool collective = max_warps_per_group(branches[i]) > 0;
                 if (!collective && gidx[i] != UNSET && fused_at.count(gidx[i])) {
                     int j = fused_at[gidx[i]];
-                    nb[j] = Block::make(nb[j], branches[i]);
+                    nb[j] = fuse_coresident_producers(nb[j], branches[i]);
                     if (nrb[j].first < 0) {
                         nrb[j] = rbudget[i];  // the fused producer inherits a register budget
                     }
