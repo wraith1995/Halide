@@ -260,6 +260,46 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
 
     module->getOrInsertNamedMetadata("nvvm.annotations")->addOperand(md_node);
 
+    // Emit `.maxntid` (launch bounds) from the kernel's GPU-thread loop extents. Without it ptxas
+    // assumes the kernel might launch with up to 1024 threads/block and budgets only ~64 registers/
+    // thread, spilling the wgmma D accumulator to local memory (the matmul_3 PTX diff: 32KB local
+    // depot + st.local in the steady loop, where the reference's __launch_bounds__ keeps `d[]` in
+    // registers). Telling ptxas the real (smaller) block size lets it spend up to 65536/N registers/
+    // thread instead. Only emitted when all thread extents are compile-time constants.
+    {
+        class ThreadExtents : public IRVisitor {
+            using IRVisitor::visit;
+            void visit(const For *op) override {
+                for (int i = 0; i < 3; i++) {
+                    if (ends_with(op->name, gpu_thread_name(i))) {
+                        if (auto e = as_const_int(simplify(op->extent()))) {
+                            // A dimension can appear on several fused thread loops; the block extent
+                            // is the max over them (they share the same %tid.i).
+                            extent[i] = std::max(extent[i], (int64_t)*e);
+                        } else {
+                            known[i] = false;
+                        }
+                    }
+                }
+                IRVisitor::visit(op);
+            }
+
+        public:
+            int64_t extent[3] = {1, 1, 1};
+            bool known[3] = {true, true, true};
+        } te;
+        stmt.accept(&te);
+        if (te.known[0] && te.known[1] && te.known[2]) {
+            // LLVM 21's NVPTX reads launch bounds from the `nvvm.maxntid` function attribute (the
+            // old nvvm.annotations "maxntidx" path is no longer honored). Value is the comma-joined
+            // x,y,z block dims; ptxas then budgets up to 65536/(x*y*z) registers/thread.
+            std::string v = std::to_string(te.extent[0]) + "," + std::to_string(te.extent[1]) +
+                            "," + std::to_string(te.extent[2]);
+            function->addFnAttr("nvvm.maxntid", v);
+            debug(2) << "PTX kernel " << name << " nvvm.maxntid = " << v << "\n";
+        }
+    }
+
     // Now verify the function is ok
     verifyFunction(*function);
 
