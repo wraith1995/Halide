@@ -2116,9 +2116,6 @@ Expr warp_group_lane_count(const Stmt &branch, int warp_size, int warps_per_grou
     if (warps_per_group_override > 0) {
         return Expr(warps_per_group_override * warp_size);  // explicit symmetric peel
     }
-    if (max_warps_per_group(branch) > 0) {
-        return Expr(max_warps_per_group(branch) * warp_size);  // collective: exactly its N warps
-    }
     ThreadExtents te;
     branch.accept(&te);
     Expr prod = 1;
@@ -2127,7 +2124,19 @@ Expr warp_group_lane_count(const Stmt &branch, int warp_size, int warps_per_grou
             prod = prod * te.extent[d];
         }
     }
-    return simplify(((simplify(prod) + (warp_size - 1)) / warp_size) * warp_size);
+    prod = simplify(prod);
+    if (int wpg = max_warps_per_group(branch); wpg > 0) {
+        // Collective branch (a warp-group scope, e.g. the wgmma consumer): its lane count is the FULL
+        // thread extent rounded up to whole warp groups. The full extent already includes the
+        // warp-group AXIS multiplicity -- an M-split consumer (R5's 128x256 = 2 m64n256 groups) is
+        // gpu_warps(wg=2)*gpu_threads(tx=128) = 256 lanes = 2 groups, NOT one. The old per-group
+        // shortcut (wpg*warp_size = 4*32 = 128) sized it as a SINGLE group, so partition_warp_groups
+        // gave the consumer only 128 lanes -> only group 0 ran -> rows 0-63 (the other M-half + the
+        // group's epilogue thread_id_y reconstruction were dropped). NFC for 1 group (extent == 128).
+        int g = wpg * warp_size;
+        return simplify(((prod + (g - 1)) / g) * g);
+    }
+    return simplify(((prod + (warp_size - 1)) / warp_size) * warp_size);
 }
 
 Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
@@ -2489,14 +2498,6 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         // Flat partition: only the producing + consuming groups' lanes are in range.
         Expr count = fork_fuse ? simplify(producer_threads[b.producer] + consumer_threads)
                                : thread_count;
-        // DIAGNOSTIC override for the multi-consumer empty-edge count topology (R5): the named-barrier
-        // count must EXACTLY equal the lanes that execute it (producer-wait + all-consumer-arrive).
-        // HL_WG_EMPTY_COUNT lets us sweep candidates on H100 without a rebuild while the exact arrival
-        // model is being pinned. Remove once R5's count is settled.
-        std::string ecov = get_env_variable("HL_WG_EMPTY_COUNT");
-        if (!ecov.empty()) {
-            count = Expr(std::atoi(ecov.c_str()));
-        }
         // Emit a WarpGroup-scope sync requirement (only the producing + consuming
         // groups rendezvous); LowerSyncRequirements lowers it to a partial named
         // barrier — or, at sm_90, an mbarrier — at the single sync seam. mode 0 =
