@@ -218,15 +218,26 @@ Expr ExecMap::block_lanes() const {
 }
 
 Expr ExecMap::elected_lane(const ActiveSet &a) const {
-    // Our GPU kernels are 1-D in threads (.thread_id_x; warp groups are contiguous thread_id_x
-    // ranges, and y/z thread axes are unused), so the first lane's hardware thread index is the
-    // thread_id_x axis's narrowed min. Whole block => 0 == the legacy global-tid==0 election.
-    for (const ExecAxis &ax : axes_) {
-        if (ends_with(ax.var, gpu_thread_name(0)) && ax.lane_weight == 1) {
-            return simplify(axis_interval(a, ax).min);
+    if (get_env_variable("HL_ELECT_DEBUG") == "1") {
+        std::cerr << "ELECT axes:";
+        for (const ExecAxis &ax : axes_) {
+            Interval iv = axis_interval(a, ax);
+            std::cerr << " {" << ax.var << " min=" << ax.min << " ext=" << ax.extent
+                      << " w=" << ax.lane_weight << " | active=[" << iv.min << "," << iv.max << "]}";
         }
+        std::cerr << "\n";
     }
-    return Expr(0);
+    // The hardware thread index of the region's first lane = its lane OFFSET from the block's
+    // first lane, summed over axes: (each axis's narrowed min - its base) * lane_weight. This is
+    // correct whether the warp-spec split narrowed a wide thread axis (weight 1) or a warp-group
+    // axis (weight = warps_per_group*warp_size), and ignores degenerate (ext-1) fused axes since
+    // they sit at their base. Whole block => every axis at its base => 0 (== legacy global-tid==0).
+    Expr lane = 0;
+    for (const ExecAxis &ax : axes_) {
+        Interval iv = axis_interval(a, ax);
+        lane = simplify(lane + (iv.min - ax.min) * ax.lane_weight);
+    }
+    return lane;
 }
 
 Expr ExecMap::count(const ActiveSet &a) const {
