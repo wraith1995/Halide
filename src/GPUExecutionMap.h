@@ -105,6 +105,13 @@ public:
     /** Both regions are the SAME single lane => Thread scope, NO barrier (program order). */
     bool same_single_lane(const ActiveSet &a, const ActiveSet &b) const;
 
+    /** The hardware thread index of the region's ELECTED (first) lane -- the one thread codegen
+     * should guard a single-thread op (TMA / mbarrier issue) on. = the thread axis's narrowed min;
+     * the whole-block region elects 0 (the legacy global-tid==0 election, hence NFC there). This is
+     * the modeled replacement for codegen's hardcoded `%tid==0`, so a sub-region producer (e.g. a
+     * warp-spec consumer/producer on tid in [32,64)) elects its OWN first lane, not global tid 0. */
+    Expr elected_lane(const ActiveSet &a) const;
+
     /** Whether `condition` is a guard form the model recognizes (else enter_if is a no-op
      * and the active set is conservatively NOT narrowed — more sync, never less). */
     bool recognizes_guard(const Expr &condition) const;

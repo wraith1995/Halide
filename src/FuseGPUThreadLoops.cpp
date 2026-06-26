@@ -1414,9 +1414,12 @@ protected:
         exec.enter_if(op->condition);
         Stmt then_case = mutate(op->then_case);
         exec.pop();
-        // The else-branch keeps the enclosing active set (the model does not represent
-        // guard negation; this is conservative => more sync, never less).
+        // The else-branch executes on the COMPLEMENT lanes: narrow by the negated guard (the
+        // warp-spec fork emits `if tid<32 {As} else if tid<64 {Bs} ...`, so Bs lives in the else
+        // and must narrow to [32,64) -- without this its elected lane / scope would be wrong).
+        exec.enter_if(simplify(!op->condition));
         Stmt else_case = op->else_case.defined() ? mutate(op->else_case) : Stmt();
+        exec.pop();
         if (condition.same_as(op->condition) &&
             then_case.same_as(op->then_case) &&
             else_case.same_as(op->else_case)) {
@@ -1479,6 +1482,18 @@ protected:
         return IRMutator::visit(op);
     }
 
+    // Append the model's ELECTED LANE (the thread codegen should single-thread-issue this op on) as
+    // the op's last arg, when it isn't already there (base_argc = the op's normal arg count). Replaces
+    // codegen's hardcoded global tid==0: a sub-region (warp-spec) producer elects its OWN first lane.
+    Expr with_elected_lane(const Call *op, size_t base_argc) {
+        if (op->args.size() != base_argc) {
+            return op;  // already carries the elected lane (idempotent)
+        }
+        std::vector<Expr> args = op->args;
+        args.push_back(exec.elected_lane(exec.current()));
+        return Call::make(op->type, op->name, args, op->call_type);
+    }
+
     Expr visit(const Call *op) override {
         // F3: the mbarrier_init intrinsic WRITES the mbarrier shared state (via inline asm); its
         // args are Load carriers (base_ref) that would otherwise register as shared READS. Register
@@ -1508,7 +1523,10 @@ protected:
                     record_active(store_active, dst->name);
                 }
             }
-            return op;
+            return with_elected_lane(op, 5);
+        }
+        if (op->is_intrinsic() && op->name == "mbarrier_arrive_expect_tx") {
+            return with_elected_lane(op, 2);
         }
         return IRMutator::visit(op);
     }

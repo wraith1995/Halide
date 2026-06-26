@@ -641,21 +641,24 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         // an in-flight bulk-tensor copy. cp.async.bulk.tensor decrements this tx count as the bytes
         // land; the consumer's try_wait.parity then observes completion (reusing the F3 mbarrier
         // wait). Issued ONCE by the elected thread (the recognizer guards it). Args: (mbar_ref, bytes).
-        internal_assert(op->args.size() == 2u) << "mbarrier_arrive_expect_tx expects (mbar_ref, bytes).\n";
+        internal_assert(op->args.size() == 3u)
+            << "mbarrier_arrive_expect_tx expects (mbar_ref, bytes, elected_lane).\n";
         llvm::Value *addr = mbar_shared_addr(op->args[0]);
         llvm::Value *bytes = codegen(op->args[1]);
-        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t, i32_t}, false);
-        // Self-elect thread 0: the recognizer places this at block level (all threads), so the
-        // arm must fire ONCE -- a single expect_tx sets the whole tile's expected byte count.
-        // (Mirrors mbarrier_init's %tid self-guard; %tid.{x,y,z} always exist in PTX.)
+        llvm::Value *elected = codegen(op->args[2]);
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t, i32_t, i32_t}, false);
+        // Single-thread arm on the MODEL's elected lane ($2 = ExecMap::elected_lane): the expect_tx
+        // fires ONCE, and a warp-spec sub-region producer elects its OWN first lane (not global tid
+        // 0). Guard = (tid.x == elected) && tid.y == 0 && tid.z == 0.
         const char *asm_str =
-            "{ .reg .pred tma_e; .reg .u32 tma_t0, tma_t1; .reg .b64 tma_st;\n"
-            "  mov.u32 tma_t0, %tid.x; mov.u32 tma_t1, %tid.y; or.b32 tma_t0, tma_t0, tma_t1;\n"
-            "  mov.u32 tma_t1, %tid.z; or.b32 tma_t0, tma_t0, tma_t1;\n"
-            "  setp.eq.u32 tma_e, tma_t0, 0;\n"
+            "{ .reg .pred tma_e, tma_p; .reg .u32 tma_t0, tma_t1; .reg .b64 tma_st;\n"
+            "  mov.u32 tma_t0, %tid.y; mov.u32 tma_t1, %tid.z; or.b32 tma_t0, tma_t0, tma_t1;\n"
+            "  setp.eq.u32 tma_p, tma_t0, 0;\n"
+            "  mov.u32 tma_t0, %tid.x;\n"
+            "  setp.eq.and.u32 tma_e, tma_t0, $2, tma_p;\n"
             "  @tma_e mbarrier.arrive.expect_tx.shared::cta.b64 tma_st, [$0], $1; }";
-        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, asm_str, "r,r", /*hasSideEffects*/ true);
-        builder->CreateCall(ia, {addr, bytes});
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, asm_str, "r,r,r", /*hasSideEffects*/ true);
+        builder->CreateCall(ia, {addr, bytes, elected});
         value = ConstantInt::get(i32_t, 0);
         return;
     }
@@ -667,26 +670,30 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         // the .shared::cluster destination addressing works with no explicit cluster launch.
         // Args: (dst_smem_ref, tensor_map_ptr_u64, coord_x, coord_y, mbar_ref). dst/mbar are Load
         // carriers (shared byte offset = the addrspace(3) ptr's int value, dynamic shared base 0).
-        internal_assert(op->args.size() == 5u) << "tma_load_2d expects (dst, map, x, y, mbar).\n";
+        internal_assert(op->args.size() == 6u)
+            << "tma_load_2d expects (dst, map, x, y, mbar, elected_lane).\n";
         llvm::Value *dst = mbar_shared_addr(op->args[0]);
         llvm::Value *map = codegen(op->args[1]);
         llvm::Value *x = codegen(op->args[2]);
         llvm::Value *y = codegen(op->args[3]);
         llvm::Value *mbar = mbar_shared_addr(op->args[4]);
+        llvm::Value *elected = codegen(op->args[5]);
         llvm::FunctionType *ft =
-            llvm::FunctionType::get(void_t, {i32_t, i64_t, i32_t, i32_t, i32_t}, false);
-        // Self-elect thread 0: block-level placement (all threads) but the bulk copy must issue
-        // ONCE (the hardware generates all addresses). Mirrors mbarrier_init's %tid self-guard.
+            llvm::FunctionType::get(void_t, {i32_t, i64_t, i32_t, i32_t, i32_t, i32_t}, false);
+        // Single-thread issue on the MODEL's elected lane ($5 = ExecMap::elected_lane): the bulk copy
+        // must issue ONCE, and a warp-spec sub-region producer (e.g. Bs on tid in [32,64)) elects its
+        // OWN first lane, not global tid 0. Guard = (tid.x == elected) && tid.y == 0 && tid.z == 0.
         const char *asm_str =
-            "{ .reg .pred tma_e; .reg .u32 tma_t0, tma_t1;\n"
-            "  mov.u32 tma_t0, %tid.x; mov.u32 tma_t1, %tid.y; or.b32 tma_t0, tma_t0, tma_t1;\n"
-            "  mov.u32 tma_t1, %tid.z; or.b32 tma_t0, tma_t0, tma_t1;\n"
-            "  setp.eq.u32 tma_e, tma_t0, 0;\n"
+            "{ .reg .pred tma_e, tma_p; .reg .u32 tma_t0, tma_t1;\n"
+            "  mov.u32 tma_t0, %tid.y; mov.u32 tma_t1, %tid.z; or.b32 tma_t0, tma_t0, tma_t1;\n"
+            "  setp.eq.u32 tma_p, tma_t0, 0;\n"
+            "  mov.u32 tma_t0, %tid.x;\n"
+            "  setp.eq.and.u32 tma_e, tma_t0, $5, tma_p;\n"
             "  @tma_e cp.async.bulk.tensor.2d.shared::cluster.global.tile"
             ".mbarrier::complete_tx::bytes [$0], [$1, {$2, $3}], [$4]; }";
         llvm::InlineAsm *ia =
-            llvm::InlineAsm::get(ft, asm_str, "r,l,r,r,r", /*hasSideEffects*/ true);
-        builder->CreateCall(ia, {dst, map, x, y, mbar});
+            llvm::InlineAsm::get(ft, asm_str, "r,l,r,r,r,r", /*hasSideEffects*/ true);
+        builder->CreateCall(ia, {dst, map, x, y, mbar, elected});
         value = ConstantInt::get(i32_t, 0);
         return;
     }

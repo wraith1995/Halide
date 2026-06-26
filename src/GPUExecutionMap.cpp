@@ -217,6 +217,18 @@ Expr ExecMap::block_lanes() const {
     return p;
 }
 
+Expr ExecMap::elected_lane(const ActiveSet &a) const {
+    // Our GPU kernels are 1-D in threads (.thread_id_x; warp groups are contiguous thread_id_x
+    // ranges, and y/z thread axes are unused), so the first lane's hardware thread index is the
+    // thread_id_x axis's narrowed min. Whole block => 0 == the legacy global-tid==0 election.
+    for (const ExecAxis &ax : axes_) {
+        if (ends_with(ax.var, gpu_thread_name(0)) && ax.lane_weight == 1) {
+            return simplify(axis_interval(a, ax).min);
+        }
+    }
+    return Expr(0);
+}
+
 Expr ExecMap::count(const ActiveSet &a) const {
     if (a.empty) {
         return 0;
