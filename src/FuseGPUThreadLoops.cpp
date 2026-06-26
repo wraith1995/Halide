@@ -2322,6 +2322,40 @@ private:
             rbudget[i] = branch_reg_budget(branches[i]);
             any_rb = any_rb || (rbudget[i].first >= 0);
         }
+        // PLACEMENT (async_storage_model.md S4): CO-RESIDENT producers. By default each async producer
+        // gets its own warp (spread). When several NON-collective producers are placed on the SAME warp
+        // group (same gpu_warp_group index), fuse their branches into ONE warp branch so a SINGLE
+        // elected lane issues all their transfers serially (the matmul_4 shape: one thread issues both
+        // operand TMAs). The two-warp (spread) choice stays available by giving the producers DIFFERENT
+        // group indices. Gated while bringing up; collective (wgmma) branches are never fused.
+        if (any && get_env_variable("HL_WG_FUSE_PRODUCERS") == "1") {
+            std::vector<Stmt> nb;
+            std::vector<int> ng;
+            std::vector<std::pair<int, bool>> nrb;
+            std::map<int, int> fused_at;  // group index -> index of its fused producer branch in nb
+            for (int i = 0; i < (int)branches.size(); i++) {
+                bool collective = max_warps_per_group(branches[i]) > 0;
+                if (!collective && gidx[i] != UNSET && fused_at.count(gidx[i])) {
+                    int j = fused_at[gidx[i]];
+                    nb[j] = Block::make(nb[j], branches[i]);
+                    if (nrb[j].first < 0) {
+                        nrb[j] = rbudget[i];  // the fused producer inherits a register budget
+                    }
+                } else {
+                    if (!collective && gidx[i] != UNSET) {
+                        fused_at[gidx[i]] = (int)nb.size();
+                    }
+                    nb.push_back(branches[i]);
+                    ng.push_back(gidx[i]);
+                    nrb.push_back(rbudget[i]);
+                }
+            }
+            branches = std::move(nb);
+            gidx = std::move(ng);
+            rbudget = std::move(nrb);
+            any_rb = false;
+            for (auto &rb : rbudget) any_rb = any_rb || (rb.first >= 0);
+        }
         return partition_warp_groups(branches, warp_size, device_api, 0,
                                      any ? gidx : std::vector<int>{},
                                      any_rb ? rbudget : std::vector<std::pair<int, bool>>{});
