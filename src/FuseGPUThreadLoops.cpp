@@ -2323,6 +2323,7 @@ public:
 // Each producer's first N empty-waits are primed out (slots start free); host
 // semaphores are stripped. Barrier wait/arrive is emitted via emit_barrier() so
 // mbarrier can later drop in at the same seam.
+
 class LowerGPUWarpAsyncFork : public IRMutator {
     const std::map<std::string, Function> &env;
     DeviceAPI device_api = DeviceAPI::None;
@@ -2568,6 +2569,10 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     // arrive. branch_warp_threads warp-ROUNDS (fine for bar.sync, which converges a
                     // whole warp), but mbarrier.arrive only fires on active lanes -> must match the
                     // actual count. HL_WG_MBAR_COUNT overrides it for diagnosis.
+                    // NB: a TMA producer's expected arrival count is 1 (the elected thread's
+                    // expect_tx), not the cp.async per-lane warp count -- but TMA is injected LATER
+                    // (inject_tma_copies, after this pass), so that count is patched there
+                    // (patch_tma_mbar_counts), not here.
                     Expr count = producer_threads[b.producer];
                     std::string cov = get_env_variable("HL_WG_MBAR_COUNT");
                     if (!cov.empty()) count = Expr(std::atoi(cov.c_str()));
@@ -2811,6 +2816,11 @@ class LowerAsyncCompletions : public IRMutator {
 class InjectTmaCopies : public IRMutator {
     std::set<std::string> shared_allocs;  // names allocated in GPUShared in scope
     std::map<std::string, SwizzleLayout> shared_swizzle;  // store_in swizzle per shared alloc
+public:
+    // Ring mbarriers (buffer names) we wired a TMA producer onto: their mbarrier_init arrival count
+    // (set for cp.async = warp width) must be patched to 1 (TMA's single expect_tx arrive).
+    std::set<std::string> tma_mbars;
+private:
     // Tensor-map lets to wrap around the current gpu_block (host scope -> kernel arg).
     struct MapLet {
         std::string var;    // tensor-map variable name (referenced by tma_load_2d)
@@ -3039,6 +3049,16 @@ class InjectTmaCopies : public IRMutator {
         // CompletionKind upgrade (CpAsyncGroup -> CpAsyncBulk) makes lower_async_completions emit the
         // transaction-completion expect_tx instead of a cp.async-group arrive.
         if (ring_mbar.defined()) {
+            // Record the ring mbar so patch_tma_mbar_counts can fix its arrival count (TMA arrives 1).
+            {
+                class NameOf : public IRVisitor {
+                    using IRVisitor::visit;
+                    void visit(const Load *l) override { if (name.empty()) name = l->name; IRVisitor::visit(l); }
+                public: std::string name;
+                } n;
+                ring_mbar.accept(&n);
+                if (!n.name.empty()) tma_mbars.insert(n.name);
+            }
             Expr slot_dst = Load::make(tc.elem, tc.dst, tc.dst_slot, Buffer<>{}, Parameter{},
                                        const_true(), ModulusRemainder{});
             Stmt rissue = Evaluate::make(Call::make(Int(32), Call::async_issue,
@@ -3071,13 +3091,50 @@ class InjectTmaCopies : public IRMutator {
         return ProducerConsumer::make(op->name, true, seq);
     }
 };
+
+// After TMA is wired onto ring mbarriers, patch those mbarriers' init arrival count to 1: the ring
+// emitted the count for a cp.async producer (every warp lane arrives) BEFORE TMA existed, but a TMA
+// producer arrives exactly ONCE (expect_tx) -- a count of 32 would deadlock the consumer's try_wait.
+// The init is one flattened call `mbarrier_init(base0,ring_n0,count0, base1,ring_n1,count1, ...)`.
+class PatchTmaMbarCounts : public IRMutator {
+    const std::set<std::string> &tma_mbars;
+    using IRMutator::visit;
+    static std::string buffer_of(const Expr &e) {
+        class NameOf : public IRVisitor {
+            using IRVisitor::visit;
+            void visit(const Load *l) override { if (name.empty()) name = l->name; IRVisitor::visit(l); }
+        public: std::string name;
+        } n;
+        e.accept(&n);
+        return n.name;
+    }
+    Expr visit(const Call *op) override {
+        if (op->name == "mbarrier_init") {
+            std::vector<Expr> args = op->args;
+            for (size_t i = 0; i + 2 < args.size(); i += 3) {
+                if (tma_mbars.count(buffer_of(args[i]))) {
+                    args[i + 2] = Expr(1);
+                }
+            }
+            return Call::make(op->type, op->name, args, op->call_type);
+        }
+        return IRMutator::visit(op);
+    }
+public:
+    explicit PatchTmaMbarCounts(const std::set<std::string> &m) : tma_mbars(m) {}
+};
 }  // namespace
 
 Stmt inject_tma_copies(Stmt s, const Target &t) {
     if (!t.has_feature(Target::CUDACapability90) || get_env_variable("HL_WG_TMA") != "1") {
         return s;
     }
-    return InjectTmaCopies()(s);
+    InjectTmaCopies injector;
+    s = injector(s);
+    if (!injector.tma_mbars.empty()) {
+        s = PatchTmaMbarCounts(injector.tma_mbars)(s);
+    }
+    return s;
 }
 
 Stmt lower_async_completions(Stmt s, const Target &t) {
