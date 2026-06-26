@@ -2593,6 +2593,17 @@ Func &Func::gpu_warp_group(const std::vector<int> &groups) {
     return *this;
 }
 
+Func &Func::gpu_register_budget(int regs, bool increase) {
+    invalidate_cache();
+    user_assert(regs >= 24 && regs <= 256 && (regs % 8) == 0)
+        << "gpu_register_budget() for Func " << name()
+        << " takes a register count that is a multiple of 8 in [24, 256] (Hopper setmaxnreg), but got "
+        << regs << "\n";
+    func.schedule().gpu_register_budget() = regs;
+    func.schedule().gpu_register_increase() = increase;
+    return *this;
+}
+
 Stage Func::specialize(const Expr &c) {
     invalidate_cache();
     return Stage(func, func.definition(), 0).specialize(c);

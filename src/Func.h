@@ -2371,6 +2371,18 @@ public:
      * CUDA only. See research/gpu_recognizer_design.md "Explicit warp-group assignment". */
     Func &gpu_warp_group(const std::vector<int> &groups = {});
 
+    /** Hopper (sm_90) per-warp-group register reallocation (setmaxnreg). When this Func is pinned
+     * to a warp group (see \ref Func::gpu_warp_group) and warp specialization splits the block into
+     * per-warp-group branches, emit a warp-group-collective register-budget instruction at the
+     * entry of this group's branch. With increase == false (the default) this is
+     * `setmaxnreg.dec.sync.aligned.u32 regs` -- the PRODUCER/DMA group DEALLOCATES down to `regs`,
+     * freeing registers so the sibling consumer (wgmma) groups can take more. With increase == true
+     * it is `setmaxnreg.inc.sync.aligned.u32 regs` -- a CONSUMER group ALLOCATES up to `regs`.
+     * `regs` must be a compile-time constant multiple of 8 in [24, 256]; on Hopper every dec across
+     * the block must precede every inc. Opt-in: a Func with no budget emits nothing (NFC). CUDA
+     * (sm_90) only. */
+    Func &gpu_register_budget(int regs, bool increase = false);
+
     /** Expands the storage of the function by an extra dimension
      * to enable ring buffering. For this to be useful the storage
      * of the function has to be hoisted to an upper loop level using

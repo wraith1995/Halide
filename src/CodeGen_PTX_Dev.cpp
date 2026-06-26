@@ -727,6 +727,30 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         return;
     }
 
+    if (op->is_intrinsic() && op->name == "setmaxnreg") {
+        // Hopper (sm_90) per-warp-group register reallocation. setmaxnreg.{dec,inc}.sync.aligned.u32
+        // is a WARP-GROUP-COLLECTIVE instruction: all 128 threads of the warp group must execute it
+        // converged, so it is emitted unguarded at the entry of the warp group's branch (the branch's
+        // group-range guard already restricts it to that group's lanes -- it must NOT be wrapped in a
+        // single-thread predicate). dec deallocates this group's registers down to N (a producer/DMA
+        // group frees registers); inc allocates up to N (a wgmma consumer group). N must be a
+        // compile-time immediate multiple of 8 in [24, 256]. Args: (regs, increase).
+        internal_assert(op->args.size() == 2u) << "setmaxnreg expects (regs, increase).\n";
+        auto regs = as_const_int(op->args[0]);
+        auto increase = as_const_int(op->args[1]);
+        internal_assert(regs && increase)
+            << "setmaxnreg expects compile-time-constant (regs, increase).\n";
+        std::string asm_str =
+            "setmaxnreg." + std::string(*increase != 0 ? "inc" : "dec") + ".sync.aligned.u32 $0;";
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t}, false);
+        // "n" constraint = a compile-time integer immediate (setmaxnreg requires the count be
+        // immediate). hasSideEffects so it is never reordered/elided.
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, asm_str, "n", /*hasSideEffects*/ true);
+        builder->CreateCall(ia, {ConstantInt::get(i32_t, (int)*regs)});
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
+
     if (op->is_intrinsic(Call::gpu_thread_barrier)) {
         // Even though we always insert a __syncthreads equivalent
         // (which has both a device and shared memory fence)

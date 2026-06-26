@@ -2132,7 +2132,8 @@ Expr warp_group_lane_count(const Stmt &branch, int warp_size, int warps_per_grou
 
 Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
                            DeviceAPI device_api, int warps_per_group_override = 0,
-                           const std::vector<int> &group_index = {}) {
+                           const std::vector<int> &group_index = {},
+                           const std::vector<std::pair<int, bool>> &reg_budget = {}) {
     const std::string ftid = unique_name("warp_flat") + gpu_thread_name(0);
     Expr fv = Variable::make(Int(32), ftid);
     Expr base = 0;
@@ -2180,6 +2181,17 @@ Stmt partition_warp_groups(const std::vector<Stmt> &branches, int warp_size,
             base = simplify(((base + (align - 1)) / align) * align);
         }
         Stmt fb = FlattenBranchThreads(simplify(fv - base), stride, maxe, te.max_dim)(branch);
+        // Hopper per-warp-group register reallocation (setmaxnreg): if the Func placed on this
+        // branch set a register budget, emit it at the ENTRY of the branch body, INSIDE the group
+        // guard below so the whole warp group (and only it) executes the warp-group-collective
+        // .sync.aligned instruction. arg[0] = reg count (compile-time immediate), arg[1] = inc/dec.
+        if (!reg_budget.empty() && reg_budget[oi].first >= 0) {
+            Stmt smn = Evaluate::make(Call::make(Int(32), "setmaxnreg",
+                                                 {Expr(reg_budget[oi].first),
+                                                  Expr((int)reg_budget[oi].second)},
+                                                 Call::Intrinsic));
+            fb = Block::make(smn, fb);
+        }
         // Group range guard: only this group's warp range runs the branch (incl. its
         // cross-group barriers), so per-edge barrier counts (= sum of two groups) hold.
         fb = IfThenElse::make(fv >= base && fv < simplify(base + size), fb);
@@ -2221,6 +2233,22 @@ private:
         return -1;
     }
 
+    // The Hopper register budget (setmaxnreg) of a branch, from its producing Func's schedule:
+    // {regs, increase} with regs >= 0, or {-1, false} if unset. Mirrors branch_group_index.
+    std::pair<int, bool> branch_reg_budget(const Stmt &s) const {
+        std::string pname = producer_name_of(s);
+        if (!pname.empty()) {
+            auto it = env.find(pname);
+            if (it != env.end()) {
+                const auto &sched = it->second.schedule();
+                if (sched.gpu_register_budget() >= 0) {
+                    return {sched.gpu_register_budget(), sched.gpu_register_increase()};
+                }
+            }
+        }
+        return {-1, false};
+    }
+
     static void flatten(const Stmt &s, std::vector<Stmt> &branches) {
         if (const Fork *f = s.as<Fork>()) {
             branches.push_back(f->first);
@@ -2253,7 +2281,15 @@ private:
             for (int64_t g = 0; g < *n; g++) {
                 branches.push_back(substitute(op->name, op->min + (int)g, body));
             }
-            return partition_warp_groups(branches, warp_size, device_api, op->warps_per_group);
+            // Hopper register budget (setmaxnreg): the peeled groups share one producing Func, so
+            // all symmetric branches carry its budget (if any). Empty => no setmaxnreg (NFC).
+            std::pair<int, bool> rb = branch_reg_budget(body);
+            std::vector<std::pair<int, bool>> rbudget;
+            if (rb.first >= 0) {
+                rbudget.assign(branches.size(), rb);
+            }
+            return partition_warp_groups(branches, warp_size, device_api, op->warps_per_group,
+                                         {}, rbudget);
         }
         // A DERIVED-size (warps_per_group == 0) symmetric gpu_warps axis lowers as a
         // normal thread sub-dimension: the hardware decodes the group index from
@@ -2275,14 +2311,20 @@ private:
         // the producers packed after. All unset => empty => NFC (the flatten order is preserved).
         const int UNSET = 1 << 30;
         std::vector<int> gidx(branches.size());
-        bool any = false;
+        // Hopper register budget (setmaxnreg) per branch, keyed on the same producing Func as the
+        // warp-group placement. Empty unless some branch sets it (opt-in, NFC otherwise).
+        std::vector<std::pair<int, bool>> rbudget(branches.size(), {-1, false});
+        bool any = false, any_rb = false;
         for (int i = 0; i < (int)branches.size(); i++) {
             int g = branch_group_index(branches[i]);
             gidx[i] = (g < 0) ? UNSET : g;
             any = any || (g >= 0);
+            rbudget[i] = branch_reg_budget(branches[i]);
+            any_rb = any_rb || (rbudget[i].first >= 0);
         }
         return partition_warp_groups(branches, warp_size, device_api, 0,
-                                     any ? gidx : std::vector<int>{});
+                                     any ? gidx : std::vector<int>{},
+                                     any_rb ? rbudget : std::vector<std::pair<int, bool>>{});
     }
 };
 

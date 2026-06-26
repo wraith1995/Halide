@@ -635,6 +635,18 @@ public:
     std::vector<int> &gpu_warp_group();
     const std::vector<int> &gpu_warp_group() const;
 
+    /** Hopper per-warp-group register reallocation budget (setmaxnreg). -1 = unset (no
+     * setmaxnreg emitted). When this Function is placed on a warp group, the budget is emitted
+     * at the entry of that group's branch: gpu_register_increase() == false -> setmaxnreg.dec
+     * (the producer default, frees registers); true -> setmaxnreg.inc (consumers). When set,
+     * must be a multiple of 8 in [24, 256]. See \ref Func::gpu_register_budget. */
+    // @{
+    int &gpu_register_budget();
+    int gpu_register_budget() const;
+    bool &gpu_register_increase();
+    bool gpu_register_increase() const;
+    // @}
+
     Expr &ring_buffer();
     Expr &ring_buffer() const;
 

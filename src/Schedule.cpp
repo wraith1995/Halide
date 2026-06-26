@@ -247,6 +247,13 @@ struct FuncScheduleContents {
     // placement). A single index pins a role (e.g. producer -> group g); a list spans/splits the
     // stage across several groups (e.g. 2 MMA consumer groups, ping-pong). See Func::gpu_warp_group.
     std::vector<int> gpu_warp_group;
+    // Hopper per-warp-group register reallocation (setmaxnreg). When this Func is placed on a
+    // warp group, emit setmaxnreg at the entry of that group's branch to deallocate (dec, frees
+    // registers for sibling consumer groups) or allocate (inc) this warp group's register budget.
+    // -1 = unset (no setmaxnreg emitted). When set, must be a multiple of 8 in [24, 256].
+    // gpu_register_increase selects .inc (true) vs .dec (false). See Func::gpu_register_budget.
+    int gpu_register_budget = -1;
+    bool gpu_register_increase = false;
     // This is an extent of the ring buffer and expected to be a positive integer.
     Expr ring_buffer;
     Expr memoize_eviction_key;
@@ -372,6 +379,8 @@ FuncSchedule FuncSchedule::deep_copy(
     copy.contents->memoize_eviction_key = contents->memoize_eviction_key;
     copy.contents->async = contents->async;
     copy.contents->gpu_warp_group = contents->gpu_warp_group;
+    copy.contents->gpu_register_budget = contents->gpu_register_budget;
+    copy.contents->gpu_register_increase = contents->gpu_register_increase;
     copy.contents->ring_buffer = contents->ring_buffer;
 
     // Deep-copy wrapper functions.
@@ -430,6 +439,22 @@ std::vector<int> &FuncSchedule::gpu_warp_group() {
 
 const std::vector<int> &FuncSchedule::gpu_warp_group() const {
     return contents->gpu_warp_group;
+}
+
+int &FuncSchedule::gpu_register_budget() {
+    return contents->gpu_register_budget;
+}
+
+int FuncSchedule::gpu_register_budget() const {
+    return contents->gpu_register_budget;
+}
+
+bool &FuncSchedule::gpu_register_increase() {
+    return contents->gpu_register_increase;
+}
+
+bool FuncSchedule::gpu_register_increase() const {
+    return contents->gpu_register_increase;
 }
 
 Expr &FuncSchedule::ring_buffer() {
