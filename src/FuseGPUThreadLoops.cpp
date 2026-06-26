@@ -3129,6 +3129,14 @@ private:
         std::string mbar = op->name + ".tma_mbar";
         std::string tmap = op->name + ".tma_map";
         int swz = swizzle_bytes(shared_swizzle[op->name]);
+        // The ring storage transform bakes the swizzle into the scalar store INDEX and clears the
+        // Allocate.swizzle, so a ring operand loses its swizzle here (swz=0) even though the wgmma
+        // descriptor still expects it -> the TMA would write unswizzled. HL_WG_TMA_SWZ overrides the
+        // tensor-map swizzle to confirm/repair this until the swizzle is kept as an attribute.
+        {
+            std::string ov = get_env_variable("HL_WG_TMA_SWZ");
+            if (!ov.empty() && swz == 0) swz = std::atoi(ov.c_str());
+        }
         pending_maps.push_back({tmap, tc.src, tc.box0, tc.box1, swz});
 
         Expr mbar_ref = Load::make(UInt(64), mbar, 0, Buffer<>{}, Parameter{}, const_true(),
