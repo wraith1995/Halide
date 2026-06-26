@@ -103,11 +103,16 @@ protected:
     // M0 wgmma: the {f32 x 8} accumulator from the one wgmma.mma_async collective
     // emitted per kernel (the recognizer's per-element calls all extract from it).
     // Reset per add_kernel. See research/gpu_recognizer_design.md S5b.
-    llvm::Value *cached_wgmma_acc = nullptr;
+    // Keyed by REGISTER BANK = the D fragment's base register (the accum_reg D_in load index,
+    // = m_it*(N/2)). One m64nN wgmma per bank: a BM=128 consumer tile is 2 stacked m64n128 wgmmas
+    // (m_it=0 rows 0-63 in bank 0, m_it=1 rows 64-127 in bank N/2) -- Hopper has no m128 wgmma, so
+    // the two supertiles are TWO instructions into two register banks, not one m64n256. The frag8/
+    // scalar (non-accumulator) path always uses bank 0 (a single m64nN <= m64n256). Reset per kernel.
+    std::map<int, llvm::Value *> cached_wgmma_acc;
     // The basic block `cached_wgmma_acc` was emitted into. The cache is only valid within
     // that block: the recognizer always co-locates the wgmma emit and its fragment extracts
     // in one straight-line block, so when codegen has moved to a DIFFERENT block (e.g. a
-    // second consumer warp group's partition branch in M3) the cached Value would not
+    // second consumer warp group's partition branch in M3) the cached Values would not
     // dominate the new uses -- invalidate so that scope re-emits its own wgmma. Reset per kernel.
     llvm::BasicBlock *cached_wgmma_block = nullptr;
 
@@ -186,7 +191,7 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
 
     debug(2) << "In CodeGen_PTX_Dev::add_kernel\n";
 
-    cached_wgmma_acc = nullptr;
+    cached_wgmma_acc.clear();
     cached_wgmma_block = nullptr;
 
     // Now deduce the types of the arguments to our function
@@ -385,13 +390,20 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             << "wgmma accum_reg args malformed\n";
         const int N = (int)*n_dim;
         const int R = N / 2;
+        // The register BANK = the D fragment base (D_in load index, = m_it*(N/2)). Each bank is its
+        // own m64nN wgmma: a BM=128 tile is 2 stacked m64n128 wgmmas (bank 0 rows 0-63, bank R rows
+        // 64-127). reg is the fragment register WITHIN the bank (0..R-1). For one m_it (BM<=64) bank=0
+        // and this is exactly the old single-wgmma behavior.
+        auto bank_opt = as_const_int(simplify(dl->index));
+        internal_assert(bank_opt) << "wgmma accum_reg D_in index must be a constant register bank\n";
+        const int bank = (int)*bank_opt;
 
-        // Drop a cache that was built in a different basic block (it would not dominate here).
-        if (cached_wgmma_acc && cached_wgmma_block != builder->GetInsertBlock()) {
-            cached_wgmma_acc = nullptr;
+        // Drop caches built in a different basic block (they would not dominate here).
+        if (!cached_wgmma_acc.empty() && cached_wgmma_block != builder->GetInsertBlock()) {
+            cached_wgmma_acc.clear();
         }
-        if (cached_wgmma_acc == nullptr) {
-            // Seed the {f32 x R} accumulator from prod[base+0..R-1] (R scalar loads).
+        if (cached_wgmma_acc.find(bank) == cached_wgmma_acc.end()) {
+            // Seed the {f32 x R} accumulator from prod[bank+0..bank+R-1] (R scalar loads).
             llvm::Type *f32 = llvm::Type::getFloatTy(*context);
             llvm::StructType *acc_ty = llvm::StructType::get(*context, std::vector<llvm::Type *>(R, f32));
             llvm::Value *acc = llvm::UndefValue::get(acc_ty);
@@ -422,10 +434,10 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
-            cached_wgmma_acc = acc;
+            cached_wgmma_acc[bank] = acc;
             cached_wgmma_block = builder->GetInsertBlock();
         }
-        value = builder->CreateExtractValue(cached_wgmma_acc, (unsigned)*reg);
+        value = builder->CreateExtractValue(cached_wgmma_acc[bank], (unsigned)*reg);
         return;
     }
 
@@ -463,11 +475,13 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                      << " strideB=" << *stride_b << "\n";
         }
 
+        // Non-accumulator path: a single m64nN wgmma (N <= 256 => one register bank). Bank 0.
+        const int bank = 0;
         // Drop a cache that was built in a different basic block (it would not dominate here).
-        if (cached_wgmma_acc && cached_wgmma_block != builder->GetInsertBlock()) {
-            cached_wgmma_acc = nullptr;
+        if (!cached_wgmma_acc.empty() && cached_wgmma_block != builder->GetInsertBlock()) {
+            cached_wgmma_acc.clear();
         }
-        if (cached_wgmma_acc == nullptr) {
+        if (cached_wgmma_acc.find(bank) == cached_wgmma_acc.end()) {
             // Zeroed {f32 x R} D fragment. Chunk 0 overwrites (scaleD=0); the zero init
             // is belt-and-suspenders. First-guess core-matrix offsets for a 64x16 (A) /
             // 16xN (B) f16 K-major tile (Colfax/CUTLASS no-swizzle): LBO 128 B, SBO 256 B.
@@ -510,7 +524,7 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
-            cached_wgmma_acc = acc;
+            cached_wgmma_acc[bank] = acc;
             cached_wgmma_block = builder->GetInsertBlock();
         }
         if (vec) {
@@ -519,12 +533,12 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             llvm::Type *f32 = llvm::Type::getFloatTy(*context);
             llvm::Value *v = llvm::UndefValue::get(llvm::FixedVectorType::get(f32, R));
             for (int j = 0; j < R; j++) {
-                v = builder->CreateInsertElement(v, builder->CreateExtractValue(cached_wgmma_acc, j),
+                v = builder->CreateInsertElement(v, builder->CreateExtractValue(cached_wgmma_acc[bank], j),
                                                  (uint64_t)j);
             }
             value = v;
         } else {
-            value = builder->CreateExtractValue(cached_wgmma_acc, (unsigned)*reg);
+            value = builder->CreateExtractValue(cached_wgmma_acc[bank], (unsigned)*reg);
         }
         return;
     }
