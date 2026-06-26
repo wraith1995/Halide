@@ -2638,7 +2638,31 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                 ptv[i] = branch_warp_threads(branches[i]);
             }
             ScopedValue<std::vector<Expr>> pt(producer_threads, ptv);
-            ScopedValue<Expr> ct(consumer_threads, branch_warp_threads(branches[num_groups - 1]));
+            // The empty (WAR) edge is arrived by EVERY consumer lane (each warp group releases the
+            // ring slot it just finished), so its rendezvous count is the consumers' FULL thread span
+            // -- including the wg-axis multiplicity. A multi-consumer tile (R5's M-split 128x256) is
+            // ONE Fork branch that partition_warp_groups later expands into G warp groups (the gpu_warps
+            // `wg` extent), so branch_warp_threads' per-group shortcut (128) undercounts it: use the
+            // branch's full GPUThread extent product (G*128). The producer then waits for ALL consumers
+            // before refilling (else it races a not-yet-released group -> garbage). NFC for R4/R3
+            // (1 consumer group -> full extent == the single group's 128). branches = [producers...,
+            // consumers...], consumers in [num_producers, num_groups).
+            auto full_thread_count = [&](const Stmt &s) {
+                ThreadExtents te;
+                s.accept(&te);
+                Expr p = 1;
+                for (int d = 0; d <= te.max_dim; d++) {
+                    if (te.extent[d].defined()) {
+                        p = p * te.extent[d];
+                    }
+                }
+                return simplify(p);
+            };
+            Expr ct_sum = 0;
+            for (int i = num_producers; i < num_groups; i++) {
+                ct_sum += full_thread_count(branches[i]);
+            }
+            ScopedValue<Expr> ct(consumer_threads, simplify(ct_sum));
             std::vector<std::string> lifted;
             std::set<std::string> lifted_seen;
             std::vector<Stmt> out(num_groups);
