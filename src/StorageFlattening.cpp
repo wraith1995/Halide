@@ -427,15 +427,21 @@ protected:
         MemoryType memory_type;
         vector<Expr> extents;
         Expr condition;
+        // The non-affine storage swizzle (store_in + swizzle_storage) must survive hoisting:
+        // FlattenDimensions carries it onto the Allocate, and this pass re-creates that Allocate,
+        // so we thread it through or the swizzle is silently lost (breaks TMA-filled ring operands).
+        SwizzleLayout swizzle;
 
         HoistedAllocationInfo(const string &name, Type type,
                               MemoryType memory_type,
-                              const vector<Expr> &extents, Expr condition)
+                              const vector<Expr> &extents, Expr condition,
+                              const SwizzleLayout &swizzle)
             : name(name),
               type(type),
               memory_type(memory_type),
               extents(extents),
-              condition(std::move(condition)) {
+              condition(std::move(condition)),
+              swizzle(swizzle) {
         }
     };
 
@@ -503,7 +509,8 @@ protected:
             }
             condition = condition || ai.condition;
         }
-        body = Allocate::make(alloc_info.name, alloc_info.type, alloc_info.memory_type, extents, condition, body);
+        body = Allocate::make(alloc_info.name, alloc_info.type, alloc_info.memory_type, extents, condition, body,
+                              Expr(), std::string(), 0, alloc_info.swizzle);
         hoisted_storages_map.erase(op->name);
         hoisted_storages.pop_back();
         return body;
@@ -553,7 +560,7 @@ protected:
                 expanded_condition = const_true();
             }
 
-            HoistedAllocationInfo hoisted_alloc(op->name, op->type, op->memory_type, bounded_extents, expanded_condition);
+            HoistedAllocationInfo hoisted_alloc(op->name, op->type, op->memory_type, bounded_extents, expanded_condition, op->swizzle);
 
             hoisted_storage_data.hoisted_allocations.push_back(hoisted_alloc);
             return mutate(op->body);

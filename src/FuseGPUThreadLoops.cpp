@@ -2937,6 +2937,10 @@ private:
         if (shared) {
             shared_allocs.insert(op->name);
             shared_swizzle[op->name] = op->swizzle;
+            if (get_env_variable("HL_TMA_DEBUG") == "3") {
+                std::cerr << "ALLOC shared=" << op->name << " swizzle.defined=" << op->swizzle.defined()
+                          << " bytes=" << swizzle_bytes(op->swizzle) << "\n";
+            }
         }
         Stmt s = IRMutator::visit(op);
         if (shared) {
