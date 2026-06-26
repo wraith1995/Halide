@@ -2489,6 +2489,14 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         // Flat partition: only the producing + consuming groups' lanes are in range.
         Expr count = fork_fuse ? simplify(producer_threads[b.producer] + consumer_threads)
                                : thread_count;
+        // DIAGNOSTIC override for the multi-consumer empty-edge count topology (R5): the named-barrier
+        // count must EXACTLY equal the lanes that execute it (producer-wait + all-consumer-arrive).
+        // HL_WG_EMPTY_COUNT lets us sweep candidates on H100 without a rebuild while the exact arrival
+        // model is being pinned. Remove once R5's count is settled.
+        std::string ecov = get_env_variable("HL_WG_EMPTY_COUNT");
+        if (!ecov.empty()) {
+            count = Expr(std::atoi(ecov.c_str()));
+        }
         // Emit a WarpGroup-scope sync requirement (only the producing + consuming
         // groups rendezvous); LowerSyncRequirements lowers it to a partial named
         // barrier — or, at sm_90, an mbarrier — at the single sync seam. mode 0 =
@@ -2638,31 +2646,15 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                 ptv[i] = branch_warp_threads(branches[i]);
             }
             ScopedValue<std::vector<Expr>> pt(producer_threads, ptv);
-            // The empty (WAR) edge is arrived by EVERY consumer lane (each warp group releases the
-            // ring slot it just finished), so its rendezvous count is the consumers' FULL thread span
-            // -- including the wg-axis multiplicity. A multi-consumer tile (R5's M-split 128x256) is
-            // ONE Fork branch that partition_warp_groups later expands into G warp groups (the gpu_warps
-            // `wg` extent), so branch_warp_threads' per-group shortcut (128) undercounts it: use the
-            // branch's full GPUThread extent product (G*128). The producer then waits for ALL consumers
-            // before refilling (else it races a not-yet-released group -> garbage). NFC for R4/R3
-            // (1 consumer group -> full extent == the single group's 128). branches = [producers...,
-            // consumers...], consumers in [num_producers, num_groups).
-            auto full_thread_count = [&](const Stmt &s) {
-                ThreadExtents te;
-                s.accept(&te);
-                Expr p = 1;
-                for (int d = 0; d <= te.max_dim; d++) {
-                    if (te.extent[d].defined()) {
-                        p = p * te.extent[d];
-                    }
-                }
-                return simplify(p);
-            };
-            Expr ct_sum = 0;
-            for (int i = num_producers; i < num_groups; i++) {
-                ct_sum += full_thread_count(branches[i]);
-            }
-            ScopedValue<Expr> ct(consumer_threads, simplify(ct_sum));
+            // NOTE (R5 multi-consumer WIP): with >1 consumer warp group (M-split 128x256), the empty
+            // (WAR) edge must be arrived by ALL consumer lanes before the producer refills a slot. The
+            // count here is producer + ONE consumer group (branches[num_groups-1]); raising it to the
+            // consumers' full span (G*128) makes the named barrier HANG -- empirically only ~1 consumer
+            // group's lanes actually execute the empty-arrive after partition (count=160 races, 288
+            // hangs). So the real fix is STRUCTURAL: make every consumer group execute the empty-arrive
+            // (and match the count), not just bump the count. Use HL_WG_EMPTY_COUNT below to probe the
+            // true participant count on H100 while pinning the topology. NFC for R4 (1 consumer).
+            ScopedValue<Expr> ct(consumer_threads, branch_warp_threads(branches[num_groups - 1]));
             std::vector<std::string> lifted;
             std::set<std::string> lifted_seen;
             std::vector<Stmt> out(num_groups);
