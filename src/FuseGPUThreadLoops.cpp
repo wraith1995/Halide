@@ -2872,6 +2872,7 @@ class InjectTmaCopies : public IRMutator {
         std::string dst, src;        // shared dst buffer, global src buffer
         Expr box0, box1;             // contiguous (dim 0) tile extent, then outer (dim 1) extent
         Expr coordX, coordY;         // tile origin: contiguous-axis coord (c0), then outer-axis (c1)
+        Expr dst_slot;               // dst element offset of the tile origin (ring slot; 0 if non-ring)
         Type elem;                   // element type of the copy
     };
     // Source stride of `var` in `index` (the change in index per unit step of var); a unit result
@@ -2879,17 +2880,43 @@ class InjectTmaCopies : public IRMutator {
     static Expr loop_source_stride(const std::string &var, const Expr &index) {
         return simplify(substitute(var, Variable::make(Int(32), var) + 1, index) - index);
     }
+    // Strip leading LetStmts and descend into Block.first until we reach the 2D copy's outer For.
+    // A ring-buffered / .async() producer wraps the For-nest in lets (ring-slot offsets) and a Block
+    // (the trailing ring-completion marker), so the body isn't a bare For.
+    //
+    // DESIGN DEBT (2026-06-26): this structural peeling is brittle -- it depends on the exact IR shape
+    // the ring/async lowering emits. The principled alternative is to drive TMA eligibility + the ring
+    // wiring from SCHEDULE metadata (the Func is store_in(GPUShared), a direct copy, has a swizzle, and
+    // the ring/async/warp-group split are all schedule facts), not from re-matching the lowered nest.
+    // Revisit when the recognizer is consolidated. See perf_ladder.md R4.
+    static Stmt peel_to_for_nest(Stmt s) {
+        while (true) {
+            if (const LetStmt *l = s.as<LetStmt>()) { s = l->body; continue; }
+            if (const Block *b = s.as<Block>()) {
+                // The copy For-nest is the Block half that contains a For (the other is the marker).
+                if (b->first.as<For>() || b->first.as<LetStmt>() || b->first.as<Block>()) { s = b->first; continue; }
+                if (b->rest.defined() && (b->rest.as<For>() || b->rest.as<LetStmt>())) { s = b->rest; continue; }
+            }
+            return s;
+        }
+    }
     static bool match_tile_copy(const Stmt &produce_body, const std::string &name, TileCopy *tc) {
-        const For *lo = produce_body.as<For>();
+        const bool dbg = get_env_variable("HL_TMA_DEBUG") == "2";
+        const For *lo = peel_to_for_nest(produce_body).as<For>();
         if (!lo) {
+            if (dbg) debug(0) << "TMA_NOMATCH " << name << ": peeled body not For (is "
+                              << (produce_body.as<LetStmt>() ? "LetStmt" : produce_body.as<Block>() ? "Block" : "other") << ")\n";
             return false;
         }
-        const For *li = lo->body.as<For>();
+        const For *li = peel_to_for_nest(lo->body).as<For>();
         if (!li) {
+            if (dbg) debug(0) << "TMA_NOMATCH " << name << ": lo->body not For\n";
             return false;
         }
-        const Store *st = li->body.as<Store>();
+        const Store *st = peel_to_for_nest(li->body).as<Store>();
         if (!st || st->name != name) {
+            if (dbg) debug(0) << "TMA_NOMATCH " << name << ": li->body not Store-to-name (store="
+                              << (st ? st->name : "<none>") << ")\n";
             return false;
         }
         const Load *ld = st->value.as<Load>();  // direct copy (no cast): As(k,m) = Src(k,m)
@@ -2937,6 +2964,11 @@ class InjectTmaCopies : public IRMutator {
         tc->coordX = simplify(contig->min - cmin);  // contiguous-axis origin (c0)
         tc->coordY = simplify(outer->min - omin);   // outer-axis origin (c1)
         tc->elem = st->value.type();
+        // Ring case: the destination is a per-ko shared SLOT (ring_buffer rotation). The slot base =
+        // the store index at the tile origin (swizzle(0)=0), so dst = dst-buffer + that offset. For a
+        // non-ring tile this simplifies to 0 (the alloc base) -- NFC for R3.
+        tc->dst_slot = simplify(substitute({{contig->name, contig->min}, {outer->name, outer->min}},
+                                           st->index));
         if (get_env_variable("HL_TMA_DEBUG") == "1") {
             debug(0) << "TMA_DEBUG name=" << name << " src=" << ld->name
                      << " contig_loop=" << contig->name << " cdim=" << cdim
@@ -2946,12 +2978,42 @@ class InjectTmaCopies : public IRMutator {
         return true;
     }
 
+    // A ring/.async() producer carries its own completion marker (`async_issue(kind, full_mbar[ko])`).
+    // Find that mbar Expr (undefined => non-ring producer). For the ring case, TMA must arrive on THIS
+    // mbar (so the consumer's try_wait wakes), not a private one.
+    static Expr find_ring_mbar(const Stmt &body) {
+        class Finder : public IRVisitor {
+            using IRVisitor::visit;
+            void visit(const Call *op) override {
+                if (op->is_intrinsic(Call::async_issue) && op->args.size() >= 2 && !found.defined()) {
+                    found = op->args[1];
+                }
+                IRVisitor::visit(op);
+            }
+        public:
+            Expr found;
+        } f;
+        body.accept(&f);
+        return f.found;
+    }
+
     Stmt visit(const ProducerConsumer *op) override {
+        if (op->is_producer && get_env_variable("HL_TMA_DEBUG") == "3") {
+            debug(0) << "TMA_BODY producer=" << op->name << " shared=" << shared_allocs.count(op->name)
+                     << " swz=" << swizzle_bytes(shared_swizzle[op->name]) << ":\n" << op->body << "\n---\n";
+        }
         if (!op->is_producer || !shared_allocs.count(op->name)) {
             return IRMutator::visit(op);
         }
         TileCopy tc;
         if (!match_tile_copy(op->body, op->name, &tc)) {
+            return IRMutator::visit(op);
+        }
+        // A ring-buffered / .async() producer reuses the ring's full_mbar completion; the TMA must
+        // arrive on it (gap 1) and write the per-ko ring SLOT (gap 2). This wiring is WIP (the swizzle
+        // recovery, gap 3, is still open), so it is gated -- by default keep the correct cp.async fill.
+        Expr ring_mbar = find_ring_mbar(op->body);
+        if (ring_mbar.defined() && get_env_variable("HL_WG_TMA_RING") != "1") {
             return IRMutator::visit(op);
         }
         // Tile coords (element offsets from the source buffer's origin) are computed contiguity-
@@ -2970,6 +3032,23 @@ class InjectTmaCopies : public IRMutator {
         Expr dst_ref = Load::make(tc.elem, tc.dst, 0, Buffer<>{}, Parameter{}, const_true(),
                                   ModulusRemainder{});
         Expr map_var = Variable::make(UInt(64), tmap);
+
+        // RING case (gated): TMA writes the per-ko slot and arrives on the ring's OWN full_mbar (the
+        // marker we found). We emit only expect_tx + the TMA load -- the ring already init's the mbar
+        // and the consumer warp group already try_waits it; no private mbar / init / wait. The
+        // CompletionKind upgrade (CpAsyncGroup -> CpAsyncBulk) makes lower_async_completions emit the
+        // transaction-completion expect_tx instead of a cp.async-group arrive.
+        if (ring_mbar.defined()) {
+            Expr slot_dst = Load::make(tc.elem, tc.dst, tc.dst_slot, Buffer<>{}, Parameter{},
+                                       const_true(), ModulusRemainder{});
+            Stmt rissue = Evaluate::make(Call::make(Int(32), Call::async_issue,
+                                                    {Expr((int)CompletionKind::CpAsyncBulk), ring_mbar, bytes},
+                                                    Call::Intrinsic));
+            Stmt rload = Evaluate::make(Call::make(Int(32), "tma_load_2d",
+                                                   {slot_dst, map_var, coordX, coordY, ring_mbar},
+                                                   Call::Intrinsic));
+            return ProducerConsumer::make(op->name, true, Block::make(rissue, rload));
+        }
 
         // Single-slot mbarrier, one expected arrive (the elected thread's expect_tx). The TMA
         // intrinsics self-elect thread 0 in codegen, so these run block-level (no IR thread guard);
