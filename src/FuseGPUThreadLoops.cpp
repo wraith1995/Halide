@@ -1573,6 +1573,13 @@ protected:
             // in the rest block
             Stmt rest = mutate(op->rest);
 
+            // Capture REST's stores (for WAR/WAW vs first) before they're cleared, and snapshot the
+            // accumulated loads so we can isolate FIRST's own loads. Used only by membar mode below.
+            std::set<std::string> rest_shared_stores = shared_stores;
+            std::set<std::string> rest_device_stores = device_stores;
+            std::set<std::string> shared_loads_before = shared_loads;
+            std::set<std::string> device_loads_before = device_loads;
+
             // Now, record which stores occur in the first stmt
             // of this block
             shared_stores.clear();
@@ -1614,12 +1621,46 @@ protected:
             consider(device_stores, device_loads, CodeGen_GPU_Dev::MemoryFenceType::Device);
 
             // Triton-membar mode (opt-in via HL_WG_MEMBAR): emit a barrier ONLY on a real shared
-            // hazard that isn't already ordered by an mbarrier sync point (the consider() skip above
-            // drops TMA store->load edges covered by an all-threads try_wait). With no such hazard,
-            // emit nothing -- matching Triton's barrier-only-on-hazard policy. Default (flag off) keeps
-            // the conservative unconditional barrier at every block sequence point (byte-identical NFC).
-            if (get_env_variable("HL_WG_MEMBAR") == "1" && !any_match) {
-                return Block::make(first, rest);
+            // hazard not already ordered by an mbarrier sync point. consider() above is RAW (first
+            // store -> rest load), minus mbarrier-covered TMA edges. We must ALSO keep WAR/WAW edges
+            // (first load/store of a buffer that REST stores) -- e.g. the ring slot-reuse edge: the
+            // next iteration's TMA store vs the previous (async) wgmma read. Default (flag off) keeps
+            // the conservative unconditional barrier (byte-identical NFC).
+            if (get_env_variable("HL_WG_MEMBAR") == "1") {
+                auto intersects = [](const std::set<std::string> &a, const std::set<std::string> &b) {
+                    for (const auto &x : a) {
+                        if (b.count(x)) return true;
+                    }
+                    return false;
+                };
+                // FIRST's own loads = accumulated loads minus what was already there before first.
+                std::set<std::string> first_shared_loads, first_device_loads;
+                for (const auto &x : shared_loads) {
+                    if (!shared_loads_before.count(x)) first_shared_loads.insert(x);
+                }
+                for (const auto &x : device_loads) {
+                    if (!device_loads_before.count(x)) first_device_loads.insert(x);
+                }
+                bool war_waw = false;
+                if (intersects(first_shared_loads, rest_shared_stores) ||
+                    intersects(shared_stores, rest_shared_stores)) {
+                    war_waw = true;
+                    mask |= CodeGen_GPU_Dev::MemoryFenceType::Shared;
+                }
+                if (intersects(first_device_loads, rest_device_stores) ||
+                    intersects(device_stores, rest_device_stores)) {
+                    war_waw = true;
+                    mask |= CodeGen_GPU_Dev::MemoryFenceType::Device;
+                }
+                if (!any_match && !war_waw) {
+                    // No within-block hazard needing a barrier HERE. But keep injected_barrier set so
+                    // the enclosing serial loop still emits its once-per-iteration end barrier, which
+                    // (after the consume's wgmma.wait_group) orders the CROSS-iteration ring slot reuse
+                    // -- the next iteration's TMA store vs this iteration's wgmma read. Dropping the
+                    // per-op barriers (the win) while keeping the one loop barrier (correctness).
+                    injected_barrier = true;
+                    return Block::make(first, rest);
+                }
             }
             injected_barrier = true;
             // M2: barrier scope = scope(join(active(producer), active(consumer))). When
