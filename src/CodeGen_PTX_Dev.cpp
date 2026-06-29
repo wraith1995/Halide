@@ -737,6 +737,17 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         llvm::Value *ready = builder->CreateICmpNE(done, ConstantInt::get(i32_t, 0));
         builder->CreateCondBr(ready, after_bb, loop_bb);
         builder->SetInsertPoint(after_bb);
+        // Once the mbarrier phase completes, the TMA/cp.async tile is in shared memory -- but it was
+        // written through the ASYNC proxy. A wgmma operand read (or any generic-proxy access) is NOT
+        // guaranteed to observe that write without an async-proxy fence. Emit it here, right after the
+        // wait, so visibility no longer relies on incidental bar.sync ordering (Hopper TMA->wgmma; cf.
+        // Triton's `fence.proxy.async.shared::cta` and CUTLASS fence_view_async_shared).
+        {
+            llvm::FunctionType *fft = llvm::FunctionType::get(llvm::Type::getVoidTy(*context), {}, false);
+            llvm::InlineAsm *fence = llvm::InlineAsm::get(fft, "fence.proxy.async.shared::cta;",
+                                                          "", /*hasSideEffects*/ true);
+            builder->CreateCall(fence, {});
+        }
         value = ConstantInt::get(i32_t, 0);
         return;
     }
