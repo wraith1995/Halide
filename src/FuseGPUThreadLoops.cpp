@@ -1879,14 +1879,19 @@ protected:
             ExtractBlockSize block_size;
             loop.accept(&block_size);
 
-            // The software-pipeline empty_mbar (WAR edge) expects an arrive from every block thread;
-            // its init count placeholder is now resolvable to the block thread total.
+            // The software-pipeline empty_mbar (WAR edge) consumer_release is emitted at block scope
+            // (after the innermost gpu_thread loop, dim 0), so NormalizeDimensionality guards it to run
+            // once per (tid.y, tid.z) -- i.e. on threadIdx.x == 0, one LEADER per warp group, NOT all
+            // block threads. Each leader executes its group's wgmma.wait_group before reaching the
+            // release, so it arrives only after that group's async read drained -- self-sufficient (no
+            // CTA barrier needed). The mbarrier arrival count must therefore = the number of those
+            // leaders = product of the thread extents EXCLUDING dim 0 ( = block_total / num_threads(0) ).
             {
-                Expr total_threads = 1;
-                for (int d = 0; d < block_size.threads_dimensions(); d++) {
-                    total_threads = total_threads * block_size.num_threads(d);
+                Expr release_arrivers = 1;
+                for (int d = 1; d < block_size.threads_dimensions(); d++) {
+                    release_arrivers = release_arrivers * block_size.num_threads(d);
                 }
-                loop = PatchEmptyMbarCounts(simplify(total_threads))(loop);
+                loop = PatchEmptyMbarCounts(simplify(release_arrivers))(loop);
             }
 
             ExtractSharedAndHeapAllocations block_allocations(op->device_api);
