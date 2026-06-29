@@ -1340,6 +1340,22 @@ protected:
     std::set<std::string> device_stores;
     std::set<std::string> shared_loads;
     std::set<std::string> device_loads;
+    // Redundant-barrier elimination (Triton membar principle: an async-wait is a sync point). A TMA
+    // shared store whose completion mbarrier is try_wait'd (by all threads) before the consumer load
+    // is ALREADY ordered store->load, so no block barrier is needed for it. Track each TMA shared
+    // dst -> its completion mbar buffer, and the set of mbar buffers that are try_wait'd.
+    std::map<std::string, std::string> tma_dst_mbar;
+    std::set<std::string> mbar_waited;
+    // The buffer a (possibly nested) Load addresses, or "" if none.
+    static std::string load_buffer(const Expr &e) {
+        class NameOf : public IRVisitor {
+            using IRVisitor::visit;
+            void visit(const Load *l) override { if (name.empty()) name = l->name; IRVisitor::visit(l); }
+        public: std::string name;
+        } n;
+        e.accept(&n);
+        return n.name;
+    }
     // Active set of the producing store(s) / consuming load(s) per name (joined over
     // all occurrences), captured alongside the name sets above.
     std::map<std::string, ActiveSet> store_active;
@@ -1521,12 +1537,32 @@ protected:
                 if (memory_type_for_name(dst->name) == MemoryType::GPUShared) {
                     shared_stores.insert(dst->name);
                     record_active(store_active, dst->name);
+                    // Remember which mbarrier completes this TMA dst (arg 4). If the consumer
+                    // try_waits that mbarrier (all threads) the store->load edge is already CTA-
+                    // ordered and the block barrier is redundant -- see the consider() skip below.
+                    if (op->args.size() > 4) {
+                        std::string m = load_buffer(op->args[4]);
+                        if (!m.empty()) {
+                            tma_dst_mbar[dst->name] = m;
+                        }
+                    }
                 }
             }
             return with_elected_lane(op, 5);
         }
         if (op->is_intrinsic() && op->name == "mbarrier_arrive_expect_tx") {
             return with_elected_lane(op, 2);
+        }
+        if (op->is_intrinsic() && op->name == "mbarrier_try_wait") {
+            // An all-threads mbarrier wait: record the mbar buffer as a CTA-wide sync point so the
+            // RAW it covers (TMA store -> this consumer's load) needs no extra block barrier.
+            if (!op->args.empty()) {
+                std::string m = load_buffer(op->args[0]);
+                if (!m.empty()) {
+                    mbar_waited.insert(m);
+                }
+            }
+            return IRMutator::visit(op);
         }
         return IRMutator::visit(op);
     }
@@ -1554,6 +1590,15 @@ protected:
                                 const std::set<std::string> &loads, int fence) {
                 for (const auto &st : stores) {
                     if (loads.count(st)) {
+                        // Redundant-barrier elimination: if `st` is a TMA shared dst whose completion
+                        // mbarrier is try_wait'd (all threads) by the consumer, that wait is the CTA-
+                        // wide ordering point (Hopper mbarrier.try_wait.parity) -- the block barrier is
+                        // redundant. Skip it. (Only fires for TMA-completed buffers; plain shared
+                        // stores still barrier, so NFC for the warp-spec / synchronous paths.)
+                        auto mi = tma_dst_mbar.find(st);
+                        if (mi != tma_dst_mbar.end() && mbar_waited.count(mi->second)) {
+                            continue;
+                        }
                         mask |= fence;
                         auto si = store_active.find(st);
                         auto li = load_active.find(st);
@@ -1568,6 +1613,14 @@ protected:
             consider(shared_stores, shared_loads, CodeGen_GPU_Dev::MemoryFenceType::Shared);
             consider(device_stores, device_loads, CodeGen_GPU_Dev::MemoryFenceType::Device);
 
+            // Triton-membar mode (opt-in via HL_WG_MEMBAR): emit a barrier ONLY on a real shared
+            // hazard that isn't already ordered by an mbarrier sync point (the consider() skip above
+            // drops TMA store->load edges covered by an all-threads try_wait). With no such hazard,
+            // emit nothing -- matching Triton's barrier-only-on-hazard policy. Default (flag off) keeps
+            // the conservative unconditional barrier at every block sequence point (byte-identical NFC).
+            if (get_env_variable("HL_WG_MEMBAR") == "1" && !any_match) {
+                return Block::make(first, rest);
+            }
             injected_barrier = true;
             // M2: barrier scope = scope(join(active(producer), active(consumer))). When
             // that scope is Thread (producer and consumer are the SAME single lane) the
