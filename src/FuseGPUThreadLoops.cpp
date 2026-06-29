@@ -1356,6 +1356,19 @@ protected:
         e.accept(&n);
         return n.name;
     }
+    // Does this stmt contain a TMA bulk load (the produce of a ring tile)?
+    static bool contains_tma(const Stmt &s) {
+        class Finder : public IRVisitor {
+            using IRVisitor::visit;
+            void visit(const Call *op) override {
+                if (op->is_intrinsic() && op->name == "tma_load_2d") found = true;
+                IRVisitor::visit(op);
+            }
+        public: bool found = false;
+        } f;
+        s.accept(&f);
+        return f.found;
+    }
     // Active set of the producing store(s) / consuming load(s) per name (joined over
     // all occurrences), captured alongside the name sets above.
     std::map<std::string, ActiveSet> store_active;
@@ -1652,15 +1665,17 @@ protected:
                     war_waw = true;
                     mask |= CodeGen_GPU_Dev::MemoryFenceType::Device;
                 }
-                // BISECTION (HL_WG_MEMBAR_KEEPTMA): keep the barrier whenever `rest` READS a TMA tile
-                // (a consume block), to test whether the consume-side ordering is the load-bearing one.
-                bool rest_reads_tma = false;
+                // EMPTY-EDGE / producer-acquire (HL_WG_MEMBAR_KEEPTMA): keep the barrier at any block
+                // ADJACENT to a TMA produce (the block contains a tma_load_2d, on either side). This is
+                // the buffer-reuse (empty) edge realized as a CTA rendezvous: all consumer warps must
+                // finish reading the slot (their wgmma drained) before the elected producer's next TMA
+                // overwrites it. It is a cross-iteration WAR through an ASYNC wgmma read -- NOT a
+                // name-matched data hazard the analysis can see -- so we keep it STRUCTURALLY.
+                bool tma_adjacent = false;
                 if (get_env_variable("HL_WG_MEMBAR_KEEPTMA") == "1") {
-                    for (const auto &ld : shared_loads) {
-                        if (tma_dst_mbar.count(ld)) { rest_reads_tma = true; break; }
-                    }
+                    tma_adjacent = contains_tma(first) || contains_tma(rest);
                 }
-                if (!any_match && !war_waw && !rest_reads_tma) {
+                if (!any_match && !war_waw && !tma_adjacent) {
                     // No within-block hazard needing a barrier HERE. But keep injected_barrier set so
                     // the enclosing serial loop still emits its once-per-iteration end barrier, which
                     // (after the consume's wgmma.wait_group) orders the CROSS-iteration ring slot reuse
