@@ -124,17 +124,60 @@ class SoftwarePipeline : public IRMutator {
             return rebuild(op, body);
         }
 
+        const std::string &v = op->name;
+        Expr vv = Variable::make(Int(32), v);
+
+        // GPU ring producers (GPUShared) need the mbarrier COMPLETION carried by the rotation: the
+        // TMA-loaded tile is consumed D iters after it is issued, so the wgmma must wait on the ring
+        // slot's full_mbar with the tile's parity. We emit TILE-INDEXED markers -- an async_issue in
+        // each produce (so inject_tma takes the RING path: it writes the ring slot and arrives
+        // full_mbar[slot]) and an async_wait before each consume -- both as functions of the loop var,
+        // so substitution moves slot AND parity exactly. The selector lowers them to mbarrier ops, the
+        // SAME mechanism the fork uses (shared selector, per-topology emission). CPU producers get no
+        // markers (the register/MLP data dependency is the completion). NFC: this never runs for the
+        // .async() fork path (those producers are not software_pipeline()'d).
+        bool gpu = false;
+        {
+            auto it = env.find(producers[0]->name);
+            gpu = it != env.end() && it->second.schedule().memory_type() == MemoryType::GPUShared;
+        }
+
         // Build one hoisted unit per producer + one for the shared consumer. The lets are pure
         // address math, so duplicating them into each unit is safe (the simplifier drops unused
         // ones); substituting the loop var then moves both the data address AND the ring slot.
         std::vector<Stmt> produce_units;
         produce_units.reserve(producers.size());
         for (const ProducerConsumer *p : producers) {
-            produce_units.push_back(wrap_lets(lets, ProducerConsumer::make(p->name, true, p->body)));
+            Stmt pbody = p->body;
+            if (gpu) {
+                // After the cooperative store (match_tile_copy reads the store), arm the ring slot:
+                // async_issue(CpAsyncBulk, full_mbar[v%Q], bytes) -- find_ring_mbar grabs args[1].
+                Stmt issue = Evaluate::make(Call::make(
+                    Int(32), Call::async_issue,
+                    {Expr((int)CompletionKind::CpAsyncBulk), mbar_ref(p->name, vv % Q), Expr(0)},
+                    Call::Intrinsic));
+                pbody = Block::make(pbody, issue);
+            }
+            produce_units.push_back(wrap_lets(lets, ProducerConsumer::make(p->name, true, pbody)));
         }
-        Stmt consume_unit = wrap_lets(lets, consumer_stmt);
+        Stmt consumer_body = consumer_stmt;
+        if (gpu) {
+            // Before the shared consumer, wait on every producer's tile: async_wait(CpAsyncBulk, Block,
+            // full_mbar[v%Q], parity=(v/Q)%2). The selector lowers to mbarrier_try_wait.
+            Expr parity = (vv / Q) % 2;
+            Stmt waits;
+            for (const ProducerConsumer *p : producers) {
+                Stmt w = Evaluate::make(Call::make(
+                    Int(32), Call::async_wait,
+                    {Expr((int)CompletionKind::CpAsyncBulk), Expr((int)SyncScope::Block),
+                     mbar_ref(p->name, vv % Q), parity},
+                    Call::Intrinsic));
+                waits = waits.defined() ? Block::make(waits, w) : w;
+            }
+            consumer_body = Block::make(waits, consumer_stmt);
+        }
+        Stmt consume_unit = wrap_lets(lets, consumer_body);
 
-        const std::string &v = op->name;
         // Produce EVERY pipelined producer at iteration `idx` (preserving original order).
         auto produce_all = [&](const Expr &idx) {
             Stmt s;
@@ -164,7 +207,26 @@ class SoftwarePipeline : public IRMutator {
             epilogue = epilogue.defined() ? Block::make(epilogue, c) : c;
         }
 
-        return Block::make({prologue, steady, epilogue});
+        Stmt result = Block::make({prologue, steady, epilogue});
+        if (gpu) {
+            // Allocate + init one depth-Q full_mbar per producer, wrapping the rotated region. count=1:
+            // a TMA producer arrives exactly once (expect_tx). PatchTmaMbarCounts keeps it at 1.
+            for (const ProducerConsumer *p : producers) {
+                Stmt init = Evaluate::make(Call::make(Int(32), "mbarrier_init",
+                                                      {mbar_ref(p->name, 0), Expr(Q), Expr(1)},
+                                                      Call::Intrinsic));
+                result = Block::make(init, result);
+                result = Allocate::make(p->name + ".full_mbar", UInt(64), MemoryType::GPUShared,
+                                        {Expr(Q)}, const_true(), result);
+            }
+        }
+        return result;
+    }
+
+    // A reference to producer `prod`'s ring full_mbar at ring slot `slot` (a UInt64 shared array of Q).
+    static Expr mbar_ref(const std::string &prod, Expr slot) {
+        return Load::make(UInt(64), prod + ".full_mbar", std::move(slot), Buffer<>{}, Parameter{},
+                          const_true(), ModulusRemainder{});
     }
 
     // Rebuild the For with a (possibly) mutated body, preserving all fork fields.
