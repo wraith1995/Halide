@@ -629,6 +629,13 @@ public:
     bool &async();
     bool async() const;
 
+    /** Realize this producer's lead-ahead via an intra-execution-unit loop pipeline
+     * (peel/rotate) rather than a separate executor. A peer of \ref async (not a value
+     * of it). Requires ring_buffer. See \ref Func::software_pipeline. STUB: lowering not
+     * yet implemented. */
+    bool &software_pipeline();
+    bool software_pipeline() const;
+
     /** Explicit warp-group assignment (F2): the warp-group index/indices this Function runs
      * on within a GPU block, for warp specialization. Empty = unset (derived). A single index
      * pins a role; a list spans/splits across several groups. See \ref Func::gpu_warp_group. */

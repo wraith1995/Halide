@@ -2361,6 +2361,21 @@ public:
      */
     Func &async();
 
+    /** Pipeline this producer within its consumer's serial loop: instead of running it on
+     * a separate executor (\ref async), the SAME execution unit issues the producer's work
+     * D iterations ahead into a depth-Q ring and consumes D iterations behind, overlapping
+     * the producer's latency under the consumer's compute (Triton's `num_stages`; classic
+     * CPU modulo-scheduled prefetch). D defaults to ring_buffer depth minus one.
+     *
+     * This is a PEER of \ref async, not a value of it: async = separate-executor lead,
+     * software_pipeline = same-executor (intra-execution-unit) lead. They compose later (a
+     * forked producer whose own loop is pipelined, FA3-style). Requires \ref ring_buffer to
+     * size the ring; lowered as a late peel/rotate pass over frozen placement (it reschedules
+     * in time, it does not skew the iteration domain). STUB: the lowering pass is not yet
+     * implemented and currently errors at lowering rather than silently producing
+     * unpipelined code. */
+    Func &software_pipeline();
+
     /** Explicit warp-group assignment (F2). Pin this Func's computation to specific warp-group
      * index/indices within its GPU block, for warp specialization. The argument is OPTIONAL: with
      * no list (or an empty one) the assignment is derived from .async()/the collective-aware

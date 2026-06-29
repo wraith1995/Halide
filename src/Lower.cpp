@@ -67,6 +67,7 @@
 #include "SlidingWindow.h"
 #include "SplitTuples.h"
 #include "StageStridedLoads.h"
+#include "SoftwarePipeline.h"
 #include "StorageFlattening.h"
 #include "StorageFolding.h"
 #include "StrictifyFloat.h"
@@ -311,6 +312,14 @@ void lower_impl(const vector<Function> &output_funcs,
     debug(1) << "Performing storage flattening...\n";
     s = storage_flattening(s, outputs, env, t);
     log("Lowering after storage flattening:", s);
+
+    // Software pipelining (Func::software_pipeline): runs AFTER storage flattening, so the
+    // ring-buffer slot index is an explicit function of the loop var and substituting the var in a
+    // hoisted produce/consume unit makes the slot follow. A late reschedule over frozen placement
+    // (peel prologue / skew steady-state / drain epilogue); NFC unless a producer requested it.
+    debug(1) << "Software pipelining producers...\n";
+    s = software_pipeline(s, env);
+    log("Lowering after software pipelining:", s);
 
     debug(1) << "Adding atomic mutex allocation...\n";
     s = add_atomic_mutex(s, outputs);

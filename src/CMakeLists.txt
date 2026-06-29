@@ -202,6 +202,7 @@ target_sources(
     SimplifySpecializations.h
     SkipStages.h
     SlidingWindow.h
+    SoftwarePipeline.h
     Solve.h
     SplitTuples.h
     StageStridedLoads.h
@@ -401,6 +402,7 @@ target_sources(
     Solve.cpp
     SpirvIR.cpp
     SpirvIR.h
+    SoftwarePipeline.cpp
     SplitTuples.cpp
     StageStridedLoads.cpp
     StmtToHTML.cpp

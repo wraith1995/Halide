@@ -242,6 +242,11 @@ struct FuncScheduleContents {
     SwizzleLayout swizzle;
     bool memoized = false;
     bool async = false;
+    // Realize this producer's lead-ahead via an intra-execution-unit loop pipeline (peel/rotate)
+    // rather than a separate executor. A PEER of `async` (not a value of it): they may compose later
+    // (a forked producer whose own loop is pipelined). Requires ring_buffer. See Func::software_pipeline.
+    // STUB: the lowering pass is not yet implemented; setting this errors clearly at lowering.
+    bool software_pipeline = false;
     // Explicit warp-group assignment (F2): the warp-group index/indices this Func runs on within
     // a GPU block, for warp specialization. Empty = unset (derive from .async()/collective-aware
     // placement). A single index pins a role (e.g. producer -> group g); a list spans/splits the
@@ -378,6 +383,7 @@ FuncSchedule FuncSchedule::deep_copy(
     copy.contents->memoized = contents->memoized;
     copy.contents->memoize_eviction_key = contents->memoize_eviction_key;
     copy.contents->async = contents->async;
+    copy.contents->software_pipeline = contents->software_pipeline;
     copy.contents->gpu_warp_group = contents->gpu_warp_group;
     copy.contents->gpu_register_budget = contents->gpu_register_budget;
     copy.contents->gpu_register_increase = contents->gpu_register_increase;
@@ -431,6 +437,14 @@ bool &FuncSchedule::async() {
 
 bool FuncSchedule::async() const {
     return contents->async;
+}
+
+bool &FuncSchedule::software_pipeline() {
+    return contents->software_pipeline;
+}
+
+bool FuncSchedule::software_pipeline() const {
+    return contents->software_pipeline;
 }
 
 std::vector<int> &FuncSchedule::gpu_warp_group() {

@@ -2576,6 +2576,12 @@ Func &Func::async() {
     return *this;
 }
 
+Func &Func::software_pipeline() {
+    invalidate_cache();
+    func.schedule().software_pipeline() = true;
+    return *this;
+}
+
 Func &Func::ring_buffer(Expr extent) {
     invalidate_cache();
     func.schedule().ring_buffer() = std::move(extent);

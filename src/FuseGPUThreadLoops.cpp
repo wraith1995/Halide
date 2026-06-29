@@ -3005,7 +3005,16 @@ private:
         Stmt body = mutate(op->body);
         Stmt block = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy,
                                op->device_api, body, op->realization, op->warps_per_group);
+        // The tensor-map descriptor is loop-invariant (one map per producer FUNC, keyed by
+        // src/box/swizzle -- all func-level). A software-pipelined producer is duplicated into
+        // prologue/steady/epilogue copies, so the same `<func>.tma_map` can be pushed several times;
+        // emit one LetStmt per UNIQUE descriptor name (define once, reference many) rather than
+        // shadowing copies that violate global name-uniqueness.
+        std::set<std::string> emitted_maps;
         for (auto it = pending_maps.rbegin(); it != pending_maps.rend(); ++it) {
+            if (!emitted_maps.insert(it->var).second) {
+                continue;
+            }
             // box dims are descriptor parameters (inner contiguous, then outer); swizzle in bytes
             // (0 = NONE) = the consumer's store_in swizzle, so the TMA shared layout matches.
             Expr buf = Variable::make(type_of<halide_buffer_t *>(), it->src + ".buffer");
