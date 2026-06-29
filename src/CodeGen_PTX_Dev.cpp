@@ -650,6 +650,23 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         value = ConstantInt::get(i32_t, 0);
         return;
     }
+    if (op->is_intrinsic() && op->name == "mbarrier_arrive") {
+        // Plain count arrive on the empty (WAR) ring edge: this consumer thread, having drained its
+        // wgmma read of the slot (the wgmma.wait_group precedes this), signals the slot free. Every
+        // block thread executes it and increments the mbarrier's pending count by 1; when the count
+        // (= block thread total, set by mbarrier_init) is reached the phase flips and the producer
+        // Q iters ahead unblocks. No election guard (all consumers arrive), no expect_tx/cp.async
+        // coupling -- a pure count handshake. The .b64 state result is discarded via a scratch reg.
+        internal_assert(op->args.size() == 1u) << "mbarrier_arrive expects (mbar_ref).\n";
+        llvm::Value *addr = mbar_shared_addr(op->args[0]);
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t}, false);
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(
+            ft, "{ .reg .b64 mbar_s; mbarrier.arrive.shared.b64 mbar_s, [$0]; }", "r",
+            /*hasSideEffects*/ true);
+        builder->CreateCall(ia, {addr});
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
     if (op->is_intrinsic() && op->name == "mbarrier_arrive_expect_tx") {
         // TMA (F4): the issuing thread arms the mbarrier with the EXPECTED transaction byte count of
         // an in-flight bulk-tensor copy. cp.async.bulk.tensor decrements this tx count as the bytes

@@ -12,6 +12,7 @@
 #include "Simplify.h"
 #include "Substitute.h"
 #include "UniquifyVariableNames.h"
+#include "Util.h"
 
 namespace Halide {
 namespace Internal {
@@ -141,6 +142,11 @@ class SoftwarePipeline : public IRMutator {
             auto it = env.find(producers[0]->name);
             gpu = it != env.end() && it->second.schedule().memory_type() == MemoryType::GPUShared;
         }
+        // The explicit empty (WAR / buffer-reuse) mbarrier edge -- the CUTLASS PipelineTmaAsync dual of
+        // the full edge. Gated (default OFF) so the default uniform pipeline output stays byte-identical;
+        // it pairs with HL_WG_MEMBAR, which (once the empty edge makes correctness independent of the
+        // conservative bar.sync wall) may remove that wall. See research/empty_mbarrier_subproject.md.
+        const bool emit_empty = gpu && get_env_variable("HL_WG_SP_EMPTY") == "1";
 
         // Build one hoisted unit per producer + one for the shared consumer. The lets are pure
         // address math, so duplicating them into each unit is safe (the simplifier drops unused
@@ -149,6 +155,20 @@ class SoftwarePipeline : public IRMutator {
         produce_units.reserve(producers.size());
         for (const ProducerConsumer *p : producers) {
             Stmt pbody = p->body;
+            if (emit_empty) {
+                // Empty (WAR) edge -- producer_acquire: BEFORE overwriting ring slot v%Q with this
+                // tile's TMA, wait until the consumer has finished reading the slot's PREVIOUS occupant
+                // (tile v-Q). The consumer signals that via async_release on empty_mbar[v%Q]. Slot s is
+                // released after consuming tiles s, s+Q, ...; the producer of tile v (=s+kQ, k=v/Q)
+                // needs release #(k-1), which completed empty-phase (k-1) -- parity (v/Q+1)%2 (== (k-1)
+                // mod 2, kept non-negative). SKIP the first Q tiles per slot (v < min+Q): the slots
+                // start free, so there is no prior occupant to wait on (matches mbarrier_init phase 0).
+                Stmt acquire = Evaluate::make(Call::make(
+                    Int(32), Call::async_acquire,
+                    {empty_mbar_ref(p->name, vv % Q), (vv / Q + 1) % 2}, Call::Intrinsic));
+                acquire = IfThenElse::make(vv >= op->min + Q, acquire);
+                pbody = Block::make(acquire, pbody);
+            }
             if (gpu) {
                 // After the cooperative store (match_tile_copy reads the store), arm the ring slot:
                 // async_issue(CpAsyncBulk, full_mbar[v%Q], bytes) -- find_ring_mbar grabs args[1].
@@ -175,6 +195,19 @@ class SoftwarePipeline : public IRMutator {
                 waits = waits.defined() ? Block::make(waits, w) : w;
             }
             consumer_body = Block::make(waits, consumer_stmt);
+        }
+        if (emit_empty) {
+            // Empty (WAR) edge -- consumer_release: AFTER the consumer drains its wgmma read of slot
+            // v%Q (the wgmma.wait_group is emitted at the tail of the consumer's collective, so any
+            // statement sequenced after consumer_stmt runs once the async read has retired), signal the
+            // slot free so the producer Q iterations ahead may reuse it. Every consumer thread arrives
+            // (a plain mbarrier.arrive, +1 each); empty_mbar's expected count is the block thread total,
+            // patched once it is known (FuseGPUThreadLoops). One release per producer ring slot.
+            for (const ProducerConsumer *p : producers) {
+                Stmt rel = Evaluate::make(Call::make(
+                    Int(32), Call::async_release, {empty_mbar_ref(p->name, vv % Q)}, Call::Intrinsic));
+                consumer_body = Block::make(consumer_body, rel);
+            }
         }
         Stmt consume_unit = wrap_lets(lets, consumer_body);
 
@@ -218,6 +251,20 @@ class SoftwarePipeline : public IRMutator {
                 result = Block::make(init, result);
                 result = Allocate::make(p->name + ".full_mbar", UInt(64), MemoryType::GPUShared,
                                         {Expr(Q)}, const_true(), result);
+                if (emit_empty) {
+                    // The dual empty_mbar (buffer-reuse/WAR edge). Its expected arrival count = the
+                    // number of consumer threads that arrive (every thread in the block), unknown until
+                    // the thread loops are fused -- emit a 0 placeholder; PatchEmptyMbarCounts sets it to
+                    // the block thread total in FuseGPUThreadLoops. Phase 0 + "slots start free" is
+                    // realized by the skip-first-Q guard on producer_acquire (no arrive precedes the
+                    // first Q waits).
+                    Stmt einit = Evaluate::make(Call::make(Int(32), "mbarrier_init",
+                                                           {empty_mbar_ref(p->name, 0), Expr(Q), Expr(0)},
+                                                           Call::Intrinsic));
+                    result = Block::make(einit, result);
+                    result = Allocate::make(p->name + ".empty_mbar", UInt(64), MemoryType::GPUShared,
+                                            {Expr(Q)}, const_true(), result);
+                }
             }
         }
         return result;
@@ -226,6 +273,12 @@ class SoftwarePipeline : public IRMutator {
     // A reference to producer `prod`'s ring full_mbar at ring slot `slot` (a UInt64 shared array of Q).
     static Expr mbar_ref(const std::string &prod, Expr slot) {
         return Load::make(UInt(64), prod + ".full_mbar", std::move(slot), Buffer<>{}, Parameter{},
+                          const_true(), ModulusRemainder{});
+    }
+
+    // The dual: producer `prod`'s ring empty_mbar at ring slot `slot` (a UInt64 shared array of Q).
+    static Expr empty_mbar_ref(const std::string &prod, Expr slot) {
+        return Load::make(UInt(64), prod + ".empty_mbar", std::move(slot), Buffer<>{}, Parameter{},
                           const_true(), ModulusRemainder{});
     }
 

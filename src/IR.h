@@ -629,7 +629,16 @@ struct Call : public ExprNode<Call> {
         // C.1a / gpu_sync_model.md). Side-effecting; never reaches codegen unlowered.
         // async_issue(kind, token, [bytes]) marks the producer's arrive/commit;
         // async_wait(kind, scope, token) the consumer's wait.
+        //
+        // async_acquire / async_release are the DUAL pair on the buffer-reuse (WAR) edge of a ring:
+        // the consumer signals a slot is free (release -> a plain mbarrier arrive) and the producer
+        // waits for it before overwriting that slot (acquire -> mbarrier try_wait.parity). They model
+        // the CUTLASS PipelineTmaAsync "empty" mbarrier, the dual of the "full" (data-ready) edge
+        // carried by async_issue/async_wait. async_acquire(token, parity); async_release(token).
+        // Side-effecting; never reaches codegen unlowered (same selector seam as async_issue/wait).
+        async_acquire,
         async_issue,
+        async_release,
         async_wait,
         bitwise_and,
         bitwise_not,

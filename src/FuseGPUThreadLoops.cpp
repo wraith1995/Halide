@@ -1812,6 +1812,42 @@ public:
 Stmt flatten_warp_spec_forks(const Stmt &s, int warp_size,
                              const std::map<std::string, Function> &env);
 
+// Set the expected-arrival count on every software-pipeline empty_mbar to the block thread total.
+// SoftwarePipeline emits empty_mbar's mbarrier_init with a 0 placeholder because the consumer-thread
+// count (every thread arrives on the WAR edge) is only known once the thread loops are fused. We run
+// this with that count in hand. Mirrors PatchTmaMbarCounts; keyed on the ".empty_mbar" buffer suffix.
+class PatchEmptyMbarCounts : public IRMutator {
+    const Expr count;
+    using IRMutator::visit;
+    static std::string buffer_of(const Expr &e) {
+        class NameOf : public IRVisitor {
+            using IRVisitor::visit;
+            void visit(const Load *l) override { if (name.empty()) name = l->name; IRVisitor::visit(l); }
+        public: std::string name;
+        } n;
+        e.accept(&n);
+        return n.name;
+    }
+    Expr visit(const Call *op) override {
+        if (op->name == "mbarrier_init") {
+            std::vector<Expr> args = op->args;
+            bool changed = false;
+            for (size_t i = 0; i + 2 < args.size(); i += 3) {
+                if (ends_with(buffer_of(args[i]), ".empty_mbar")) {
+                    args[i + 2] = count;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                return Call::make(op->type, op->name, args, op->call_type);
+            }
+        }
+        return IRMutator::visit(op);
+    }
+public:
+    explicit PatchEmptyMbarCounts(Expr count) : count(std::move(count)) {}
+};
+
 class FuseGPUThreadLoops : public IRMutator {
     const int warp_size;
     const std::map<std::string, Function> &env;
@@ -1842,6 +1878,16 @@ protected:
             // Do the analysis of thread block size and shared memory usage.
             ExtractBlockSize block_size;
             loop.accept(&block_size);
+
+            // The software-pipeline empty_mbar (WAR edge) expects an arrive from every block thread;
+            // its init count placeholder is now resolvable to the block thread total.
+            {
+                Expr total_threads = 1;
+                for (int d = 0; d < block_size.threads_dimensions(); d++) {
+                    total_threads = total_threads * block_size.num_threads(d);
+                }
+                loop = PatchEmptyMbarCounts(simplify(total_threads))(loop);
+            }
 
             ExtractSharedAndHeapAllocations block_allocations(op->device_api);
             loop = block_allocations(loop);
@@ -3061,6 +3107,23 @@ class LowerAsyncCompletions : public IRMutator {
                 return Call::make(Int(32), "mbarrier_try_wait",
                                   {mutate(op->args[2]), mutate(op->args[3])}, Call::Intrinsic);
             }
+        }
+        if (op->is_intrinsic(Call::async_acquire)) {
+            // The empty (WAR) edge's wait: the producer spins on empty_mbar[slot] until the consumer
+            // has released the slot's previous occupant. Same mechanism as the full-edge consumer wait
+            // (mbarrier try_wait.parity); only the role (producer waits) and barrier (empty) differ.
+            internal_assert(op->args.size() == 2)
+                << "async_acquire expects (token, parity).\n";
+            return Call::make(Int(32), "mbarrier_try_wait",
+                              {mutate(op->args[0]), mutate(op->args[1])}, Call::Intrinsic);
+        }
+        if (op->is_intrinsic(Call::async_release)) {
+            // The empty (WAR) edge's arrive: every consumer thread signals empty_mbar[slot] free with a
+            // plain mbarrier.arrive (+1). When all block threads have arrived the phase flips and the
+            // producer Q iters ahead unblocks. No expect_tx / no cp.async coupling -- a count handshake.
+            internal_assert(op->args.size() == 1)
+                << "async_release expects (token).\n";
+            return Call::make(Int(32), "mbarrier_arrive", {mutate(op->args[0])}, Call::Intrinsic);
         }
         return IRMutator::visit(op);
     }
