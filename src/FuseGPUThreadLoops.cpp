@@ -1652,7 +1652,15 @@ protected:
                     war_waw = true;
                     mask |= CodeGen_GPU_Dev::MemoryFenceType::Device;
                 }
-                if (!any_match && !war_waw) {
+                // BISECTION (HL_WG_MEMBAR_KEEPTMA): keep the barrier whenever `rest` READS a TMA tile
+                // (a consume block), to test whether the consume-side ordering is the load-bearing one.
+                bool rest_reads_tma = false;
+                if (get_env_variable("HL_WG_MEMBAR_KEEPTMA") == "1") {
+                    for (const auto &ld : shared_loads) {
+                        if (tma_dst_mbar.count(ld)) { rest_reads_tma = true; break; }
+                    }
+                }
+                if (!any_match && !war_waw && !rest_reads_tma) {
                     // No within-block hazard needing a barrier HERE. But keep injected_barrier set so
                     // the enclosing serial loop still emits its once-per-iteration end barrier, which
                     // (after the consume's wgmma.wait_group) orders the CROSS-iteration ring slot reuse
