@@ -1593,17 +1593,17 @@ protected:
             int mask = 0;
             ActiveSet combined;
             bool any_match = false;
+            const bool membar = get_env_variable("HL_WG_MEMBAR") == "1";
             auto consider = [&](const std::set<std::string> &stores,
                                 const std::set<std::string> &loads, int fence) {
                 for (const auto &st : stores) {
                     if (loads.count(st)) {
-                        // Redundant-barrier elimination: if `st` is a TMA shared dst whose completion
-                        // mbarrier is try_wait'd (all threads) by the consumer, that wait is the CTA-
-                        // wide ordering point (Hopper mbarrier.try_wait.parity) -- the block barrier is
-                        // redundant. Skip it. (Only fires for TMA-completed buffers; plain shared
-                        // stores still barrier, so NFC for the warp-spec / synchronous paths.)
+                        // Redundant-barrier elimination (membar mode only, so the default path is
+                        // byte-identical NFC): if `st` is a TMA shared dst whose completion mbarrier is
+                        // try_wait'd (all threads) by the consumer, that wait is the CTA-wide ordering
+                        // point (Hopper mbarrier.try_wait.parity) and the block barrier is redundant.
                         auto mi = tma_dst_mbar.find(st);
-                        if (mi != tma_dst_mbar.end() && mbar_waited.count(mi->second)) {
+                        if (membar && mi != tma_dst_mbar.end() && mbar_waited.count(mi->second)) {
                             continue;
                         }
                         mask |= fence;
@@ -1626,7 +1626,7 @@ protected:
             // (first load/store of a buffer that REST stores) -- e.g. the ring slot-reuse edge: the
             // next iteration's TMA store vs the previous (async) wgmma read. Default (flag off) keeps
             // the conservative unconditional barrier (byte-identical NFC).
-            if (get_env_variable("HL_WG_MEMBAR") == "1") {
+            if (membar) {
                 auto intersects = [](const std::set<std::string> &a, const std::set<std::string> &b) {
                     for (const auto &x : a) {
                         if (b.count(x)) return true;
