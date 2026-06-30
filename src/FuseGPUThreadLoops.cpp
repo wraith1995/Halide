@@ -1749,7 +1749,11 @@ protected:
             if (lean_cpasync && any_match &&
                 exec.scope(combined) == ExecScope::Block &&
                 contains_cp_async(first) && contains_cp_async(rest)) {
-                return Block::make(first, rest);
+                // Drop the redundant CTA bar.sync, but CLOSE the cp.async group here so the per-stage
+                // wait_group accounting (the full-edge data-ready carrier) is byte-identical to NFC --
+                // commit_group is per-thread + barrier-free, so the produce stays unfenced (§8).
+                Stmt commit = Evaluate::make(Call::make(Int(32), "cp_async_commit", {}, Call::Intrinsic));
+                return Block::make({first, commit, rest});
             }
             return Block::make({first, make_barrier(mask), rest});
         } else {

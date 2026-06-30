@@ -694,6 +694,21 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         value = ConstantInt::get(i32_t, 0);
         return;
     }
+    if (op->is_intrinsic() && op->name == "cp_async_commit") {
+        // COMMIT-ONLY group boundary (HL_CPASYNC_LEAN_BAR, async_storage_model.md §8). When
+        // InjectThreadBarriers ELIDES the redundant inter-producer CTA bar.sync, the per-stage
+        // cp.async group accounting (the FULL-edge data-ready carrier, `cp.async.wait_group N`)
+        // must still be preserved -- otherwise the producers merge into one group and the prologue
+        // fill goes uncommitted, breaking `wait_group`. So we close the current cp.async group here
+        // WITHOUT a barrier: this is the bar.sync collapse with the group structure kept identical
+        // to NFC. Not a sync point -- commit_group is per-thread, cheap, leaves the produce unfenced.
+        llvm::Function *commit = llvm::Intrinsic::getOrInsertDeclaration(
+            module.get(), llvm::Intrinsic::nvvm_cp_async_commit_group);
+        builder->CreateCall(commit);
+        emitted_cp_async = false;  // this group is committed; the next cp.async issue reopens one
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
     if (op->is_intrinsic() && op->name == "mbarrier_arrive") {
         // Plain count arrive on the empty (WAR) ring edge: this consumer thread, having drained its
         // wgmma read of the slot (the wgmma.wait_group precedes this), signals the slot free. Every
