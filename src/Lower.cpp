@@ -390,6 +390,14 @@ void lower_impl(const vector<Function> &output_funcs,
         debug(1) << "Recognizing TMA tile copies...\n";
         s = inject_tma_copies(s, t);
         log("Lowering after recognizing TMA tile copies:", s);
+
+        // Recognize cooperative global->shared staging copies whose producer carries the async? bit
+        // (.async()/.async(var)) and rewrite them to explicit cp.async (cp_async_copy). Makes cp.async
+        // a deliberate schedule choice rather than a codegen pattern-match; runs after TMA (which wins
+        // where applied), before async-completion lowering + fuse. NFC unless a producer is async.
+        debug(1) << "Recognizing cp.async tile copies...\n";
+        s = inject_cp_async_copies(s, env, t);
+        log("Lowering after recognizing cp.async tile copies:", s);
     }
 
     if (t.has_gpu_feature()) {

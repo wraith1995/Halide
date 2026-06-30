@@ -2361,6 +2361,16 @@ public:
      */
     Func &async();
 
+    /** Place this producer's async movement at a specific execution LEVEL (the dual-lattice
+     * placement primitive): `level` is the loop var naming the resource that issues the movement.
+     * A thread-level var (e.g. the producer's own gpu_threads var) requests a COOPERATIVE, same-warp
+     * async movement issued by the consumer's own threads — a GPUShared staging copy so placed lowers
+     * to cp.async (LDGSTS), with NO dedicated producer warp (unlike bare \ref async, which is a
+     * separate-warp executor). Composes with \ref vectorize (the 128-bit collective), \ref store_in,
+     * \ref ring_buffer, and \ref software_pipeline. Unlike bare \ref async this does NOT set the
+     * separate-executor async bit, so it does not trigger warp specialization. */
+    Func &async(const VarOrRVar &level);
+
     /** Pipeline this producer within its consumer's serial loop: instead of running it on
      * a separate executor (\ref async), the SAME execution unit issues the producer's work
      * D iterations ahead into a depth-Q ring and consumes D iterations behind, overlapping

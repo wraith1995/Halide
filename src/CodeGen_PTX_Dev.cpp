@@ -666,6 +666,34 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         value = ConstantInt::get(i32_t, 0);
         return;
     }
+    if (op->is_intrinsic() && op->name == "cp_async_copy") {
+        // Explicit cp.async cooperative staging copy (emitted by inject_cp_async_copies, replacing the
+        // old vectorized-Store pattern-match here). Each lane copies one 16-byte chunk global->shared
+        // directly, bypassing registers: cp.async.cg.shared.global.16. The downstream
+        // gpu_thread_barrier / named barrier commits + waits the cp.async group (emitted_cp_async).
+        // Args: (dst, src) -- scalar Load carriers giving (buffer name, element type, base index);
+        // their indices carry the cooperative per-thread offset (thread-flattened upstream).
+        internal_assert(op->args.size() == 2u) << "cp_async_copy expects (dst, src).\n";
+        const Load *d = op->args[0].as<Load>();
+        const Load *sld = op->args[1].as<Load>();
+        internal_assert(d && sld) << "cp_async_copy args must be Load carriers.\n";
+        Value *dst = codegen_buffer_pointer(d->name, d->type.element_of(), d->index);
+        Value *src = codegen_buffer_pointer(sld->name, sld->type.element_of(), sld->index);
+        // cp.async copies global (as1) -> shared (as3). dst must be shared; src must be global (cast a
+        // generic as0 pointer to as1).
+        unsigned src_as = src->getType()->getPointerAddressSpace();
+        internal_assert(dst->getType()->getPointerAddressSpace() == 3 && src_as != 3)
+            << "cp_async_copy expects a shared dst and a non-shared (global) src.\n";
+        if (src_as != 1) {
+            src = builder->CreateAddrSpaceCast(src, llvm::PointerType::get(*context, 1));
+        }
+        llvm::Function *cp = llvm::Intrinsic::getOrInsertDeclaration(
+            module.get(), llvm::Intrinsic::nvvm_cp_async_cg_shared_global_16);
+        builder->CreateCall(cp, {dst, src});
+        emitted_cp_async = true;
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
     if (op->is_intrinsic() && op->name == "mbarrier_arrive") {
         // Plain count arrive on the empty (WAR) ring edge: this consumer thread, having drained its
         // wgmma read of the slot (the wgmma.wait_group precedes this), signals the slot free. Every
@@ -1071,41 +1099,11 @@ void CodeGen_PTX_Dev::visit(const Load *op) {
 }
 
 void CodeGen_PTX_Dev::visit(const Store *op) {
-    // P1: a vectorized (4-wide, 16 B) contiguous copy from global to shared lowers to
-    // `cp.async.cg.shared.global.16`, which copies global->shared directly (bypassing
-    // registers) — the codegen of a vectorized shared<-global copy, gated on sm_80+.
-    // Detect `Store(shared, Load(global))` with matching unit-stride 4-wide ramps. The
-    // following gpu_thread_barrier commits + waits (synchronous; ring_buffer adds overlap).
-    if (!emit_atomic_stores && target.get_cuda_capability_lower_bound() >= 80 &&
-        get_env_variable("HL_NO_CP_ASYNC").empty() &&
-        is_const_one(op->predicate)) {
-        const Ramp *r = op->index.as<Ramp>();
-        const Load *ld = op->value.as<Load>();
-        const Ramp *lr = ld ? ld->index.as<Ramp>() : nullptr;
-        // cp.async.cg moves a 16-byte chunk; accept any element width whose contiguous
-        // vector is 16 B -- 4-wide 32-bit, or 8-wide 16-bit (the f16 core-matrix ki run
-        // produced by a vectorized operand staging copy, P3/1.2).
-        int payload_bits = r ? op->value.type().bits() * r->lanes : 0;
-        if (r && ld && lr && is_const_one(ld->predicate) &&
-            is_const_one(r->stride) && is_const_one(lr->stride) &&
-            payload_bits == 128 && lr->lanes == r->lanes) {
-            Value *dst = codegen_buffer_pointer(op->name, op->value.type().element_of(), r->base);
-            Value *src = codegen_buffer_pointer(ld->name, ld->type.element_of(), lr->base);
-            // cp.async copies global (as1) -> shared (as3). dst must be shared; src must be
-            // global (cast a generic as0 pointer to as1; skip a shared->shared copy).
-            unsigned src_as = src->getType()->getPointerAddressSpace();
-            if (dst->getType()->getPointerAddressSpace() == 3 && src_as != 3) {
-                if (src_as != 1) {
-                    src = builder->CreateAddrSpaceCast(src, llvm::PointerType::get(*context, 1));
-                }
-                llvm::Function *cp = llvm::Intrinsic::getOrInsertDeclaration(
-                    module.get(), llvm::Intrinsic::nvvm_cp_async_cg_shared_global_16);
-                builder->CreateCall(cp, {dst, src});
-                emitted_cp_async = true;
-                return;
-            }
-        }
-    }
+    // NOTE: cp.async cooperative staging copies are NO LONGER pattern-matched here. They are
+    // recognized at the IR level by inject_cp_async_copies (a deliberate schedule choice via the
+    // async? bit, .async()/.async(var)) and lowered from the explicit `cp_async_copy` intrinsic in
+    // visit(Call) above. A vectorized shared<-global Store with no async? bit therefore lowers as an
+    // ordinary (synchronous) vectorized ld/st below -- the synchronous cell of the model.
 
     // Issue atomic store if we are inside an Atomic node.
     if (emit_atomic_stores) {

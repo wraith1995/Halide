@@ -625,9 +625,21 @@ public:
     Expr memoize_eviction_key() const;
     // @}
 
-    /** Is the production of this Function done asynchronously */
+    /** Is the production of this Function done asynchronously on a SEPARATE executor (the model's
+     * "async = separate-executor lead"). On GPU + store_in(GPUShared) this is the warp-specialization
+     * trigger (a dedicated producer warp). See also \ref async_level for SAME-resource (cooperative)
+     * async placement, which does NOT set this bool. */
     bool &async();
     bool async() const;
+
+    /** The execution-level (loop var name) at which an async movement is PLACED, when async is
+     * requested at a finer granularity than a separate executor (\ref Func::async(VarOrRVar)). Empty
+     * = unset (bare \ref async = separate-warp placement). A thread-level var = cooperative same-warp
+     * movement (e.g. a GPUShared staging copy lowers to cp.async issued by the consumer's own
+     * threads). The dual-lattice "async? bit" is set if EITHER \ref async or this is set; the WARP
+     * specialization fork is gated on bare \ref async only. */
+    std::string &async_level();
+    const std::string &async_level() const;
 
     /** Realize this producer's lead-ahead via an intra-execution-unit loop pipeline
      * (peel/rotate) rather than a separate executor. A peer of \ref async (not a value

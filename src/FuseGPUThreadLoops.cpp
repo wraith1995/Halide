@@ -1563,6 +1563,19 @@ protected:
             }
             return with_elected_lane(op, 5);
         }
+        if (op->is_intrinsic() && op->name == "cp_async_copy") {
+            // cp_async_copy WRITES its shared destination (arg 0, a Load carrier) via cp.async --
+            // register it as a shared STORE so the produce->consume scan GENERATES the CTA barrier
+            // (the old plain Store did this implicitly; the intrinsic must do it explicitly). Mirrors
+            // the tma_load_2d case, but cooperative: every lane issues its own copy (no elected lane).
+            if (const Load *dst = op->args[0].as<Load>()) {
+                if (memory_type_for_name(dst->name) == MemoryType::GPUShared) {
+                    shared_stores.insert(dst->name);
+                    record_active(store_active, dst->name);
+                }
+            }
+            return op;
+        }
         if (op->is_intrinsic() && op->name == "mbarrier_arrive_expect_tx") {
             return with_elected_lane(op, 2);
         }
@@ -3524,6 +3537,84 @@ Stmt lower_async_completions(Stmt s, const Target &t) {
         return s;
     }
     return LowerAsyncCompletions()(s);
+}
+
+namespace {
+// Rewrite a cooperative global->shared staging copy to an explicit cp_async_copy intrinsic, but ONLY
+// inside a producer carrying the async? movement bit (is_gpu_async_movement). This makes cp.async a
+// deliberate schedule choice (the async? bit), not a codegen pattern-match: a vectorized shared<-global
+// store with no async bit stays a synchronous vectorized ld/st. Mirrors the old CodeGen_PTX_Dev cp.async
+// trigger's match conditions (128-bit unit-stride payload, shared dst, non-shared/global src).
+class InjectCpAsyncCopies : public IRMutator {
+    const std::map<std::string, Function> &env;
+    std::set<std::string> shared_allocs;  // GPUShared alloc names in scope (classify dst vs global src)
+    bool in_async_producer = false;       // currently inside the PRODUCE of an async-movement Func
+    using IRMutator::visit;
+
+    Stmt visit(const Allocate *op) override {
+        bool shared = op->memory_type == MemoryType::GPUShared;
+        if (shared) {
+            shared_allocs.insert(op->name);
+        }
+        Stmt s = IRMutator::visit(op);
+        if (shared) {
+            shared_allocs.erase(op->name);
+        }
+        return s;
+    }
+
+    Stmt visit(const ProducerConsumer *op) override {
+        ScopedValue<bool> save(in_async_producer, in_async_producer);
+        if (op->is_producer) {
+            auto it = env.find(op->name);
+            in_async_producer = shared_allocs.count(op->name) && it != env.end() &&
+                                is_gpu_async_movement(it->second);
+        } else {
+            in_async_producer = false;  // the CONSUME half is not a staging copy
+        }
+        return IRMutator::visit(op);
+    }
+
+    Stmt visit(const Store *op) override {
+        if (in_async_producer) {
+            const Ramp *r = op->index.as<Ramp>();
+            const Load *ld = op->value.as<Load>();
+            const Ramp *lr = ld ? ld->index.as<Ramp>() : nullptr;
+            // cp.async.cg moves a 16-byte chunk; accept any element width whose contiguous unit-stride
+            // vector is 128 bits (4x32b, or the 8x16b f16 core-matrix run). dst must be shared, src
+            // global (a non-shared buffer). Mirrors the removed CodeGen_PTX_Dev::visit(Store) trigger.
+            int payload_bits = r ? op->value.type().bits() * r->lanes : 0;
+            if (is_const_one(op->predicate) && r && ld && lr && is_const_one(ld->predicate) &&
+                is_const_one(r->stride) && is_const_one(lr->stride) && payload_bits == 128 &&
+                lr->lanes == r->lanes && shared_allocs.count(op->name) && !shared_allocs.count(ld->name)) {
+                // Scalar Load carriers (name, element type, ramp base): codegen reconstructs the shared
+                // dst / global src pointers (codegen_buffer_pointer) and emits cp.async.cg.16. Thread-var
+                // flattening (NormalizeDimensionality) substitutes the cooperative per-thread base inside
+                // these Call args, exactly as it would the original Store's index.
+                Expr dst = Load::make(op->value.type().element_of(), op->name, r->base, Buffer<>{},
+                                      Parameter{}, const_true(), ModulusRemainder{});
+                Expr src = Load::make(ld->type.element_of(), ld->name, lr->base, ld->image, ld->param,
+                                      const_true(), ModulusRemainder{});
+                return Evaluate::make(
+                    Call::make(Int(32), "cp_async_copy", {dst, src}, Call::Intrinsic));
+            }
+        }
+        return IRMutator::visit(op);
+    }
+
+public:
+    explicit InjectCpAsyncCopies(const std::map<std::string, Function> &env) : env(env) {
+    }
+};
+}  // namespace
+
+Stmt inject_cp_async_copies(Stmt s, const std::map<std::string, Function> &env, const Target &t) {
+    // cp.async.cg is sm_80+. The HL_NO_CP_ASYNC kill switch forces every staging copy synchronous
+    // (a vectorized ld/st) regardless of the async? bit -- the synchronous cell of the model.
+    if (t.get_cuda_capability_lower_bound() < 80 || !get_env_variable("HL_NO_CP_ASYNC").empty()) {
+        return s;
+    }
+    return InjectCpAsyncCopies(env)(s);
 }
 
 namespace {

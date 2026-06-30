@@ -20,7 +20,18 @@ using std::vector;
  * a block) rather than host-thread async. Detect that case so the host async
  * machinery skips it. */
 bool is_gpu_warp_specialized(const Function &f) {
+    // Only the SEPARATE-executor async (bare .async(), no placement level) forks a producer warp.
+    // A placement-level async (.async(var), async_level set) is a same-resource cooperative movement
+    // (e.g. cp.async) and must NOT warp-specialize.
     return f.schedule().async() &&
+           f.schedule().async_level().empty() &&
+           f.schedule().memory_type() == MemoryType::GPUShared;
+}
+
+bool is_gpu_async_movement(const Function &f) {
+    // The dual-lattice "async? movement bit": the production carries an async movement (set by either
+    // bare .async() -- separate-warp -- or .async(var) -- cooperative placement) into GPU shared.
+    return (f.schedule().async() || !f.schedule().async_level().empty()) &&
            f.schedule().memory_type() == MemoryType::GPUShared;
 }
 

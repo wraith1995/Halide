@@ -54,6 +54,19 @@ Stmt lower_gpu_warp_async(Stmt s, const std::map<std::string, Function> &env, co
  * fusegpu_rearch_plan.md C.3/C.4a/M4. */
 Stmt inject_tma_copies(Stmt s, const Target &t);
 
+/** Recognize a cooperative global->shared staging copy whose producing Func carries an async
+ * MOVEMENT (the dual-lattice async? bit: bare .async() -- warp-specialized -- or .async(var) --
+ * same-warp cooperative) and rewrite each vectorized 128-bit `Store(shared, Load(global))` to an
+ * explicit `cp_async_copy(dst, src)` intrinsic (lowered to cp.async.cg in codegen). This makes
+ * cp.async a DELIBERATE schedule choice (the async? bit), not a codegen pattern-match: a vectorized
+ * shared<-global store with NO async bit stays a synchronous vectorized ld/st (a selectable cell).
+ * The cp_async_copy dst (arg 0, a Load carrier) registers as a shared store in InjectThreadBarriers,
+ * so the produce->consume barrier is generated; thread-var flattening substitutes the cooperative
+ * per-thread addresses inside the Call args. Runs after inject_tma_copies (TMA wins where applied),
+ * before lower_async_completions. Gated on sm_80+. See research/async_storage_model.md (the dual
+ * lattice), research/cpasync_overlap_handoff.md. */
+Stmt inject_cp_async_copies(Stmt s, const std::map<std::string, Function> &env, const Target &t);
+
 /** Lower async-completion requirements (Call::async_issue / async_wait, CompletionKind x
  * SyncScope x target) to their concrete mechanism. The CpAsyncBulk (sm_90 cp.async.bulk / TMA)
  * path becomes an mbarrier transaction: async_issue -> mbarrier_arrive_expect_tx, async_wait ->

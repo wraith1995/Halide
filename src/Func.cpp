@@ -2576,6 +2576,16 @@ Func &Func::async() {
     return *this;
 }
 
+Func &Func::async(const VarOrRVar &level) {
+    invalidate_cache();
+    // Placement-level async (model's finer-grained placement primitive). Records the level var name
+    // ONLY (does NOT set the separate-executor async bit), so the cooperative same-warp movement does
+    // not engage the warp-spec fork / separate-executor async machinery. The async movement bit is
+    // (async() || !async_level().empty()).
+    func.schedule().async_level() = level.name();
+    return *this;
+}
+
 Func &Func::software_pipeline() {
     invalidate_cache();
     func.schedule().software_pipeline() = true;

@@ -242,6 +242,12 @@ struct FuncScheduleContents {
     SwizzleLayout swizzle;
     bool memoized = false;
     bool async = false;
+    // Execution-level (loop var name) at which an async movement is placed, when requested at a
+    // finer granularity than a separate executor (Func::async(VarOrRVar)). Empty = unset (bare
+    // `async` = separate-warp placement). A thread-level var = cooperative same-warp movement
+    // (cp.async). Does NOT set `async`, so the separate-executor async machinery (StorageFolding /
+    // AsyncProducers fork) stays keyed to `async` and untouched by cooperative placement.
+    std::string async_level;
     // Realize this producer's lead-ahead via an intra-execution-unit loop pipeline (peel/rotate)
     // rather than a separate executor. A PEER of `async` (not a value of it): they may compose later
     // (a forked producer whose own loop is pipelined). Requires ring_buffer. See Func::software_pipeline.
@@ -383,6 +389,7 @@ FuncSchedule FuncSchedule::deep_copy(
     copy.contents->memoized = contents->memoized;
     copy.contents->memoize_eviction_key = contents->memoize_eviction_key;
     copy.contents->async = contents->async;
+    copy.contents->async_level = contents->async_level;
     copy.contents->software_pipeline = contents->software_pipeline;
     copy.contents->gpu_warp_group = contents->gpu_warp_group;
     copy.contents->gpu_register_budget = contents->gpu_register_budget;
@@ -437,6 +444,14 @@ bool &FuncSchedule::async() {
 
 bool FuncSchedule::async() const {
     return contents->async;
+}
+
+std::string &FuncSchedule::async_level() {
+    return contents->async_level;
+}
+
+const std::string &FuncSchedule::async_level() const {
+    return contents->async_level;
 }
 
 bool &FuncSchedule::software_pipeline() {
