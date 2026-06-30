@@ -642,8 +642,19 @@ class RewriteWarpGroupTiles : public IRMutator {
                 debug(0) << "[wgtile] 1b epilogue store #" << i << " (m_it=" << m_it
                          << " frag=" << frag << ") " << op->name << " <- accumulator -> frag slot\n";
             }
-            return Store::make(op->name, value, slot, op->param, op->predicate,
-                               op->alignment);
+            Stmt epi = Store::make(op->name, value, slot, op->param, op->predicate, op->alignment);
+            // WgmmaGroup full-edge completion: when the steady loop keeps N>0 wgmma groups in flight
+            // (HL_WGMMA_INFLIGHT, wgmma pipelining), the accumulator's last N groups are NOT complete at
+            // loop exit. The `C = prod` epilogue reads D, so it must DRAIN first (wgmma.wait_group 0) --
+            // else a RAW on the async MMA output corrupts the result. Emit the drain ONCE, before the
+            // first fragment read (i==0). Gated on HL_WGMMA_INFLIGHT>0 so default builds (drain every
+            // iter already) stay byte-identical NFC.
+            const char *inflight = getenv("HL_WGMMA_INFLIGHT");
+            if (i == 0 && inflight && atoi(inflight) > 0) {
+                Stmt drain = Evaluate::make(Call::make(Int(32), "wgmma_drain", {}, Call::Intrinsic));
+                return Block::make(drain, epi);
+            }
+            return epi;
         }
 
         const VectorReduce *vr = find_vector_reduce(op->value);

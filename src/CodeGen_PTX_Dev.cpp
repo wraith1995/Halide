@@ -709,6 +709,21 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         value = ConstantInt::get(i32_t, 0);
         return;
     }
+    if (op->is_intrinsic() && op->name == "wgmma_drain") {
+        // Full wgmma drain (wgmma.wait_group 0) emitted by LowerWarpGroupTiles right before the
+        // `C = prod` epilogue reads the register accumulator. When the steady loop keeps N>0 wgmma
+        // groups in flight (HL_WGMMA_INFLIGHT, wgmma pipelining), the accumulator's last N groups are
+        // NOT complete at loop exit; reading D then is a RAW hazard on the async MMA output (huge
+        // maxrel). This is the WgmmaGroup full-edge completion: drain to 0 so every wgmma has written D
+        // before the epilogue consumes it. .sync.aligned + side-effecting => a scheduling barrier, so
+        // the accumulator Load below cannot be hoisted above it.
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, false);
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, "wgmma.wait_group.sync.aligned 0;", "",
+                                                   /*hasSideEffects*/ true);
+        builder->CreateCall(ia);
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
     if (op->is_intrinsic() && op->name == "mbarrier_arrive") {
         // Plain count arrive on the empty (WAR) ring edge: this consumer thread, having drained its
         // wgmma read of the slot (the wgmma.wait_group precedes this), signals the slot free. Every
