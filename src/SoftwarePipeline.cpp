@@ -148,6 +148,13 @@ class SoftwarePipeline : public IRMutator {
         // conservative bar.sync wall) may remove that wall. See research/empty_mbarrier_subproject.md.
         const bool emit_empty = gpu && get_env_variable("HL_WG_SP_EMPTY") == "1";
 
+        // The full (data-ready) edge is an mbarrier transaction ONLY when the producer is a TMA bulk
+        // copy (HL_WG_TMA). For a cp.async cooperative-copy producer (no TMA, #9), completion rides the
+        // cp.async group counter committed/waited at the gpu_thread_barrier -- so we emit NO mbarrier
+        // markers here; the prologue/steady/epilogue SKEW + ring_buffer still provide the overlap, and
+        // CodeGen's cp.async.wait_group N (HL_CPASYNC_INFLIGHT) keeps N stages in flight.
+        const bool tma = gpu && get_env_variable("HL_WG_TMA") == "1";
+
         // Build one hoisted unit per producer + one for the shared consumer. The lets are pure
         // address math, so duplicating them into each unit is safe (the simplifier drops unused
         // ones); substituting the loop var then moves both the data address AND the ring slot.
@@ -169,7 +176,7 @@ class SoftwarePipeline : public IRMutator {
                 acquire = IfThenElse::make(vv >= op->min + Q, acquire);
                 pbody = Block::make(acquire, pbody);
             }
-            if (gpu) {
+            if (tma) {
                 // After the cooperative store (match_tile_copy reads the store), arm the ring slot:
                 // async_issue(CpAsyncBulk, full_mbar[v%Q], bytes) -- find_ring_mbar grabs args[1].
                 Stmt issue = Evaluate::make(Call::make(
@@ -181,7 +188,7 @@ class SoftwarePipeline : public IRMutator {
             produce_units.push_back(wrap_lets(lets, ProducerConsumer::make(p->name, true, pbody)));
         }
         Stmt consumer_body = consumer_stmt;
-        if (gpu) {
+        if (tma) {
             // Before the shared consumer, wait on every producer's tile: async_wait(CpAsyncBulk, Block,
             // full_mbar[v%Q], parity=(v/Q)%2). The selector lowers to mbarrier_try_wait.
             Expr parity = (vv / Q) % 2;
@@ -241,7 +248,7 @@ class SoftwarePipeline : public IRMutator {
         }
 
         Stmt result = Block::make({prologue, steady, epilogue});
-        if (gpu) {
+        if (tma) {
             // Allocate + init one depth-Q full_mbar per producer, wrapping the rotated region. count=1:
             // a TMA producer arrives exactly once (expect_tx). PatchTmaMbarCounts keeps it at 1.
             for (const ProducerConsumer *p : producers) {

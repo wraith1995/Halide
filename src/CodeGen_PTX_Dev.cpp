@@ -848,11 +848,16 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         // before the block sync, so the shared data is ready (synchronous cp.async). Each
         // thread waits its own group; the barrier then makes the shared writes visible.
         if (emitted_cp_async) {
+            // PIPELINE (#9, HL_CPASYNC_INFLIGHT=N, default 0): keep N cp.async groups in flight across
+            // the gpu_thread_barrier instead of draining to 0. With a software_pipeline'd ring (skew D),
+            // N=D lets the producer run D K-blocks ahead -- the cp.async overlap. N=0 = synchronous (NFC).
+            std::string cpaf = get_env_variable("HL_CPASYNC_INFLIGHT");
+            int cpa_inflight = cpaf.empty() ? 0 : atoi(cpaf.c_str());
             builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
                 module.get(), llvm::Intrinsic::nvvm_cp_async_commit_group));
             builder->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
                                     module.get(), llvm::Intrinsic::nvvm_cp_async_wait_group),
-                                builder->getInt32(0));
+                                builder->getInt32(cpa_inflight));
             emitted_cp_async = false;
         }
 
