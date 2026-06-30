@@ -730,15 +730,40 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
     }
     if (op->is_intrinsic() && op->name == "mbarrier_try_wait") {
         // Spin on mbarrier.try_wait.parity until the awaited phase (parity = (ko/N)&1) completes,
-        // i.e. all producer cp.async into this slot are visible. Args: (mbar_ref, parity). The
-        // try_wait is emitted as asm returning 0/1; the spin loop is built in LLVM IR.
-        internal_assert(op->args.size() == 2u) << "mbarrier_try_wait expects (mbar_ref, parity).\n";
+        // i.e. all producer cp.async into this slot are visible. Args: (mbar_ref, parity) for the
+        // all-threads full-edge wait, or (mbar_ref, parity, elected_lane) for the empty-edge
+        // producer_acquire -- there ONLY the elected (TMA-issuing) lane needs to wait before it
+        // overwrites the slot, so we gate the spin to that one lane and let every other thread fall
+        // straight through (avoids a 256-thread mbarrier poll storm; the others don't touch the slot
+        // and their own consume is gated by the full edge). The try_wait is emitted as asm returning
+        // 0/1; the spin loop is built in LLVM IR.
+        internal_assert(op->args.size() == 2u || op->args.size() == 3u)
+            << "mbarrier_try_wait expects (mbar_ref, parity[, elected_lane]).\n";
         llvm::Value *addr = mbar_shared_addr(op->args[0]);
         llvm::Value *parity = codegen(op->args[1]);
         llvm::Function *fn = builder->GetInsertBlock()->getParent();
         llvm::BasicBlock *loop_bb = llvm::BasicBlock::Create(*context, "mbar_wait", fn);
         llvm::BasicBlock *after_bb = llvm::BasicBlock::Create(*context, "mbar_ready", fn);
-        builder->CreateBr(loop_bb);
+        if (op->args.size() == 3u) {
+            // Gate: only (tid.x == elected && tid.y == 0 && tid.z == 0) enters the spin; mirrors the
+            // expect_tx election so the acquire-waiter is exactly the TMA issuer. Others skip to after.
+            llvm::Value *elected = codegen(op->args[2]);
+            llvm::FunctionType *eft = llvm::FunctionType::get(i32_t, {i32_t}, false);
+            llvm::InlineAsm *eia = llvm::InlineAsm::get(
+                eft,
+                "{ .reg .pred mbe, mbp; .reg .u32 mbt0, mbt1;\n"
+                "  mov.u32 mbt0, %tid.y; mov.u32 mbt1, %tid.z; or.b32 mbt0, mbt0, mbt1;\n"
+                "  setp.eq.u32 mbp, mbt0, 0;\n"
+                "  mov.u32 mbt0, %tid.x;\n"
+                "  setp.eq.and.u32 mbe, mbt0, $1, mbp;\n"
+                "  selp.u32 $0, 1, 0, mbe; }",
+                "=r,r", /*hasSideEffects*/ true);
+            llvm::Value *am_elected = builder->CreateCall(eia, {elected});
+            llvm::Value *is_elected = builder->CreateICmpNE(am_elected, ConstantInt::get(i32_t, 0));
+            builder->CreateCondBr(is_elected, loop_bb, after_bb);
+        } else {
+            builder->CreateBr(loop_bb);
+        }
         builder->SetInsertPoint(loop_bb);
         llvm::FunctionType *ft = llvm::FunctionType::get(i32_t, {i32_t, i32_t}, false);
         // LLVM IR-level inline asm: operands are $0/$1/$2 and `%` is literal (NOT a GCC-style

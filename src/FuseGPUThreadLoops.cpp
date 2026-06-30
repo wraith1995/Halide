@@ -1567,13 +1567,18 @@ protected:
             return with_elected_lane(op, 2);
         }
         if (op->is_intrinsic() && op->name == "mbarrier_try_wait") {
-            // An all-threads mbarrier wait: record the mbar buffer as a CTA-wide sync point so the
-            // RAW it covers (TMA store -> this consumer's load) needs no extra block barrier.
-            if (!op->args.empty()) {
-                std::string m = load_buffer(op->args[0]);
-                if (!m.empty()) {
-                    mbar_waited.insert(m);
-                }
+            std::string m = op->args.empty() ? std::string() : load_buffer(op->args[0]);
+            if (ends_with(m, ".empty_mbar")) {
+                // Empty (WAR) edge producer_acquire: only the TMA-issuing (elected) lane must wait for
+                // the slot to free before it overwrites it. Tag it with the elected lane so codegen
+                // gates the spin to that one lane (perf: avoids a 256-thread poll storm). It is a
+                // single-lane wait, NOT a CTA-wide sync point, so do not record it in mbar_waited.
+                return with_elected_lane(op, 2);
+            }
+            // Full edge: an all-threads mbarrier wait -- record the mbar buffer as a CTA-wide sync
+            // point so the RAW it covers (TMA store -> this consumer's load) needs no extra block barrier.
+            if (!m.empty()) {
+                mbar_waited.insert(m);
             }
             return IRMutator::visit(op);
         }
