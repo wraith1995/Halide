@@ -1369,6 +1369,24 @@ protected:
         s.accept(&f);
         return f.found;
     }
+    // Does this stmt contain a cooperative cp.async staging copy (the produce of a ring tile via the
+    // per-thread cp.async group, NOT TMA)? Used by the model-derived inter-producer barrier elision
+    // (HL_CPASYNC_LEAN_BAR, async_storage_model.md §8): two consecutive cp_async_copy producers
+    // co-placed on the same Block-cooperative resource feeding one consumer share ONE full-edge
+    // rendezvous, so the earlier producer's CTA barrier is redundant (the later one publishes its
+    // writes too).
+    static bool contains_cp_async(const Stmt &s) {
+        class Finder : public IRVisitor {
+            using IRVisitor::visit;
+            void visit(const Call *op) override {
+                if (op->is_intrinsic() && op->name == "cp_async_copy") found = true;
+                IRVisitor::visit(op);
+            }
+        public: bool found = false;
+        } f;
+        s.accept(&f);
+        return f.found;
+    }
     // Active set of the producing store(s) / consuming load(s) per name (joined over
     // all occurrences), captured alongside the name sets above.
     std::map<std::string, ActiveSet> store_active;
@@ -1625,6 +1643,7 @@ protected:
             ActiveSet combined;
             bool any_match = false;
             const bool membar = get_env_variable("HL_WG_MEMBAR") == "1";
+            const bool lean_cpasync = get_env_variable("HL_CPASYNC_LEAN_BAR") == "1";
             auto consider = [&](const std::set<std::string> &stores,
                                 const std::set<std::string> &loads, int fence) {
                 for (const auto &st : stores) {
@@ -1712,6 +1731,24 @@ protected:
             // byte-identical until an explicit single-thread guard appears (M4 TMA). The
             // WarpGroup-scope named-barrier (count) refinement lands with the ring (M3).
             if (any_match && exec.scope(combined) == ExecScope::Thread) {
+                return Block::make(first, rest);
+            }
+            // CP.ASYNC LEAN BARRIER (HL_CPASYNC_LEAN_BAR, default OFF = byte-identical NFC) -- the
+            // model-derived barrier PLACEMENT (async_storage_model.md §8). This produce->consume Block
+            // barrier sits between TWO cooperative cp.async producers (first issues a cp_async_copy AND
+            // rest issues another before the consume). As/Bs are co-placed on the same resource
+            // (Block-cooperative, scope==Block) feeding the same consumer and complete on the SAME
+            // cp.async group counter, so by §5 they SHARE one full-edge rendezvous: the LATER producer's
+            // barrier (a CTA bar.sync publishes ALL prior cooperative writes, incl. first's) covers this
+            // edge. So this INTER-PRODUCER barrier is redundant -- defer first's visibility to it and
+            // skip HERE. The surviving barrier (after the last producer, before the consume) carries
+            // codegen's commit/wait_group (emitted_cp_async persists across the now-unfenced issues) =
+            // the single consume-site full-edge barrier (Triton's structure). The Block-scope guard
+            // (join(active) cooperative) structurally excludes warp-spec (forked producer => WarpGroup)
+            // and TMA (tma_load_2d, not cp_async_copy) -- the §8 NFC scoping.
+            if (lean_cpasync && any_match &&
+                exec.scope(combined) == ExecScope::Block &&
+                contains_cp_async(first) && contains_cp_async(rest)) {
                 return Block::make(first, rest);
             }
             return Block::make({first, make_barrier(mask), rest});
