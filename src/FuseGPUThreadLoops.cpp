@@ -2548,12 +2548,30 @@ private:
                 }
                 auto iv = as_const_int(simplify(inner));
                 if (iv && *iv == (int64_t)op->warps_per_group * warp_size) {
-                    // Branchless: lower as a normal thread sub-dimension (the warps_per_group==0
-                    // decode path below). The recognizer already emitted the wgmma keyed on this
-                    // axis' thread name; ReplaceForWithIf maps it to threadIdx (no divergent guard,
-                    // extent == blockDim of that dim), so the descriptor/epilogue follow the group
-                    // index at runtime. NFC unless the gate is set.
-                    return IRMutator::visit(op);
+                    // Branchless AND FLAT: fold the warp-group axis into the SINGLE flat thread
+                    // dimension (dim0) instead of promoting it to a separate threadIdx.y. The warp
+                    // group = flat_thread_id / (warps_per_group*warp_size), recovered inside the wgmma
+                    // descriptor/epilogue by FlattenBranchThreads; the single full-block branch's range
+                    // guard is [0,total) (trivially true), so the wgmma stays one CONVERGENT site (no
+                    // serializing WG.AR / ptxas C7520).
+                    //
+                    // Why flat, not a threadIdx.y sub-dim (the old `IRMutator::visit(op)`): a separate
+                    // y-dim makes the CONSUMER (within_group=128, num_groups=2) while a cooperative
+                    // PRODUCER that spans the whole block (e.g. the cp.async staging copy, gpu_threads
+                    // over all 256 lanes) stays (256,1) on dim0. ExtractBlockSize/maxntid take the
+                    // per-dimension MAX *independently*, so the two incompatible factorizations of the
+                    // same 256-thread block inflate to a phantom max(256,128) x max(1,2) = (256,2) = 512
+                    // threads -> ptxas budgets 65536/512 = 128 regs/thread -> the wgmma (needs >128)
+                    // can't compile (C7602 "insufficient registers"). Folding the group into dim0 keeps
+                    // ONE factorization (a flat block of warps_per_group*warp_size*num_groups lanes)
+                    // shared by producer and consumer -- the layout Triton's tl.dot uses. Reuses the
+                    // same flat partitioner as the peeled path, with ONE non-peeled branch (so the group
+                    // index is a runtime fv/stride, not a peeled constant). NFC unless the gate is set.
+                    Stmt body = mutate(op->body);
+                    Stmt branch = For::make(op->name, op->min, op->max, op->for_type,
+                                            op->partition_policy, op->device_api, body,
+                                            op->realization, op->warps_per_group);
+                    return partition_warp_groups({branch}, warp_size, device_api, 0, {}, {});
                 }
             }
             // EXPLICIT wgmma-scope sizing: each group is exactly N warps regardless of
