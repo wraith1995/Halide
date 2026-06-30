@@ -2472,6 +2472,36 @@ private:
         ScopedValue<DeviceAPI> d(device_api,
                                  op->device_api != DeviceAPI::None ? op->device_api : device_api);
         if (op->warps_per_group > 0) {
+            // DESERIALIZE (HL_WG_DECODE): when the inner thread tile ALREADY fills exactly
+            // warps_per_group*warp_size lanes per group (no idle-lane padding needed), the warp
+            // group axis can stay a plain thread sub-dimension (threadIdx decode) instead of being
+            // peeled into CTA-divergent per-group branches. Peeling wraps each group's warp-group
+            // collective (wgmma) in a flat-thread-id range guard `if (fv>=base && fv<base+size)`
+            // (partition_warp_groups), and ptxas then inserts a serializing WG.AR in that divergent
+            // path (warning C7520) -- halving wgmma concurrency for an M-split (e.g. R5's 128x256 =
+            // 2 m64n256 groups). Decoding keeps the wgmma a SINGLE uniform site: the warp-group
+            // index (= threadIdx.y, uniform within a group) feeds the operand descriptor + output
+            // offset branchlessly, so the two groups' wgmmas issue concurrently. Only valid with no
+            // padding (each group is a whole, aligned set of warps) and no per-group setmaxnreg.
+            if (get_env_variable("HL_WG_DECODE") == "1") {
+                ThreadExtents te;
+                op->body.accept(&te);
+                Expr inner = 1;
+                for (int d = 0; d <= te.max_dim; d++) {
+                    if (te.extent[d].defined()) {
+                        inner = inner * te.extent[d];
+                    }
+                }
+                auto iv = as_const_int(simplify(inner));
+                if (iv && *iv == (int64_t)op->warps_per_group * warp_size) {
+                    // Branchless: lower as a normal thread sub-dimension (the warps_per_group==0
+                    // decode path below). The recognizer already emitted the wgmma keyed on this
+                    // axis' thread name; ReplaceForWithIf maps it to threadIdx (no divergent guard,
+                    // extent == blockDim of that dim), so the descriptor/epilogue follow the group
+                    // index at runtime. NFC unless the gate is set.
+                    return IRMutator::visit(op);
+                }
+            }
             // EXPLICIT wgmma-scope sizing: each group is exactly N warps regardless of
             // the thread tile (idle lanes masked). That padding can't be a plain thread
             // dimension, so we peel into N symmetric warp-group branches (group index
