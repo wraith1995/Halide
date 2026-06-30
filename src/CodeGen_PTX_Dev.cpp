@@ -433,7 +433,15 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                 acc = emit_wgmma(N, acc, desc_a, desc_b, /*scale_d*/ true);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
-            emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
+            {
+                // PERF PROBE (HL_WGMMA_INFLIGHT=N, default 0=NFC): emit `wait_group N` to keep N wgmma
+                // groups in flight (wgmma pipelining). N>0 WITHOUT re-timing the operand-reuse WAR
+                // (deeper ring / empty edge) gives WRONG results -- this is a TIMING-ONLY probe to
+                // measure the real kernel's wgmma-pipelining ceiling end-to-end vs the microbench proxy.
+                std::string nf = get_env_variable("HL_WGMMA_INFLIGHT");
+                std::string wg = "wgmma.wait_group.sync.aligned " + std::string(nf.empty() ? "0" : nf) + ";";
+                emit_wgmma_asm(wg.c_str());
+            }
             cached_wgmma_acc[bank] = acc;
             cached_wgmma_block = builder->GetInsertBlock();
         }
@@ -523,7 +531,15 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                 acc = emit_wgmma(N, acc, desc_a, desc_b, /*scale_d*/ c > 0);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
-            emit_wgmma_asm("wgmma.wait_group.sync.aligned 0;");
+            {
+                // PERF PROBE (HL_WGMMA_INFLIGHT=N, default 0=NFC): emit `wait_group N` to keep N wgmma
+                // groups in flight (wgmma pipelining). N>0 WITHOUT re-timing the operand-reuse WAR
+                // (deeper ring / empty edge) gives WRONG results -- this is a TIMING-ONLY probe to
+                // measure the real kernel's wgmma-pipelining ceiling end-to-end vs the microbench proxy.
+                std::string nf = get_env_variable("HL_WGMMA_INFLIGHT");
+                std::string wg = "wgmma.wait_group.sync.aligned " + std::string(nf.empty() ? "0" : nf) + ";";
+                emit_wgmma_asm(wg.c_str());
+            }
             cached_wgmma_acc[bank] = acc;
             cached_wgmma_block = builder->GetInsertBlock();
         }
