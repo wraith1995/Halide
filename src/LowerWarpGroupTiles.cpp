@@ -649,6 +649,15 @@ class RewriteWarpGroupTiles : public IRMutator {
             // else a RAW on the async MMA output corrupts the result. Emit the drain ONCE, before the
             // first fragment read (i==0). Gated on HL_WGMMA_INFLIGHT>0 so default builds (drain every
             // iter already) stay byte-identical NFC.
+            //
+            // MODEL BOUNDARY: HL_WGMMA_INFLIGHT is a UNIFORM software_pipeline mechanism. It has three
+            // co-required edges -- (1) steady wait_group N (CodeGen_PTX_Dev), (2) this epilogue drain,
+            // (3) the operand-WAR skew retiming D=Q-1-N_w (SoftwarePipeline). The warp-spec fork (R5)
+            // bypasses SoftwarePipeline, so on that path edge (3) is absent: keeping N wgmma groups in
+            // flight without shortening the producer lead re-opens the operand WAR (the next slot
+            // overwrite races the in-flight wgmma's shared read) and corrupts. That is by construction,
+            // not a bug here -- the warp-spec ring would need its own empty-edge re-derivation to carry
+            // the WAR under N_w>0. R5 ships INFLIGHT=0 (byte-identical NFC); the probe is uniform-only.
             const char *inflight = getenv("HL_WGMMA_INFLIGHT");
             if (i == 0 && inflight && atoi(inflight) > 0) {
                 Stmt drain = Evaluate::make(Call::make(Int(32), "wgmma_drain", {}, Call::Intrinsic));
