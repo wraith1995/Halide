@@ -251,6 +251,37 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
     BasicBlock *body_block = BasicBlock::Create(*context, "body", function);
     builder->SetInsertPoint(body_block);
 
+    // Detect a gpu_cluster kernel (launched as a multi-CTA cluster via cuLaunchKernelEx) BEFORE
+    // codegen, so the gpu_thread_barrier handler can read `in_cluster_kernel` while it emits barriers.
+    // A cluster kernel's block barriers must be cluster-scoped (barrier.cluster.arrive/wait): a plain
+    // CTA `bar.sync 0` is an illegal instruction under a multi-CTA cluster launch (XID 13 "Illegal
+    // Instruction Parameter" -- the reserved barrier index 0). We do NOT declare the cluster in the
+    // PTX (CUTLASS launches clusters purely via the runtime API with cluster-agnostic PTX; declaring
+    // it does not prevent the trap). See research/RESUME_gpu_cluster.md.
+    {
+        class ClusterExtents : public IRVisitor {
+            using IRVisitor::visit;
+            void visit(const For *op) override {
+                for (int i = 0; i < 3; i++) {
+                    if (ends_with(op->name, gpu_block_name(i)) && op->blocks_per_cluster > 1) {
+                        cluster[i] = std::max(cluster[i], (int64_t)op->blocks_per_cluster);
+                    }
+                }
+                IRVisitor::visit(op);
+            }
+
+        public:
+            int64_t cluster[3] = {1, 1, 1};
+        } ce;
+        stmt.accept(&ce);
+        in_cluster_kernel = (ce.cluster[0] > 1 || ce.cluster[1] > 1 || ce.cluster[2] > 1);
+        if (in_cluster_kernel) {
+            debug(2) << "PTX kernel " << name << " is a gpu_cluster kernel (cluster "
+                     << ce.cluster[0] << "," << ce.cluster[1] << "," << ce.cluster[2]
+                     << ") -> cluster-scoped block barriers\n";
+        }
+    }
+
     debug(1) << "Generating llvm bitcode for kernel...\n";
     // Ok, we have a module, function, context, and a builder
     // pointing at a brand new basic block. We're good to go.
@@ -310,35 +341,6 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
                             "," + std::to_string(te.extent[2]);
             function->addFnAttr("nvvm.maxntid", v);
             debug(2) << "PTX kernel " << name << " nvvm.maxntid = " << v << "\n";
-        }
-    }
-
-    // Detect a gpu_cluster kernel (launched as a multi-CTA cluster via cuLaunchKernelEx). Its block
-    // barriers must be cluster-scoped (see the gpu_thread_barrier handler). We do NOT declare the
-    // cluster in the PTX (no nvvm.cluster_dim / .explicitcluster / .reqnctapercluster): CUTLASS
-    // launches clusters purely via the runtime API with cluster-agnostic PTX, and declaring it does
-    // NOT prevent the plain-bar.sync trap (verified). The actual fix is the cluster barrier below.
-    {
-        class ClusterExtents : public IRVisitor {
-            using IRVisitor::visit;
-            void visit(const For *op) override {
-                for (int i = 0; i < 3; i++) {
-                    if (ends_with(op->name, gpu_block_name(i)) && op->blocks_per_cluster > 1) {
-                        cluster[i] = std::max(cluster[i], (int64_t)op->blocks_per_cluster);
-                    }
-                }
-                IRVisitor::visit(op);
-            }
-
-        public:
-            int64_t cluster[3] = {1, 1, 1};
-        } ce;
-        stmt.accept(&ce);
-        in_cluster_kernel = (ce.cluster[0] > 1 || ce.cluster[1] > 1 || ce.cluster[2] > 1);
-        if (in_cluster_kernel) {
-            debug(2) << "PTX kernel " << name << " is a gpu_cluster kernel (cluster "
-                     << ce.cluster[0] << "," << ce.cluster[1] << "," << ce.cluster[2]
-                     << ") -> cluster-scoped block barriers\n";
         }
     }
 
