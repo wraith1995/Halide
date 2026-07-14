@@ -93,7 +93,7 @@ protected:
      * large N (n64/n128/n256) is ~95% of peak vs ~38% for n16 (Luo et al. 2402.13499). The
      * fragment lane<->element map (frag_row_m/frag_col_n) extends to N/2 regs by construction.
      * See research/gpu_recognizer_design.md §5a/§5f. */
-    llvm::Value *emit_wgmma(int n, llvm::Value *acc, llvm::Value *desc_a,
+    llvm::Value *emit_wgmma(int n, const Type &operand_type, llvm::Value *acc, llvm::Value *desc_a,
                             llvm::Value *desc_b, bool scale_d);
 
     // P1: set when a cp.async copy (vectorized global->shared) was emitted since the last
@@ -178,7 +178,9 @@ CodeGen_PTX_Dev::~CodeGen_PTX_Dev() {
 }
 
 Type CodeGen_PTX_Dev::upgrade_type_for_storage(const Type &t) const {
-    if (t.element_of() == Float(16)) {
+    // f16 AND bf16 are native 16-bit storage on Hopper (wgmma reads both from shared) -- keep them,
+    // don't let the LLVM default promote bf16.
+    if (t.element_of() == Float(16) || t.element_of() == BFloat(16)) {
         return t;
     }
     return CodeGen_LLVM::upgrade_type_for_storage(t);
@@ -430,7 +432,7 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                                                              off_b, /*lbo*/ 128, sbo,
                                                              operand_swizzle_bytes(lb->name));
                 // scaleD=1 ALWAYS: prod already holds the running sum across prior ko iterations.
-                acc = emit_wgmma(N, acc, desc_a, desc_b, /*scale_d*/ true);
+                acc = emit_wgmma(N, la->type.element_of(), acc, desc_a, desc_b, /*scale_d*/ true);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             {
@@ -528,7 +530,7 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                 llvm::Value *desc_b = build_wgmma_descriptor(lb->name, lb->type.element_of(),
                                                              off_b, /*lbo*/ 128, sbo,
                                                              operand_swizzle_bytes(lb->name));
-                acc = emit_wgmma(N, acc, desc_a, desc_b, /*scale_d*/ c > 0);
+                acc = emit_wgmma(N, la->type.element_of(), acc, desc_a, desc_b, /*scale_d*/ c > 0);
             }
             emit_wgmma_asm("wgmma.commit_group.sync.aligned;");
             {
@@ -1261,8 +1263,8 @@ int CodeGen_PTX_Dev::operand_swizzle_bytes(const std::string &buffer) const {
     return s.defined() ? (1 << (s.bits + 4)) : 0;  // bits 1/2/3 -> 32/64/128 B
 }
 
-llvm::Value *CodeGen_PTX_Dev::emit_wgmma(int n, llvm::Value *acc, llvm::Value *desc_a,
-                                         llvm::Value *desc_b, bool scale_d) {
+llvm::Value *CodeGen_PTX_Dev::emit_wgmma(int n, const Type &operand_type, llvm::Value *acc,
+                                         llvm::Value *desc_a, llvm::Value *desc_b, bool scale_d) {
     // The per-thread accumulator fragment is {f32 x R}, R = N/2 (m64nNk16 f32). The descriptors
     // are operands $R and $R+1. Build the operand list dynamically so N scales (n16 R=8 ... n256
     // R=128). wgmma.mma_async.sync.aligned.m64nNk16.f32.f16.f16 {d0..d_{R-1}}, descA, descB,
@@ -1282,8 +1284,11 @@ llvm::Value *CodeGen_PTX_Dev::emit_wgmma(int n, llvm::Value *acc, llvm::Value *d
     // descA/descB operand numbers: the R tied inputs consume operand slots R..2R-1, so the two
     // descriptor inputs are $(2R) and $(2R+1) -- NOT $R/$R+1 (which alias the tied accumulators).
     const std::string scale = scale_d ? "1" : "0";
+    // Operand dtype: f16 or bf16 (both f32-accumulate, structurally identical wgmma). Hopper wgmma
+    // supports .f16.f16 and .bf16.bf16 with the same m64nNk16 shape / descriptors / swizzle.
+    const std::string dt = (operand_type == BFloat(16)) ? "bf16" : "f16";
     const std::string asm_str =
-        "wgmma.mma_async.sync.aligned.m64n" + std::to_string(n) + "k16.f32.f16.f16 {" +
+        "wgmma.mma_async.sync.aligned.m64n" + std::to_string(n) + "k16.f32." + dt + "." + dt + " {" +
         regs + "}, $" + std::to_string(2 * R) + ", $" + std::to_string(2 * R + 1) + ", " +
         scale + ", 1, 1, 0, 0;";
     const std::string constraints = outs + tied + "l,l";  // R outputs, R tied inputs, descA, descB
