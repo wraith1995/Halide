@@ -1372,7 +1372,21 @@ WEAK int halide_cuda_run(void *user_context,
     halide_cuda_pending_cluster[1] = 0;
     halide_cuda_pending_cluster[2] = 0;
 
+    // DIAGNOSTIC (NFC unless HL_CLUSTER_1X1 set): force the cuLaunchKernelEx path
+    // with a degenerate 1x1x1 cluster when no real cluster is pending. This isolates
+    // "the Ex-launch path itself + shared memory" from "multi-CTA cluster + shared":
+    // if a shared kernel faults here (single CTA, Ex launch) the bug is in the launch
+    // path, not multi-CTA/DSMEM. Only active when the env flag is set.
+    bool force_ex_1x1 = false;
     if (cluster_x <= 1 && cluster_y <= 1 && cluster_z <= 1) {
+        char *force = getenv("HL_CLUSTER_1X1");
+        if (force && force[0] != '0' && force[0] != '\0') {
+            force_ex_1x1 = true;
+            cluster_x = cluster_y = cluster_z = 1;
+        }
+    }
+
+    if (!force_ex_1x1 && cluster_x <= 1 && cluster_y <= 1 && cluster_z <= 1) {
         // No cluster: byte-identical to the original launch path (NFC).
         err = cuLaunchKernel(f,
                              blocksX, blocksY, blocksZ,
