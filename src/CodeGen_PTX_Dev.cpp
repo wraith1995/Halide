@@ -100,6 +100,12 @@ protected:
     // gpu_thread_barrier, so the barrier commits + waits for it (synchronous cp.async).
     bool emitted_cp_async = false;
 
+    // Set per-kernel when this kernel carries a gpu_cluster axis (launched as a multi-CTA cluster
+    // via cuLaunchKernelEx). Its block barriers must be cluster-scoped (barrier.cluster.arrive/wait),
+    // NOT plain CTA bar.sync, which traps "Illegal Instruction Parameter" under a CGA. See
+    // research/RESUME_gpu_cluster.md.
+    bool in_cluster_kernel = false;
+
     // M0 wgmma: the {f32 x 8} accumulator from the one wgmma.mma_async collective
     // emitted per kernel (the recognizer's per-element calls all extract from it).
     // Reset per add_kernel. See research/gpu_recognizer_design.md S5b.
@@ -307,14 +313,11 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
         }
     }
 
-    // Emit `.reqnctapercluster` (via LLVM 21's `nvvm.cluster_dim` fn attr) from gpu_cluster axes.
-    // A kernel launched as a thread-block cluster via cuLaunchKernelEx MUST declare the cluster in
-    // its PTX, otherwise ptxas compiles CGA-unaware code and the launch traps device-side with
-    // XID 13 "Illegal Instruction Parameter" (seen on every wgmma/bar.sync kernel; a plain kernel
-    // that never exercises the CGA-sensitive path happens to survive). The dims are the fixed
-    // blocks_per_cluster per block axis (must match the runtime cluster dims, which come from the
-    // same marker). Only emitted when gpu_cluster was used => NFC otherwise. See
-    // research/RESUME_gpu_cluster.md.
+    // Detect a gpu_cluster kernel (launched as a multi-CTA cluster via cuLaunchKernelEx). Its block
+    // barriers must be cluster-scoped (see the gpu_thread_barrier handler). We do NOT declare the
+    // cluster in the PTX (no nvvm.cluster_dim / .explicitcluster / .reqnctapercluster): CUTLASS
+    // launches clusters purely via the runtime API with cluster-agnostic PTX, and declaring it does
+    // NOT prevent the plain-bar.sync trap (verified). The actual fix is the cluster barrier below.
     {
         class ClusterExtents : public IRVisitor {
             using IRVisitor::visit;
@@ -331,11 +334,11 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
             int64_t cluster[3] = {1, 1, 1};
         } ce;
         stmt.accept(&ce);
-        if (ce.cluster[0] > 1 || ce.cluster[1] > 1 || ce.cluster[2] > 1) {
-            std::string v = std::to_string(ce.cluster[0]) + "," + std::to_string(ce.cluster[1]) +
-                            "," + std::to_string(ce.cluster[2]);
-            function->addFnAttr("nvvm.cluster_dim", v);
-            debug(2) << "PTX kernel " << name << " nvvm.cluster_dim = " << v << "\n";
+        in_cluster_kernel = (ce.cluster[0] > 1 || ce.cluster[1] > 1 || ce.cluster[2] > 1);
+        if (in_cluster_kernel) {
+            debug(2) << "PTX kernel " << name << " is a gpu_cluster kernel (cluster "
+                     << ce.cluster[0] << "," << ce.cluster[1] << "," << ce.cluster[2]
+                     << ") -> cluster-scoped block barriers\n";
         }
     }
 
@@ -951,6 +954,22 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
                                     module.get(), llvm::Intrinsic::nvvm_cp_async_wait_group),
                                 builder->getInt32(cpa_inflight));
             emitted_cp_async = false;
+        }
+
+        // Cluster kernels: a plain CTA bar.sync is illegal under a multi-CTA cluster launch (traps
+        // "Illegal Instruction Parameter", XID 13 -- reproduced on a bare shared+bar.sync kernel).
+        // Emit a cluster barrier (arrive+wait) instead: it syncs all CTAs of the cluster and, being
+        // release-on-arrive / acquire-on-wait, provides the same shared-memory visibility as
+        // __syncthreads. This mirrors CUTLASS's cluster kernels (which use barrier.cluster, not
+        // bar.sync). HL_NO_CLUSTER_BAR=1 forces the plain bar.sync (diagnostic A/B). See
+        // research/RESUME_gpu_cluster.md.
+        if (in_cluster_kernel && get_env_variable("HL_NO_CLUSTER_BAR").empty()) {
+            llvm::FunctionType *ft = llvm::FunctionType::get(void_t, false);
+            llvm::InlineAsm *ia = llvm::InlineAsm::get(
+                ft, "barrier.cluster.arrive;\n\tbarrier.cluster.wait;", "", /*hasSideEffects*/ true);
+            builder->CreateCall(ia);
+            value = ConstantInt::get(i32_t, 0);
+            return;
         }
 
         llvm::Function *barrier;
