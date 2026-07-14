@@ -1383,6 +1383,8 @@ WEAK int halide_cuda_run(void *user_context,
         if (force && force[0] != '0' && force[0] != '\0') {
             force_ex_1x1 = true;
             cluster_x = cluster_y = cluster_z = 1;
+            halide_print(user_context,
+                         "CUDA: HL_CLUSTER_1X1 -> forcing cuLaunchKernelEx with clusterDim=(1,1,1)\n");
         }
     }
 
