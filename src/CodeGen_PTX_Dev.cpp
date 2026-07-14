@@ -1079,17 +1079,22 @@ void CodeGen_PTX_Dev::visit(const Allocate *alloc) {
         // See research/RESUME_gpu_cluster.md.
         Value *shared_base;
         if (in_cluster_kernel) {
-            llvm::GlobalVariable *gv = module->getGlobalVariable("__halide_dynamic_shared", true);
-            if (!gv) {
-                llvm::ArrayType *aty = llvm::ArrayType::get(llvm::Type::getInt8Ty(*context), 0);
-                gv = new llvm::GlobalVariable(*module, aty, /*isConstant*/ false,
-                                              llvm::GlobalValue::ExternalLinkage, /*init*/ nullptr,
-                                              "__halide_dynamic_shared", /*before*/ nullptr,
-                                              llvm::GlobalValue::NotThreadLocal, /*addrspace*/ 3);
-                gv->setAlignment(llvm::Align(16));
-            }
-            shared_base = gv;
+            // Base 0 is CTA-local (invalid under DSMEM). Compute THIS CTA's own DSMEM window base with
+            // mapa.shared::cluster(0, %cluster_ctarank) -- the same base ptxas builds from SR_CgaCtaId
+            // for nvcc's shared accesses (which our raw-offset codegen omitted). All subsequent
+            // GEP+offset accesses then land in the executing CTA's own window. Inline asm so it can't be
+            // constant-folded back to 0 (which is what defeated the symbol-anchor attempt).
+            llvm::InlineAsm *rank_asm = llvm::InlineAsm::get(
+                llvm::FunctionType::get(i32_t, false), "mov.u32 $0, %cluster_ctarank;", "=r",
+                /*hasSideEffects*/ true);
+            Value *rank = builder->CreateCall(rank_asm);
+            llvm::InlineAsm *mapa_asm = llvm::InlineAsm::get(
+                llvm::FunctionType::get(i32_t, {i32_t, i32_t}, false),
+                "mapa.shared::cluster.u32 $0, $1, $2;", "=r,r,r", /*hasSideEffects*/ true);
+            Value *mapped = builder->CreateCall(mapa_asm, {ConstantInt::get(i32_t, 0), rank});
+            shared_base = builder->CreateIntToPtr(mapped, PointerType::get(*context, 3));
         } else {
+            // PTX uses zero in address space 3 as the CTA-local shared base.
             shared_base = Constant::getNullValue(PointerType::get(*context, 3));
         }
         sym_push(alloc->name, shared_base);
