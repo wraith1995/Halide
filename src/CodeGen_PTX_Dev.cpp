@@ -307,6 +307,38 @@ void CodeGen_PTX_Dev::add_kernel(Stmt stmt,
         }
     }
 
+    // Emit `.reqnctapercluster` (via LLVM 21's `nvvm.cluster_dim` fn attr) from gpu_cluster axes.
+    // A kernel launched as a thread-block cluster via cuLaunchKernelEx MUST declare the cluster in
+    // its PTX, otherwise ptxas compiles CGA-unaware code and the launch traps device-side with
+    // XID 13 "Illegal Instruction Parameter" (seen on every wgmma/bar.sync kernel; a plain kernel
+    // that never exercises the CGA-sensitive path happens to survive). The dims are the fixed
+    // blocks_per_cluster per block axis (must match the runtime cluster dims, which come from the
+    // same marker). Only emitted when gpu_cluster was used => NFC otherwise. See
+    // research/RESUME_gpu_cluster.md.
+    {
+        class ClusterExtents : public IRVisitor {
+            using IRVisitor::visit;
+            void visit(const For *op) override {
+                for (int i = 0; i < 3; i++) {
+                    if (ends_with(op->name, gpu_block_name(i)) && op->blocks_per_cluster > 1) {
+                        cluster[i] = std::max(cluster[i], (int64_t)op->blocks_per_cluster);
+                    }
+                }
+                IRVisitor::visit(op);
+            }
+
+        public:
+            int64_t cluster[3] = {1, 1, 1};
+        } ce;
+        stmt.accept(&ce);
+        if (ce.cluster[0] > 1 || ce.cluster[1] > 1 || ce.cluster[2] > 1) {
+            std::string v = std::to_string(ce.cluster[0]) + "," + std::to_string(ce.cluster[1]) +
+                            "," + std::to_string(ce.cluster[2]);
+            function->addFnAttr("nvvm.cluster_dim", v);
+            debug(2) << "PTX kernel " << name << " nvvm.cluster_dim = " << v << "\n";
+        }
+    }
+
     // Now verify the function is ok
     verifyFunction(*function);
 
