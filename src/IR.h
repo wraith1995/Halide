@@ -1032,13 +1032,21 @@ struct For : public StmtNode<For> {
      * preserves today's lowering. See research/gpu_warps_model.md. */
     int warps_per_group = -1;
 
+    /** If > 1, this loop is a gpu_blocks axis that launches as a thread-block
+     * cluster of this width along this GPU block axis (see Func::gpu_cluster).
+     * -1 or 1 = no cluster (the default), which preserves today's launch and
+     * lowering byte-for-byte (NFC). N>1 = this GPU block axis has cluster width
+     * N. Carried on the block For node analogously to warps_per_group. */
+    int blocks_per_cluster = -1;
+
     static Stmt make(const std::string &name,
                      Expr min, Expr max,
                      ForType for_type, Partition partition_policy,
                      DeviceAPI device_api,
                      Stmt body,
                      GPUVectorScope realization,
-                     int warps_per_group);
+                     int warps_per_group,
+                     int blocks_per_cluster = -1);
 
     bool is_unordered_parallel() const {
         return Halide::Internal::is_unordered_parallel(for_type);

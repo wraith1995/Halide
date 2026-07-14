@@ -1149,6 +1149,10 @@ void IRPrinter::visit(const For *op) {
     if (op->warps_per_group >= 0) {
         stream << paren("<gpu_warps=" + std::to_string(op->warps_per_group) + ">");
     }
+    // Only annotate a gpu_cluster axis (blocks_per_cluster > 1), so existing dumps stay identical.
+    if (op->blocks_per_cluster > 1) {
+        stream << paren("<gpu_cluster=" + std::to_string(op->blocks_per_cluster) + ">");
+    }
     stream << paren(" (");
     stream << var(op->name) << paren(", ");
     print_no_parens(op->min);

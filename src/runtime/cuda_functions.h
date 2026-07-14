@@ -43,6 +43,9 @@ CUDA_FN_3020(CUresult, cuMemcpyDtoDAsync, cuMemcpyDtoDAsync_v2, (CUdeviceptr dst
 
 CUDA_FN_3020(CUresult, cuMemcpy3D, cuMemcpy3D_v2, (const CUDA_MEMCPY3D *pCopy));
 CUDA_FN(CUresult, cuLaunchKernel, (CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void **kernelParams, void **extra));
+// Thread-block cluster launch (CUDA 12.0+ / sm_90+). Optional: absent on older
+// drivers, so we null-guard it at the call site instead of hard-failing the load.
+CUDA_FN_OPTIONAL(CUresult, cuLaunchKernelEx, (const CUlaunchConfig *config, CUfunction f, void **kernelParams, void **extra));
 CUDA_FN(CUresult, cuCtxSynchronize, ());
 
 CUDA_FN_4000(CUresult, cuCtxPushCurrent, cuCtxPushCurrent_v2, (CUcontext ctx));

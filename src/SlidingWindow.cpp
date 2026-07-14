@@ -198,7 +198,7 @@ class RollFunc : public IRMutator {
             Stmt body = substitute(op->name, Variable::make(Int(32), new_name) + op->min, op->body);
             // use op->name *before* the re-assignment of result, which will clobber it
             loops_to_rebase.erase(op->name);
-            result = For::make(new_name, 0, op->max - op->min, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+            result = For::make(new_name, 0, op->max - op->min, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         }
         return result;
     }
@@ -581,7 +581,7 @@ class SlidingWindowOnFunctionAndLoop : public IRMutator {
             // Unpack it back into the for
             const LetStmt *l = s.as<LetStmt>();
             internal_assert(l);
-            return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, l->body, op->realization, op->warps_per_group);
+            return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, l->body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         } else if (is_monotonic(min, loop_var) != Monotonic::Constant ||
                    is_monotonic(max, loop_var) != Monotonic::Constant) {
             debug(3) << "Not entering loop over " << op->name
@@ -880,7 +880,7 @@ class SlidingWindow : public IRMutator {
         if (body.same_as(op->body) && loop_min.same_as(op->min) && loop_max.same_as(op->max) && name == op->name) {
             return op;
         } else {
-            Stmt result = For::make(name, loop_min, loop_max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+            Stmt result = For::make(name, loop_min, loop_max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
             for (const auto &i : new_lets) {
                 result = LetStmt::make(i.first, i.second, result);
             }
@@ -923,7 +923,7 @@ class AddLoopMinOrig : public IRMutator {
         if (body.same_as(op->body) && min.same_as(op->min) && max.same_as(op->max)) {
             result = op;
         } else {
-            result = For::make(op->name, min, max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+            result = For::make(op->name, min, max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         }
         return LetStmt::make(op->name + ".loop_min.orig", op->min, result);
     }

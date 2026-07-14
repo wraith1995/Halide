@@ -428,6 +428,7 @@ struct Comparer {
                 cmp(&For::partition_policy);
                 cmp(&For::realization);
                 cmp(&For::warps_per_group);
+                cmp(&For::blocks_per_cluster);
                 cmp(&For::min);
                 cmp(&For::max);
                 cmp(&For::body);

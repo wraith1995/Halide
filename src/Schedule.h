@@ -476,6 +476,13 @@ struct Dim {
      * research/gpu_warps_model.md. */
     int warps_per_group = -1;
 
+    /** If > 1, this dim is a gpu_blocks axis launched as a thread-block cluster
+     * of this width along this block axis (see Func::gpu_cluster and
+     * For::blocks_per_cluster). -1 or 1 (default) = no cluster. Kept last (with
+     * realization and warps_per_group) so positional aggregate initializers of
+     * Dim default it. */
+    int blocks_per_cluster = -1;
+
     /** Can this loop be evaluated in any order (including in
      * parallel)? Equivalently, are there no data hazards between
      * evaluations of the Func at distinct values of this var? */

@@ -616,6 +616,27 @@ void Stage::set_dim_warps_per_group(const VarOrRVar &var, int warps_per_group) {
     }
 }
 
+void Stage::set_dim_blocks_per_cluster(const VarOrRVar &var, int blocks_per_cluster) {
+    definition.schedule().touched() = true;
+    bool found = false;
+    vector<Dim> &dims = definition.schedule().dims();
+    for (auto &dim : dims) {
+        if (dim_match(dim, var)) {
+            found = true;
+            dim.blocks_per_cluster = blocks_per_cluster;
+        }
+    }
+
+    if (!found) {
+        user_error << "In schedule for " << name()
+                   << ", could not find dimension "
+                   << var.name()
+                   << " to mark as a gpu_cluster axis"
+                   << " in vars for function\n"
+                   << dump_argument_list();
+    }
+}
+
 std::string Stage::dump_argument_list() const {
     return dump_dim_list(definition.schedule().dims());
 }
@@ -2000,6 +2021,21 @@ Stage &Stage::gpu_blocks(const VarOrRVar &bx, DeviceAPI device_api) {
     return *this;
 }
 
+Stage &Stage::gpu_cluster(const VarOrRVar &bx, int blocks_per_cluster, DeviceAPI device_api) {
+    user_assert(blocks_per_cluster >= 1)
+        << "gpu_cluster blocks_per_cluster must be >= 1 (1 = no cluster): "
+        << blocks_per_cluster << "\n";
+    // A gpu_cluster axis is an ordinary gpu_blocks axis (block tier) that also
+    // carries a thread-block cluster width. The GPUBlock for-type gives it the
+    // block loop structure; the blocks_per_cluster marker (>1) rides on the For
+    // node down to OffloadGPULoops, which turns it into a clustered launch. When
+    // blocks_per_cluster is 1 this is byte-identical to gpu_blocks (NFC).
+    set_dim_device_api(bx, device_api);
+    set_dim_type(bx, ForType::GPUBlock);
+    set_dim_blocks_per_cluster(bx, blocks_per_cluster);
+    return *this;
+}
+
 Stage &Stage::gpu_blocks(const VarOrRVar &bx, const VarOrRVar &by, DeviceAPI device_api) {
     set_dim_device_api(bx, device_api);
     set_dim_device_api(by, device_api);
@@ -2921,6 +2957,12 @@ Func &Func::gpu_lanes(const VarOrRVar &tx, DeviceAPI device_api) {
 Func &Func::gpu_warps(const VarOrRVar &wg, int warps_per_group, DeviceAPI device_api) {
     invalidate_cache();
     Stage(func, func.definition(), 0).gpu_warps(wg, warps_per_group, device_api);
+    return *this;
+}
+
+Func &Func::gpu_cluster(const VarOrRVar &bx, int blocks_per_cluster, DeviceAPI device_api) {
+    invalidate_cache();
+    Stage(func, func.definition(), 0).gpu_cluster(bx, blocks_per_cluster, device_api);
     return *this;
 }
 

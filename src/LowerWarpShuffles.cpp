@@ -459,7 +459,7 @@ class LowerWarpShuffles : public IRMutator {
             allocations.clear();
 
             return For::make(op->name, op->min, op->min + warp_size - 1,
-                             op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+                             op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         } else {
             return IRMutator::visit(op);
         }
@@ -735,7 +735,7 @@ class HoistWarpShufflesFromSingleIfStmt : public IRMutator {
         } else {
             debug(3) << "Successfully hoisted shuffle out of for loop\n";
         }
-        return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+        return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
     }
 
     Stmt visit(const Store *op) override {

@@ -245,7 +245,7 @@ class SerializeLoops : public IRMutator {
     Stmt visit(const For *op) override {
         if (op->for_type == ForType::Vectorized) {
             return For::make(op->name, op->min, op->max,
-                             ForType::Serial, op->partition_policy, op->device_api, mutate(op->body), op->realization, op->warps_per_group);
+                             ForType::Serial, op->partition_policy, op->device_api, mutate(op->body), op->realization, op->warps_per_group, op->blocks_per_cluster);
         }
 
         return IRMutator::visit(op);
@@ -835,7 +835,7 @@ protected:
             // Rebase the loop to zero and try again
             Expr var = Variable::make(Int(32), op->name);
             Stmt body = substitute(op->name, var + op->min, op->body);
-            Stmt transformed = For::make(op->name, 0, simplify(op->max - op->min), for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+            Stmt transformed = For::make(op->name, 0, simplify(op->max - op->min), for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
             return mutate(transformed);
         }
 
@@ -910,7 +910,7 @@ protected:
                 for_type == op->for_type) {
                 return op;
             } else {
-                return For::make(op->name, min, max, for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+                return For::make(op->name, min, max, for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
             }
         }
     }

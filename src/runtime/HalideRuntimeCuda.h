@@ -44,6 +44,13 @@ extern void halide_cuda_finalize_kernels(void *user_context, void *state_ptr);
 extern uint64_t halide_cuda_tensor_map(void *user_context, struct halide_buffer_t *buf,
                                        int box0, int box1, int swizzle);
 
+/** Set the thread-block cluster dimensions for the NEXT halide_cuda_run on this
+ *  context. x/y/z of 0 or 1 mean "no cluster" (the default), in which case the
+ *  launch is a plain cuLaunchKernel. Any dim > 1 makes the next launch use a
+ *  cluster of that shape via cuLaunchKernelEx. The value is consumed and reset
+ *  by halide_cuda_run so it never leaks to a later launch. */
+extern int halide_cuda_set_cluster_dims(void *user_context, int x, int y, int z);
+
 /** Set the underlying cuda device pointer for a buffer. The device
  * pointer should be allocated using cuMemAlloc or similar and must
  * have an extent large enough to cover that specified by the

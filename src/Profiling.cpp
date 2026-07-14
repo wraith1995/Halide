@@ -502,7 +502,7 @@ private:
             most_recently_set_func = -1;
         }
 
-        Stmt stmt = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+        Stmt stmt = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
 
         if (update_active_threads) {
             if (Internal::is_gpu(op->for_type)) {

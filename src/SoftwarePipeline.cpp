@@ -254,7 +254,7 @@ class SoftwarePipeline : public IRMutator {
         // Steady state: for v in [min, max-D], produce all at v+D, then consume at v.
         Stmt steady_body = Block::make(produce_all(Variable::make(Int(32), v) + D), consume_unit);
         Stmt steady = For::make(v, op->min, op->max - D, op->for_type, op->partition_policy,
-                                op->device_api, steady_body, op->realization, op->warps_per_group);
+                                op->device_api, steady_body, op->realization, op->warps_per_group, op->blocks_per_cluster);
 
         // Epilogue: consume the last D iterations [max-D+1, max].
         Stmt epilogue;
@@ -311,7 +311,7 @@ class SoftwarePipeline : public IRMutator {
             return op;
         }
         return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy,
-                         op->device_api, body, op->realization, op->warps_per_group);
+                         op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
     }
 
 public:

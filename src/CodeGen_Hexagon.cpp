@@ -365,7 +365,7 @@ private:
                 body = acquire_hvx_context(body, target);
                 body = substitute("uses_hvx", true, body);
                 Stmt new_for = For::make(op->name, op->min, op->max, op->for_type,
-                                         op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+                                         op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
                 Stmt prolog =
                     IfThenElse::make(uses_hvx_var, call_halide_qurt_hvx_unlock());
                 Stmt epilog =
@@ -410,7 +410,7 @@ private:
                 //   halide_qurt_unlock
                 // }
                 s = For::make(op->name, op->min, op->max, op->for_type,
-                              op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+                              op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
             }
 
             uses_hvx = old_uses_hvx;

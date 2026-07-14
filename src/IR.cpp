@@ -347,7 +347,8 @@ Stmt For::make(const std::string &name,
                DeviceAPI device_api,
                Stmt body,
                GPUVectorScope realization,
-               int warps_per_group) {
+               int warps_per_group,
+               int blocks_per_cluster) {
     internal_assert(min.defined()) << "For of undefined\n";
     internal_assert(max.defined()) << "For of undefined\n";
     internal_assert(min.type() == Int(32)) << "For with non-integer min\n";
@@ -364,6 +365,7 @@ Stmt For::make(const std::string &name,
     node->body = std::move(body);
     node->realization = realization;
     node->warps_per_group = warps_per_group;
+    node->blocks_per_cluster = blocks_per_cluster;
     return node;
 }
 

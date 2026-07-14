@@ -430,7 +430,7 @@ protected:
 
         return For::make(op->name, new_min, new_max,
                          op->for_type, op->partition_policy,
-                         op->device_api, body, op->realization, op->warps_per_group);
+                         op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
     }
 
     Stmt visit(const Block *op) override {
@@ -1214,7 +1214,7 @@ protected:
                 allocations.swap(old);
             }
 
-            return For::make(op->name, mutate(op->min), mutate(op->max), op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+            return For::make(op->name, mutate(op->min), mutate(op->max), op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         }
     }
 
@@ -1447,7 +1447,7 @@ protected:
                 body = Block::make(body, make_barrier(0));
             }
             result = For::make(op->name, op->min, op->max,
-                               op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+                               op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         } else {
             result = IRMutator::visit(op);
         }
@@ -1851,7 +1851,7 @@ protected:
             if (body.same_as(op->body)) {
                 return op;
             } else {
-                return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+                return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
             }
         } else {
             return IRMutator::visit(op);
@@ -1991,7 +1991,7 @@ protected:
             internal_assert(op);
             Expr adjusted = Variable::make(Int(32), op->name) + op->min;
             Stmt body = substitute(op->name, adjusted, op->body);
-            stmt = For::make(op->name, 0, simplify(op->max - op->min), op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+            stmt = For::make(op->name, 0, simplify(op->max - op->min), op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         }
         return stmt;
     }
@@ -2038,7 +2038,7 @@ protected:
         }
 
         return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api,
-                         IfThenElse::make(condition, op->body, Stmt()), op->realization, op->warps_per_group);
+                         IfThenElse::make(condition, op->body, Stmt()), op->realization, op->warps_per_group, op->blocks_per_cluster);
     }
 
 public:
@@ -2455,7 +2455,7 @@ Stmt fuse_coresident_producers(const Stmt &a, const Stmt &b) {
     if (fa && fb && fa->name == fb->name && equal(fa->min, fb->min) && equal(fa->max, fb->max)) {
         Stmt merged = For::make(fa->name, fa->min, fa->max, fa->for_type, fa->partition_policy,
                                 fa->device_api, Block::make(fa->body, fb->body),
-                                fa->realization, fa->warps_per_group);
+                                fa->realization, fa->warps_per_group, fa->blocks_per_cluster);
         for (auto it = b_lets.rbegin(); it != b_lets.rend(); ++it) {
             merged = LetStmt::make((*it)->name, (*it)->value, merged);
         }
@@ -2570,7 +2570,7 @@ private:
                     Stmt body = mutate(op->body);
                     Stmt branch = For::make(op->name, op->min, op->max, op->for_type,
                                             op->partition_policy, op->device_api, body,
-                                            op->realization, op->warps_per_group);
+                                            op->realization, op->warps_per_group, op->blocks_per_cluster);
                     return partition_warp_groups({branch}, warp_size, device_api, 0, {}, {});
                 }
             }
@@ -3296,7 +3296,7 @@ private:
         ScopedValue<std::vector<MapLet>> save(pending_maps, {});
         Stmt body = mutate(op->body);
         Stmt block = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy,
-                               op->device_api, body, op->realization, op->warps_per_group);
+                               op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         // The tensor-map descriptor is loop-invariant (one map per producer FUNC, keyed by
         // src/box/swizzle -- all func-level). A software-pipelined producer is duplicated into
         // prologue/steady/epilogue copies, so the same `<func>.tma_map` can be pushed several times;

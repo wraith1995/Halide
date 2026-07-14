@@ -64,6 +64,7 @@ bool function_takes_user_context(const std::string &name) {
         "halide_memoization_cache_store",
         "halide_memoization_cache_release",
         "halide_cuda_run",
+        "halide_cuda_set_cluster_dims",
         "halide_opencl_run",
         "halide_metal_run",
         "halide_d3d12compute_run",

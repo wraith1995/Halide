@@ -1289,7 +1289,7 @@ public:
             }
         }
 
-        return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+        return For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
     }
 
     Scope<> let_vars_in_scope;

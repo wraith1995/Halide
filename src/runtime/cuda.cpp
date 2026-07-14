@@ -1247,6 +1247,19 @@ extern "C" WEAK uint64_t halide_cuda_tensor_map(void *user_context, halide_buffe
     return out;
 }
 
+// Pending thread-block cluster dims for the next halide_cuda_run. Stored as a
+// simple global WEAK array (matching the plain-global style of `context` etc.
+// in this file); {0,0,0}/{1,1,1} is the no-cluster sentinel. Set by
+// halide_cuda_set_cluster_dims and reset by halide_cuda_run after each launch.
+WEAK int halide_cuda_pending_cluster[3] = {0, 0, 0};
+
+extern "C" WEAK int halide_cuda_set_cluster_dims(void *user_context, int x, int y, int z) {
+    halide_cuda_pending_cluster[0] = x;
+    halide_cuda_pending_cluster[1] = y;
+    halide_cuda_pending_cluster[2] = z;
+    return halide_error_code_success;
+}
+
 WEAK int halide_cuda_run(void *user_context,
                          void *state_ptr,
                          const char *entry_name,
@@ -1350,13 +1363,54 @@ WEAK int halide_cuda_run(void *user_context,
         }
     }
 
-    err = cuLaunchKernel(f,
-                         blocksX, blocksY, blocksZ,
-                         threadsX, threadsY, threadsZ,
-                         shared_mem_bytes,
-                         stream,
-                         translated_args,
-                         nullptr);
+    // Consume the pending cluster dims (set by halide_cuda_set_cluster_dims) and
+    // reset the state so it never leaks into the next launch.
+    int cluster_x = halide_cuda_pending_cluster[0];
+    int cluster_y = halide_cuda_pending_cluster[1];
+    int cluster_z = halide_cuda_pending_cluster[2];
+    halide_cuda_pending_cluster[0] = 0;
+    halide_cuda_pending_cluster[1] = 0;
+    halide_cuda_pending_cluster[2] = 0;
+
+    if (cluster_x <= 1 && cluster_y <= 1 && cluster_z <= 1) {
+        // No cluster: byte-identical to the original launch path (NFC).
+        err = cuLaunchKernel(f,
+                             blocksX, blocksY, blocksZ,
+                             threadsX, threadsY, threadsZ,
+                             shared_mem_bytes,
+                             stream,
+                             translated_args,
+                             nullptr);
+    } else if (cuLaunchKernelEx == nullptr) {
+        // A cluster was requested but the driver is too old to support it.
+        free(dev_handles);
+        free(translated_args);
+        error(user_context) << "CUDA: a thread-block cluster of "
+                            << cluster_x << "x" << cluster_y << "x" << cluster_z
+                            << " was requested but the driver does not provide "
+                               "cuLaunchKernelEx (requires CUDA 12.0+ / sm_90+)\n";
+        return halide_error_code_generic_error;
+    } else {
+        CUlaunchAttribute cluster_attr;
+        cluster_attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        cluster_attr.value.clusterDim.x = (unsigned int)cluster_x;
+        cluster_attr.value.clusterDim.y = (unsigned int)cluster_y;
+        cluster_attr.value.clusterDim.z = (unsigned int)cluster_z;
+
+        CUlaunchConfig config;
+        config.gridDimX = blocksX;
+        config.gridDimY = blocksY;
+        config.gridDimZ = blocksZ;
+        config.blockDimX = threadsX;
+        config.blockDimY = threadsY;
+        config.blockDimZ = threadsZ;
+        config.sharedMemBytes = shared_mem_bytes;
+        config.hStream = stream;
+        config.attrs = &cluster_attr;
+        config.numAttrs = 1;
+
+        err = cuLaunchKernelEx(&config, f, translated_args, nullptr);
+    }
     free(dev_handles);
     free(translated_args);
     if (err != CUDA_SUCCESS) {

@@ -35,12 +35,14 @@ class ExtractBounds : public IRVisitor {
 public:
     Expr num_threads[3];
     Expr num_blocks[3];
+    Expr cluster[3];
     Expr shared_mem_size;
 
     ExtractBounds()
         : shared_mem_size(0) {
         for (int i = 0; i < 3; i++) {
             num_threads[i] = num_blocks[i] = 1;
+            cluster[i] = 1;
         }
     }
 
@@ -60,6 +62,9 @@ protected:
             }
             if (ends_with(op->name, gpu_block_name(i))) {
                 num_blocks[i] = simplify(op->extent());
+                if (op->blocks_per_cluster > 1) {
+                    cluster[i] = op->blocks_per_cluster;
+                }
             }
         }
 
@@ -237,6 +242,32 @@ protected:
             Call::make(Handle(), Call::make_struct, arg_is_buffer, Call::Intrinsic),
         };
         Stmt run_and_assert = call_extern_and_assert("halide_" + api_unique_name + "_run", run_args);
+
+        // If this CUDA kernel launches with a thread-block cluster, emit a call
+        // to the runtime setter immediately before the launch. The setter stores
+        // the cluster dims into per-context state that the very next
+        // halide_cuda_run consults (and then resets). When no cluster is present
+        // this branch is skipped entirely and the emitted IR is byte-identical to
+        // before (NFC).
+        if (loop->device_api == DeviceAPI::CUDA) {
+            Expr cx = simplify(bounds.cluster[0]);
+            Expr cy = simplify(bounds.cluster[1]);
+            Expr cz = simplify(bounds.cluster[2]);
+            auto ix = as_const_int(cx);
+            auto iy = as_const_int(cy);
+            auto iz = as_const_int(cz);
+            bool has_cluster =
+                (ix && *ix > 1) || (iy && *iy > 1) || (iz && *iz > 1);
+            if (has_cluster) {
+                // Args are {x, y, z}; the leading void *user_context parameter of
+                // halide_cuda_set_cluster_dims is auto-prepended by the backend
+                // (function_takes_user_context), exactly as for halide_cuda_run.
+                Stmt set_cluster = call_extern_and_assert(
+                    "halide_cuda_set_cluster_dims", {cx, cy, cz});
+                run_and_assert = Block::make(set_cluster, run_and_assert);
+            }
+        }
+
         if (target.has_feature(Target::Profile) || target.has_feature(Target::ProfileByTimer)) {
             Expr device_interface = make_device_interface_call(loop->device_api, MemoryType::Auto);
             Stmt sync_and_assert = call_extern_and_assert("halide_device_sync_global", {device_interface});

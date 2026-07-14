@@ -419,7 +419,7 @@ Stmt build_loop_nest(
             const Dim &dim = stage_s.dims()[container.dim_idx];
             Expr min = Variable::make(Int(32), container.name + ".loop_min");
             Expr max = Variable::make(Int(32), container.name + ".loop_max");
-            stmt = For::make(container.name, min, max, dim.for_type, dim.partition_policy, dim.device_api, stmt, dim.realization, dim.warps_per_group);
+            stmt = For::make(container.name, min, max, dim.for_type, dim.partition_policy, dim.device_api, stmt, dim.realization, dim.warps_per_group, dim.blocks_per_cluster);
         }
     }
 
@@ -987,7 +987,7 @@ private:
                              for_loop->for_type,
                              for_loop->partition_policy,
                              for_loop->device_api,
-                             body, for_loop->realization, for_loop->warps_per_group);
+                             body, for_loop->realization, for_loop->warps_per_group, for_loop->blocks_per_cluster);
         }
     }
 };
@@ -1078,7 +1078,7 @@ Stmt substitute_fused_bounds(Stmt s, const map<string, Interval> &replacements) 
 
             Stmt stmt = For::make(new_var, i.min, i.max,
                                   for_type, op->partition_policy,
-                                  device_api, body, op->realization, op->warps_per_group);
+                                  device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
 
             // Replace any reference to the old loop name with the new one.
             stmt = substitute(op->name, Variable::make(Int(32), new_var), stmt);
@@ -1119,7 +1119,7 @@ Stmt add_loop_var_aliases(Stmt s, const map<string, set<string>> &loop_var_alias
             }
 
             return For::make(op->name, op->min, op->max, op->for_type,
-                             op->partition_policy, op->device_api, std::move(body), op->realization, op->warps_per_group);
+                             op->partition_policy, op->device_api, std::move(body), op->realization, op->warps_per_group, op->blocks_per_cluster);
         }
 
     public:
@@ -1146,7 +1146,7 @@ class ShiftLoopNest : public IRMutator {
             internal_assert(op);
             Expr adjusted = Variable::make(Int(32), op->name) + iter->second;
             Stmt body = substitute(op->name, adjusted, op->body);
-            stmt = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+            stmt = For::make(op->name, op->min, op->max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         }
         return stmt;
     }
@@ -1325,7 +1325,7 @@ protected:
                              for_loop->for_type,
                              for_loop->partition_policy,
                              for_loop->device_api,
-                             body, for_loop->realization, for_loop->warps_per_group);
+                             body, for_loop->realization, for_loop->warps_per_group, for_loop->blocks_per_cluster);
         }
     }
 

@@ -80,6 +80,7 @@ class Stage {
     void set_dim_type(const VarOrRVar &var, Internal::ForType t);
     void set_dim_realization(const VarOrRVar &var, Internal::GPUVectorScope realization);
     void set_dim_warps_per_group(const VarOrRVar &var, int warps_per_group);
+    void set_dim_blocks_per_cluster(const VarOrRVar &var, int blocks_per_cluster);
     void set_dim_device_api(const VarOrRVar &var, DeviceAPI device_api);
     void split(const std::string &old, const std::string &outer, const std::string &inner,
                const Expr &factor, bool exact, TailStrategy tail);
@@ -422,6 +423,13 @@ public:
     Stage &gpu_warps(const VarOrRVar &warp_group, int warps_per_group = 0, DeviceAPI device_api = DeviceAPI::Default_GPU);
 
     Stage &gpu_single_thread(DeviceAPI device_api = DeviceAPI::Default_GPU);
+
+    /** Mark a GPU block axis as launching in a thread-block cluster of width
+     * blocks_per_cluster along this axis. Otherwise identical to gpu_blocks: the
+     * kernel body is unchanged and, when blocks_per_cluster is 1, the generated
+     * IR and launch are byte-identical to gpu_blocks (NFC). blocks_per_cluster
+     * must be >= 1 and should divide the grid extent along this axis. */
+    Stage &gpu_cluster(const VarOrRVar &block_x, int blocks_per_cluster, DeviceAPI device_api = DeviceAPI::Default_GPU);
 
     Stage &gpu_blocks(const VarOrRVar &block_x, DeviceAPI device_api = DeviceAPI::Default_GPU);
     Stage &gpu_blocks(const VarOrRVar &block_x, const VarOrRVar &block_y, DeviceAPI device_api = DeviceAPI::Default_GPU);
@@ -1970,6 +1978,13 @@ public:
      * useful to avoid copy-back for intermediate update stages that
      * touch a very small part of your Func. */
     Func &gpu_single_thread(DeviceAPI device_api = DeviceAPI::Default_GPU);
+
+    /** Mark a GPU block axis as launching in a thread-block cluster of width
+     * blocks_per_cluster along this axis. Otherwise identical to gpu_blocks: the
+     * kernel body is unchanged and, when blocks_per_cluster is 1, the generated
+     * IR and launch are byte-identical to gpu_blocks (NFC). blocks_per_cluster
+     * must be >= 1 and should divide the grid extent along this axis. */
+    Func &gpu_cluster(const VarOrRVar &block_x, int blocks_per_cluster, DeviceAPI device_api = DeviceAPI::Default_GPU);
 
     /** Tell Halide that the following dimensions correspond to GPU
      * block indices. This is useful for scheduling stages that will

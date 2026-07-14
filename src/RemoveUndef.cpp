@@ -368,7 +368,7 @@ private:
             body.same_as(op->body)) {
             return op;
         } else {
-            return For::make(op->name, min, max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group);
+            return For::make(op->name, min, max, op->for_type, op->partition_policy, op->device_api, body, op->realization, op->warps_per_group, op->blocks_per_cluster);
         }
     }
 

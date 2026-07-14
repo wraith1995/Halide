@@ -292,6 +292,48 @@ typedef enum CUtensorMapFloatOOBfill_enum {
     CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
 } CUtensorMapFloatOOBfill;
 
+// Thread-block cluster launch (sm_90+). These mirror the CUDA 12.x driver ABI
+// exactly (verified against NVIDIA cuda.h / the LLVM offload dynamic_cuda mirror)
+// so that cuLaunchKernelEx can be called through a dlopen'd libcuda.
+typedef enum CUlaunchAttributeID_enum {
+    CU_LAUNCH_ATTRIBUTE_IGNORE = 0,
+    CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW = 1,
+    CU_LAUNCH_ATTRIBUTE_COOPERATIVE = 2,
+    CU_LAUNCH_ATTRIBUTE_SYNCHRONIZATION_POLICY = 3,
+    CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION = 4,
+    CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE = 5
+} CUlaunchAttributeID;
+
+// The real union is sized by its largest member; char pad[64] guarantees the
+// union is >= the driver's size and keeps clusterDim at offset 0.
+typedef union CUlaunchAttributeValue_union {
+    char pad[64];
+    struct {
+        unsigned int x;
+        unsigned int y;
+        unsigned int z;
+    } clusterDim;
+} CUlaunchAttributeValue;
+
+typedef struct CUlaunchAttribute_st {
+    CUlaunchAttributeID id;
+    char pad[8 - sizeof(CUlaunchAttributeID)];
+    CUlaunchAttributeValue value;
+} CUlaunchAttribute;
+
+typedef struct CUlaunchConfig_st {
+    unsigned int gridDimX;
+    unsigned int gridDimY;
+    unsigned int gridDimZ;
+    unsigned int blockDimX;
+    unsigned int blockDimY;
+    unsigned int blockDimZ;
+    unsigned int sharedMemBytes;
+    CUstream hStream;
+    CUlaunchAttribute *attrs;
+    unsigned int numAttrs;
+} CUlaunchConfig;
+
 }  // namespace Cuda
 }  // namespace Internal
 }  // namespace Runtime
