@@ -1068,8 +1068,30 @@ void CodeGen_PTX_Dev::visit(const Allocate *alloc) {
     user_assert(!alloc->new_expr.defined()) << "Allocate node inside PTX kernel has custom new expression.\n"
                                             << "(Memoization is not supported inside GPU kernels at present.)\n";
     if (alloc->memory_type == MemoryType::GPUShared) {
-        // PTX uses zero in address space 3 as the base address for shared memory
-        Value *shared_base = Constant::getNullValue(PointerType::get(*context, 3));
+        // PTX normally uses zero in address space 3 as the base address for shared memory: a raw
+        // `st.shared [offset]` with the offset counted from 0. That is correct for a lone CTA, but
+        // WRONG under a thread-block cluster: shared then lives in the Distributed Shared Memory
+        // (DSMEM) aperture where each CTA's own window base is derived from its cluster CTA rank
+        // (SR_CgaCtaId), not 0. ptxas only inserts that per-CTA DSMEM base for accesses anchored to a
+        // real `.shared` symbol -- a null/0 base emits a bare offset that traps ("Illegal Instruction
+        // Parameter", XID 13) on any CTA of rank != 0. So for a cluster kernel, anchor shared accesses
+        // to an `.extern .shared` symbol; ptxas then adds the DSMEM base. NFC otherwise (null base).
+        // See research/RESUME_gpu_cluster.md.
+        Value *shared_base;
+        if (in_cluster_kernel) {
+            llvm::GlobalVariable *gv = module->getGlobalVariable("__halide_dynamic_shared", true);
+            if (!gv) {
+                llvm::ArrayType *aty = llvm::ArrayType::get(llvm::Type::getInt8Ty(*context), 0);
+                gv = new llvm::GlobalVariable(*module, aty, /*isConstant*/ false,
+                                              llvm::GlobalValue::ExternalLinkage, /*init*/ nullptr,
+                                              "__halide_dynamic_shared", /*before*/ nullptr,
+                                              llvm::GlobalValue::NotThreadLocal, /*addrspace*/ 3);
+                gv->setAlignment(llvm::Align(16));
+            }
+            shared_base = gv;
+        } else {
+            shared_base = Constant::getNullValue(PointerType::get(*context, 3));
+        }
         sym_push(alloc->name, shared_base);
         if (alloc->swizzle.defined()) {
             shared_swizzles[alloc->name] = {alloc->swizzle, alloc->type.bytes()};
