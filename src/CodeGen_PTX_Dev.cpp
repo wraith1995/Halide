@@ -824,6 +824,14 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         llvm::Value *elected = codegen(op->args[5]);
         llvm::FunctionType *ft =
             llvm::FunctionType::get(void_t, {i32_t, i64_t, i32_t, i32_t, i32_t, i32_t}, false);
+        // Phase-2 multicast (step 1, hardcoded): for a cluster kernel, the cluster-SHARED operand (As,
+        // N-invariant when clustering `no`) is loaded ONCE by the cluster LEADER CTA and broadcast to
+        // every CTA's shared via `.multicast::cluster` + a CTA mask -- half the global A traffic for a
+        // 2x1 cluster. Gate = (cluster_ctarank==0) AND the elected lane. Mask 0b11 = both CTAs. Selected
+        // when HL_MULTICAST is set and this TMA's dst is the As allocation. See phase2_multicast_plan.md.
+        const Load *dl = op->args[0].as<Load>();
+        bool multicast = in_cluster_kernel && !get_env_variable("HL_MULTICAST").empty() &&
+                         dl && starts_with(dl->name, "As");
         // Single-thread issue on the MODEL's elected lane ($5 = ExecMap::elected_lane): the bulk copy
         // must issue ONCE, and a warp-spec sub-region producer (e.g. Bs on tid in [32,64)) elects its
         // OWN first lane, not global tid 0. Guard = (tid.x == elected) && tid.y == 0 && tid.z == 0.
@@ -835,8 +843,19 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             "  setp.eq.and.u32 tma_e, tma_t0, $5, tma_p;\n"
             "  @tma_e cp.async.bulk.tensor.2d.shared::cluster.global.tile"
             ".mbarrier::complete_tx::bytes [$0], [$1, {$2, $3}], [$4]; }";
-        llvm::InlineAsm *ia =
-            llvm::InlineAsm::get(ft, asm_str, "r,l,r,r,r,r", /*hasSideEffects*/ true);
+        const char *mc_asm_str =
+            "{ .reg .pred mc_e, mc_p, mc_l; .reg .u32 mc_t0, mc_t1; .reg .b16 mc_m;\n"
+            "  mov.u32 mc_t0, %tid.y; mov.u32 mc_t1, %tid.z; or.b32 mc_t0, mc_t0, mc_t1;\n"
+            "  setp.eq.u32 mc_p, mc_t0, 0;\n"
+            "  mov.u32 mc_t0, %tid.x;\n"
+            "  setp.eq.and.u32 mc_e, mc_t0, $5, mc_p;\n"
+            "  mov.u32 mc_t0, %cluster_ctarank; setp.eq.u32 mc_l, mc_t0, 0;\n"
+            "  and.pred mc_e, mc_e, mc_l;\n"
+            "  mov.u16 mc_m, 3;\n"
+            "  @mc_e cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+            ".mbarrier::complete_tx::bytes.multicast::cluster [$0], [$1, {$2, $3}], [$4], mc_m; }";
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(
+            ft, multicast ? mc_asm_str : asm_str, "r,l,r,r,r,r", /*hasSideEffects*/ true);
         builder->CreateCall(ia, {dst, map, x, y, mbar, elected});
         value = ConstantInt::get(i32_t, 0);
         return;
