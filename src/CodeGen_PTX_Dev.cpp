@@ -830,8 +830,10 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         // 2x1 cluster. Gate = (cluster_ctarank==0) AND the elected lane. Mask 0b11 = both CTAs. Selected
         // when HL_MULTICAST is set and this TMA's dst is the As allocation. See phase2_multicast_plan.md.
         const Load *dl = op->args[0].as<Load>();
+        std::string mc_op = get_env_variable("HL_MC_OP");
+        if (mc_op.empty()) mc_op = "As";  // which shared operand to multicast (As=N-cluster, Bs=M-cluster)
         bool multicast = in_cluster_kernel && !get_env_variable("HL_MULTICAST").empty() &&
-                         dl && starts_with(dl->name, "As");
+                         dl && starts_with(dl->name, mc_op);
         // Single-thread issue on the MODEL's elected lane ($5 = ExecMap::elected_lane): the bulk copy
         // must issue ONCE, and a warp-spec sub-region producer (e.g. Bs on tid in [32,64)) elects its
         // OWN first lane, not global tid 0. Guard = (tid.x == elected) && tid.y == 0 && tid.z == 0.
