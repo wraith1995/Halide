@@ -2937,7 +2937,13 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         // body of one k-tile, not a refinement of which k-tile we are on. Without this, the producer's
         // own copy loops got folded into the index (iter = t*F+i), which multiplied the rendezvous per
         // tile by F and deadlocked the ring -- see research/schedule_fact_carriage.md §9.
-        ScopedValue<bool> p(in_pc, true);
+        // Only the RING PRODUCER's body freezes it. The enclosing `produce <consumer>` wraps the ring
+        // loop itself, so freezing on every ProducerConsumer would leave the index unset entirely.
+        auto it = env.find(op->name);
+        const bool is_ring_producer =
+            op->is_producer && it != env.end() && is_gpu_warp_specialized(it->second) &&
+            it->second.schedule().ring_buffer().defined();
+        ScopedValue<bool> p(in_pc, in_pc || is_ring_producer);
         return IRMutator::visit(op);
     }
 
