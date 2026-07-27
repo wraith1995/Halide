@@ -2854,7 +2854,22 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             // The empty edge carries the DRAIN edge's lag so its arrive can be retimed (§12.4).
             // Gated on HL_WS_EMPTY_SKEW while validating -- default OFF keeps lam_out = 0, i.e.
             // byte-identical NFC (and the prior, WAR-unsafe, behaviour under HL_WGMMA_INFLIGHT>0).
-            const int lam_out = empty_skew ? resolve_ring_pipeline(env, prod).release_retiming() : 0;
+            int lam_out = 0;
+            if (empty_skew) {
+                RingPipeline rp = resolve_ring_pipeline(env, prod);
+                rp.Q = rn;
+                // The §12.3 bracket must be non-empty, or there is no legal producer lead and the
+                // ring cannot make progress: the retimed release would free a slot only after the
+                // producer already needs it -> DEADLOCK on device. Fail at schedule time instead.
+                user_assert(rp.feasible())
+                    << "Ring buffer \"" << prod << "\" has depth " << rp.Q
+                    << ", too shallow for its async edges' in-flight depths (fill lag "
+                    << rp.lam_in << ", drain lag " << rp.lam_out << "): the hazard edges leave no "
+                    << "legal producer lead (" << rp.lead_lo() << " <= D <= " << rp.lead_hi()
+                    << " is empty). Increase ring_buffer() to at least "
+                    << (rp.lam_in + rp.lam_out + 1) << ", or reduce the in-flight depths.\n";
+                lam_out = rp.release_retiming();
+            }
             smap[prod + ".folding_semaphore.ring_buffer"] = {base + rn, rn, /*is_empty*/ true, pi,
                                                             {}, lam_out};
             base += 2 * rn;
