@@ -3050,6 +3050,16 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     Expr count = producer_threads[b.producer];
                     std::string cov = get_env_variable("HL_WG_MBAR_COUNT");
                     if (!cov.empty()) count = Expr(std::atoi(cov.c_str()));
+                    // §8.2 shared rendezvous: several producers may name the SAME full mbarrier, and
+                    // it must be allocated + initialized exactly ONCE (two Allocates / two init
+                    // triples for one buffer is what made the init malformed).
+                    bool already = false;
+                    for (const BarrierInfo &m : mbar_allocs) {
+                        already = already || m.mbar_name == b.mbar_name;
+                    }
+                    if (already) {
+                        continue;
+                    }
                     init_args.push_back(base_ref);
                     init_args.push_back(Expr(b.ring_n));
                     init_args.push_back(count);
@@ -3331,7 +3341,9 @@ class InjectTmaCopies : public IRMutator {
 public:
     // Ring mbarriers (buffer names) we wired a TMA producer onto: their mbarrier_init arrival count
     // (set for cp.async = warp width) must be patched to 1 (TMA's single expect_tx arrive).
-    std::set<std::string> tma_mbars;
+    // mbar buffer name -> how many TMA producers ARRIVE on it. >1 when co-placed producers
+    // share one full-edge rendezvous (§8.2), which is exactly the mbarrier's arrival count.
+    std::map<std::string, int> tma_mbars;
 private:
     // The enclosing gpu_block axis that carries a multi-CTA cluster, if any (async_storage_model.md
     // §11): its name lets us ask whether a staged tile is INVARIANT across the cluster's CTAs, which
@@ -3692,7 +3704,7 @@ private:
                 public: std::string name;
                 } n;
                 ring_mbar.accept(&n);
-                if (!n.name.empty()) tma_mbars.insert(n.name);
+                if (!n.name.empty()) tma_mbars[n.name]++;
             }
             Expr slot_dst = Load::make(tc.elem, tc.dst, tc.dst_slot, Buffer<>{}, Parameter{},
                                        const_true(), ModulusRemainder{});
@@ -3732,7 +3744,7 @@ private:
 // producer arrives exactly ONCE (expect_tx) -- a count of 32 would deadlock the consumer's try_wait.
 // The init is one flattened call `mbarrier_init(base0,ring_n0,count0, base1,ring_n1,count1, ...)`.
 class PatchTmaMbarCounts : public IRMutator {
-    const std::set<std::string> &tma_mbars;
+    const std::map<std::string, int> &tma_mbars;
     using IRMutator::visit;
     static std::string buffer_of(const Expr &e) {
         class NameOf : public IRVisitor {
@@ -3747,8 +3759,10 @@ class PatchTmaMbarCounts : public IRMutator {
         if (op->name == "mbarrier_init") {
             std::vector<Expr> args = op->args;
             for (size_t i = 0; i + 2 < args.size(); i += 3) {
-                if (tma_mbars.count(buffer_of(args[i]))) {
-                    args[i + 2] = Expr(1);
+                auto it = tma_mbars.find(buffer_of(args[i]));
+                if (it != tma_mbars.end()) {
+                    // One expect_tx arrive per TMA producer on this mbarrier (1 unshared, N shared).
+                    args[i + 2] = Expr(it->second);
                 }
             }
             return Call::make(op->type, op->name, args, op->call_type);
@@ -3756,7 +3770,7 @@ class PatchTmaMbarCounts : public IRMutator {
         return IRMutator::visit(op);
     }
 public:
-    explicit PatchTmaMbarCounts(const std::set<std::string> &m) : tma_mbars(m) {}
+    explicit PatchTmaMbarCounts(const std::map<std::string, int> &m) : tma_mbars(m) {}
 };
 }  // namespace
 
