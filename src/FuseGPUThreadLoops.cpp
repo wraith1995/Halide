@@ -3410,11 +3410,17 @@ class InjectTmaCopies : public IRMutator {
     std::set<std::string> shared_allocs;  // names allocated in GPUShared in scope
     std::map<std::string, SwizzleLayout> shared_swizzle;  // store_in swizzle per shared alloc
 public:
-    // Ring mbarriers (buffer names) we wired a TMA producer onto: their mbarrier_init arrival count
-    // (set for cp.async = warp width) must be patched to 1 (TMA's single expect_tx arrive).
-    // mbar buffer name -> how many TMA producers ARRIVE on it. >1 when co-placed producers
-    // share one full-edge rendezvous (§8.2), which is exactly the mbarrier's arrival count.
-    std::map<std::string, int> tma_mbars;
+    // Ring mbarriers we wired a TMA producer onto: their mbarrier_init arrival count (set for
+    // cp.async = warp width) must be patched to the number of expect_tx arrives the edge actually
+    // receives -- 1 unshared, N when co-placed producers share one full-edge rendezvous (§8.2).
+    //
+    // Keyed by (mbar buffer name, RING SLOT), not by buffer name alone. The arrival count is a
+    // property of one mbarrier OBJECT (one slot), and unrolling the ring loop replicates the TMA
+    // site once per slot: counting sites per BUFFER then reported Q arrivals for every slot, while
+    // each slot still receives exactly one -- every consumer try_wait spun forever. Keying on the
+    // slot makes the count invariant under unrolling by construction, and still counts genuine
+    // co-arrivals (two producers on the same slot, or one producer issuing two TMAs into it).
+    std::map<std::string, std::map<std::string, int>> tma_mbars;
 private:
     // The enclosing gpu_block axis that carries a multi-CTA cluster, if any (async_storage_model.md
     // §11): its name lets us ask whether a staged tile is INVARIANT across the cluster's CTAs, which
@@ -3767,15 +3773,23 @@ private:
         // CompletionKind upgrade (CpAsyncGroup -> CpAsyncBulk) makes lower_async_completions emit the
         // transaction-completion expect_tx instead of a cp.async-group arrive.
         if (ring_mbar.defined()) {
-            // Record the ring mbar so patch_tma_mbar_counts can fix its arrival count (TMA arrives 1).
+            // Record this arrival so patch_tma_mbar_counts can fix the edge's arrival count. Count it
+            // against the SLOT this TMA arrives on, not just the buffer: see tma_mbars.
             {
-                class NameOf : public IRVisitor {
+                class SlotOf : public IRVisitor {
                     using IRVisitor::visit;
-                    void visit(const Load *l) override { if (name.empty()) name = l->name; IRVisitor::visit(l); }
-                public: std::string name;
+                    void visit(const Load *l) override {
+                        if (name.empty()) { name = l->name; index = l->index; }
+                        IRVisitor::visit(l);
+                    }
+                public: std::string name; Expr index;
                 } n;
                 ring_mbar.accept(&n);
-                if (!n.name.empty()) tma_mbars[n.name]++;
+                if (!n.name.empty()) {
+                    std::ostringstream slot;
+                    slot << simplify(n.index);
+                    tma_mbars[n.name][slot.str()]++;
+                }
             }
             Expr slot_dst = Load::make(tc.elem, tc.dst, tc.dst_slot, Buffer<>{}, Parameter{},
                                        const_true(), ModulusRemainder{});
@@ -3852,7 +3866,22 @@ Stmt inject_tma_copies(Stmt s, const Target &t) {
     InjectTmaCopies injector;
     s = injector(s);
     if (!injector.tma_mbars.empty()) {
-        s = PatchTmaMbarCounts(injector.tma_mbars)(s);
+        // One mbarrier_init triple covers all Q slots of a ring edge with a single arrival count, so
+        // the slots must agree on how many arrivals they receive. They do by construction -- every
+        // slot of an edge is written by the same set of producers -- and if a schedule ever breaks
+        // that symmetry we want to hear about it here rather than deadlock on device.
+        std::map<std::string, int> counts;
+        for (const auto &[buf, slots] : injector.tma_mbars) {
+            const int n = slots.begin()->second;
+            for (const auto &[slot, c] : slots) {
+                internal_assert(c == n)
+                    << "TMA ring mbarrier \"" << buf << "\" receives " << c << " expect_tx arrival(s)"
+                    << " on slot " << slot << " but " << n << " on slot " << slots.begin()->first
+                    << "; one mbarrier_init arrival count cannot serve both.\n";
+            }
+            counts[buf] = n;
+        }
+        s = PatchTmaMbarCounts(counts)(s);
     }
     return s;
 }
