@@ -2806,6 +2806,13 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         return ring_iter_expr;
     }
 
+    // Which loop types are TIME axes within one thread, i.e. refine "which k-tile am I on"?
+    // Unrolled counts: it is a sequential loop that codegen happens to emit flat. Vectorized and the
+    // GPU* types are lane axes -- every point runs at once, so they do not order the ring.
+    static bool is_sequential_axis(ForType t) {
+        return t == ForType::Serial || t == ForType::Unrolled;
+    }
+
     // mode 0 = wait, 1 = arrive. id = base + (iter % ring_n) selects the slot.
     //
     // RETIMING (async_storage_model.md §12.4): on the EMPTY edge's arrive the consumer releases the
@@ -2950,14 +2957,26 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     Stmt visit(const For *op) override {
         ScopedValue<DeviceAPI> d(device_api,
                                  op->device_api != DeviceAPI::None ? op->device_api : device_api);
-        // Compose the ring's iteration index over nested serial loops: entering an inner serial loop
-        // of constant extent E refines the index to `outer*E + inner`. A single serial loop therefore
-        // yields exactly `Variable(loop)` (byte-identical to the previous innermost-loop behaviour),
-        // while a split ring loop yields the true k-tile index. A non-constant extent restarts the
-        // chain (conservative: we cannot compose a stride we do not know).
+        // Compose the ring's iteration index over the enclosing chain of SEQUENTIAL loops: entering an
+        // inner sequential loop of constant extent E refines the index to `outer*E + inner`. A single
+        // loop therefore yields exactly `Variable(loop)` (byte-identical to the previous
+        // innermost-loop behaviour), while a split ring loop yields the true k-tile index. A
+        // non-constant extent restarts the chain (conservative: we cannot compose a stride we do not
+        // know).
+        //
+        // "Sequential" means ORDERED IN TIME WITHIN A THREAD, which is Serial *and* Unrolled --
+        // unrolling is a codegen choice about how to emit a sequential loop, not a change to what the
+        // loop means, so both refine "which k-tile am I on". Vectorized/GPU* axes are lane axes, not
+        // time axes, and must never compose. Missing Unrolled here is what made `split(ko,koo,koi,Q);
+        // unroll(koi)` hang: the fold's acquire/release sit INSIDE the unrolled loop (correctly -- the
+        // store index is already `(koo*Q+koi)%Q`), but the index frozen at that site was just `koo`,
+        // so all Q tiles of a koo rendezvoused on ONE slot and the ring stalled. This is instance #5
+        // of the characteristic bug (research/schedule_fact_carriage.md §12): a Stratum-A fact
+        // (the ring axis) re-inferred from incidental IR structure (a ForType) that a legal schedule
+        // transformation is free to change.
         Expr next_iter = ring_iter_expr;
         std::string next_loop = ring_loop;
-        if (active && !in_pc && op->for_type == ForType::Serial) {
+        if (active && !in_pc && is_sequential_axis(op->for_type)) {
             next_loop = op->name;
             Expr v = Variable::make(Int(32), op->name);
             auto e = as_const_int(simplify(op->max - op->min + 1));
