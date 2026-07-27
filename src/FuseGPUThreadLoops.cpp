@@ -3313,6 +3313,32 @@ private:
     // is exactly the condition for TMA multicast. Empty/1 = no cluster => no multicast.
     std::string cluster_var;
     int cluster_extent = 1;
+    // In-scope LetStmt definitions, so cluster-invariance can be tested TRANSITIVELY: a tile coord
+    // usually reaches us as a let variable (t281) whose definition is what mentions the block axis,
+    // so a direct expr_uses_var would wrongly call every operand invariant. Names are unique at this
+    // stage (UniquifyVariableNames), so entries never need removing.
+    std::map<std::string, Expr> let_defs;
+
+    // Does `e` depend on variable `v`, following let definitions?
+    bool uses_var_through_lets(Expr e, const std::string &v) const {
+        for (int iter = 0; iter < 16; iter++) {
+            if (expr_uses_var(e, v)) {
+                return true;
+            }
+            bool changed = false;
+            for (const auto &kv : let_defs) {
+                if (expr_uses_var(e, kv.first)) {
+                    e = substitute(kv.first, kv.second, e);
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                return false;  // fully expanded, v never appeared
+            }
+        }
+        // Didn't converge: be conservative (assume it DOES depend => no multicast).
+        return true;
+    }
     // Tensor-map lets to wrap around the current gpu_block (host scope -> kernel arg).
     struct MapLet {
         std::string var;    // tensor-map variable name (referenced by tma_load_2d)
@@ -3346,6 +3372,12 @@ private:
             shared_swizzle.erase(op->name);
         }
         return s;
+    }
+
+    Stmt visit(const LetStmt *op) override {
+        // Record the binding so uses_var_through_lets can see through it (see let_defs).
+        let_defs[op->name] = op->value;
+        return IRMutator::visit(op);
     }
 
     Stmt visit(const For *op) override {
@@ -3574,7 +3606,8 @@ private:
         int mc_mask = 0;
         if (!cluster_var.empty() && cluster_extent > 1 &&
             get_env_variable("HL_NO_MULTICAST").empty() &&
-            !expr_uses_var(coordX, cluster_var) && !expr_uses_var(coordY, cluster_var)) {
+            !uses_var_through_lets(coordX, cluster_var) &&
+            !uses_var_through_lets(coordY, cluster_var)) {
             // Contiguous cluster along one axis: every CTA rank in [0, extent) participates.
             mc_mask = (1 << cluster_extent) - 1;
         }
