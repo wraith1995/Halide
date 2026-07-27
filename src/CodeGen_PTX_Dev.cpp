@@ -814,26 +814,30 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         // the .shared::cluster destination addressing works with no explicit cluster launch.
         // Args: (dst_smem_ref, tensor_map_ptr_u64, coord_x, coord_y, mbar_ref). dst/mbar are Load
         // carriers (shared byte offset = the addrspace(3) ptr's int value, dynamic shared base 0).
-        internal_assert(op->args.size() == 6u)
-            << "tma_load_2d expects (dst, map, x, y, mbar, elected_lane).\n";
+        internal_assert(op->args.size() == 7u)
+            << "tma_load_2d expects (dst, map, x, y, mbar, mc_mask, elected_lane).\n";
         llvm::Value *dst = mbar_shared_addr(op->args[0]);
         llvm::Value *map = codegen(op->args[1]);
         llvm::Value *x = codegen(op->args[2]);
         llvm::Value *y = codegen(op->args[3]);
         llvm::Value *mbar = mbar_shared_addr(op->args[4]);
-        llvm::Value *elected = codegen(op->args[5]);
+        llvm::Value *elected = codegen(op->args[6]);
         llvm::FunctionType *ft =
             llvm::FunctionType::get(void_t, {i32_t, i64_t, i32_t, i32_t, i32_t, i32_t}, false);
-        // Phase-2 multicast (step 1, hardcoded): for a cluster kernel, the cluster-SHARED operand (As,
-        // N-invariant when clustering `no`) is loaded ONCE by the cluster LEADER CTA and broadcast to
-        // every CTA's shared via `.multicast::cluster` + a CTA mask -- half the global A traffic for a
-        // 2x1 cluster. Gate = (cluster_ctarank==0) AND the elected lane. Mask 0b11 = both CTAs. Selected
-        // when HL_MULTICAST is set and this TMA's dst is the As allocation. See phase2_multicast_plan.md.
-        const Load *dl = op->args[0].as<Load>();
-        std::string mc_op = get_env_variable("HL_MC_OP");
-        if (mc_op.empty()) mc_op = "As";  // which shared operand to multicast (As=N-cluster, Bs=M-cluster)
-        bool multicast = in_cluster_kernel && !get_env_variable("HL_MULTICAST").empty() &&
-                         dl && starts_with(dl->name, mc_op);
+        // TMA MULTICAST: the cluster-shared operand is read ONCE by the cluster LEADER CTA and fanned to
+        // every CTA in the mask via `.multicast::cluster` -- half the global traffic for that operand in a
+        // 2x1 cluster. Gate = (cluster_ctarank == 0) AND the elected lane.
+        //
+        // The DECISION is not ours: arg 5 is the CTA mask the recognizer derived from the cluster geometry
+        // (`InjectTmaCopies`: multicast iff the tile's source coords are invariant in the clustered block
+        // axis -- async_storage_model.md §11). 0 = no multicast. Codegen only emits what the mask says.
+        // (It used to name-match the destination allocation here, which silently never fired once
+        // ExtractSharedAndHeapAllocations coalesced the shared allocs to `allocgroup__Bs.1__As.0` -- a
+        // Stratum-A mechanism choice wrongly deferred to Stratum C, where the operand identity is gone.
+        // See §12.9.)
+        auto mc_mask = as_const_int(op->args[5]);
+        internal_assert(mc_mask) << "tma_load_2d multicast mask must be a constant.\n";
+        const bool multicast = in_cluster_kernel && *mc_mask != 0;
         // Single-thread issue on the MODEL's elected lane ($5 = ExecMap::elected_lane): the bulk copy
         // must issue ONCE, and a warp-spec sub-region producer (e.g. Bs on tid in [32,64)) elects its
         // OWN first lane, not global tid 0. Guard = (tid.x == elected) && tid.y == 0 && tid.z == 0.
@@ -845,7 +849,8 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             "  setp.eq.and.u32 tma_e, tma_t0, $5, tma_p;\n"
             "  @tma_e cp.async.bulk.tensor.2d.shared::cluster.global.tile"
             ".mbarrier::complete_tx::bytes [$0], [$1, {$2, $3}], [$4]; }";
-        const char *mc_asm_str =
+        // The mask is a compile-time constant from the recognizer, so bake it into the asm.
+        std::string mc_asm_str =
             "{ .reg .pred mc_e, mc_p, mc_l; .reg .u32 mc_t0, mc_t1; .reg .b16 mc_m;\n"
             "  mov.u32 mc_t0, %tid.y; mov.u32 mc_t1, %tid.z; or.b32 mc_t0, mc_t0, mc_t1;\n"
             "  setp.eq.u32 mc_p, mc_t0, 0;\n"
@@ -853,11 +858,11 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             "  setp.eq.and.u32 mc_e, mc_t0, $5, mc_p;\n"
             "  mov.u32 mc_t0, %cluster_ctarank; setp.eq.u32 mc_l, mc_t0, 0;\n"
             "  and.pred mc_e, mc_e, mc_l;\n"
-            "  mov.u16 mc_m, 3;\n"
+            "  mov.u16 mc_m, " + std::to_string(multicast ? *mc_mask : 0) + ";\n"
             "  @mc_e cp.async.bulk.tensor.2d.shared::cluster.global.tile"
             ".mbarrier::complete_tx::bytes.multicast::cluster [$0], [$1, {$2, $3}], [$4], mc_m; }";
         llvm::InlineAsm *ia = llvm::InlineAsm::get(
-            ft, multicast ? mc_asm_str : asm_str, "r,l,r,r,r,r", /*hasSideEffects*/ true);
+            ft, multicast ? mc_asm_str.c_str() : asm_str, "r,l,r,r,r,r", /*hasSideEffects*/ true);
         builder->CreateCall(ia, {dst, map, x, y, mbar, elected});
         value = ConstantInt::get(i32_t, 0);
         return;

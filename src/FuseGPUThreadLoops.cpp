@@ -1580,7 +1580,8 @@ protected:
                     }
                 }
             }
-            return with_elected_lane(op, 5);
+            // 6 base args now: (dst, map, x, y, mbar, mc_mask); the elected lane appends as arg 6.
+            return with_elected_lane(op, 6);
         }
         if (op->is_intrinsic() && op->name == "cp_async_copy") {
             // cp_async_copy WRITES its shared destination (arg 0, a Load carrier) via cp.async --
@@ -3307,6 +3308,11 @@ public:
     // (set for cp.async = warp width) must be patched to 1 (TMA's single expect_tx arrive).
     std::set<std::string> tma_mbars;
 private:
+    // The enclosing gpu_block axis that carries a multi-CTA cluster, if any (async_storage_model.md
+    // §11): its name lets us ask whether a staged tile is INVARIANT across the cluster's CTAs, which
+    // is exactly the condition for TMA multicast. Empty/1 = no cluster => no multicast.
+    std::string cluster_var;
+    int cluster_extent = 1;
     // Tensor-map lets to wrap around the current gpu_block (host scope -> kernel arg).
     struct MapLet {
         std::string var;    // tensor-map variable name (referenced by tma_load_2d)
@@ -3343,6 +3349,17 @@ private:
     }
 
     Stmt visit(const For *op) override {
+        // Remember the clustered block axis on the way down (any gpu_block dim may carry it), so a
+        // producer inside can ask whether its tile is cluster-invariant => multicast (§11).
+        if (op->for_type == ForType::GPUBlock && op->blocks_per_cluster > 1) {
+            ScopedValue<std::string> cv(cluster_var, op->name);
+            ScopedValue<int> ce(cluster_extent, op->blocks_per_cluster);
+            return visit_block_or_recurse(op);
+        }
+        return visit_block_or_recurse(op);
+    }
+
+    Stmt visit_block_or_recurse(const For *op) {
         if (!ends_with(op->name, gpu_block_name(0))) {
             return IRMutator::visit(op);
         }
@@ -3544,6 +3561,25 @@ private:
         }
         pending_maps.push_back({tmap, tc.src, tc.box0, tc.box1, swz});
 
+        // TMA MULTICAST, DERIVED (async_storage_model.md §11/§12.9): multicast is `vectorize` placed at
+        // the Cluster level -- one bulk read fanned to every CTA of the cluster. It is legal exactly when
+        // the staged tile is the SAME for all CTAs in the cluster, i.e. when the tile's source coordinates
+        // do not depend on the clustered block axis (cluster `no` => the A tile is N-invariant => A is
+        // multicast; cluster `mo` => B). So the operand choice falls out of the cluster geometry -- no
+        // `.multicast()` directive and no operand name to match (§10.4 per-operand placement).
+        //
+        // This decision MUST be made here, in the recognizer: by codegen the shared allocations have been
+        // coalesced into one `allocgroup__...` buffer, so the destination no longer identifies the
+        // operand. We hand codegen the CTA mask; it only emits what the mask says.
+        int mc_mask = 0;
+        if (!cluster_var.empty() && cluster_extent > 1 &&
+            get_env_variable("HL_NO_MULTICAST").empty() &&
+            !expr_uses_var(coordX, cluster_var) && !expr_uses_var(coordY, cluster_var)) {
+            // Contiguous cluster along one axis: every CTA rank in [0, extent) participates.
+            mc_mask = (1 << cluster_extent) - 1;
+        }
+        Expr mc = Expr(mc_mask);
+
         Expr mbar_ref = Load::make(UInt(64), mbar, 0, Buffer<>{}, Parameter{}, const_true(),
                                    ModulusRemainder{});
         Expr dst_ref = Load::make(tc.elem, tc.dst, 0, Buffer<>{}, Parameter{}, const_true(),
@@ -3572,7 +3608,7 @@ private:
                                                     {Expr((int)CompletionKind::CpAsyncBulk), ring_mbar, bytes},
                                                     Call::Intrinsic));
             Stmt rload = Evaluate::make(Call::make(Int(32), "tma_load_2d",
-                                                   {slot_dst, map_var, coordX, coordY, ring_mbar},
+                                                   {slot_dst, map_var, coordX, coordY, ring_mbar, mc},
                                                    Call::Intrinsic));
             return ProducerConsumer::make(op->name, true, Block::make(rissue, rload));
         }
@@ -3587,7 +3623,7 @@ private:
                                                {Expr((int)CompletionKind::CpAsyncBulk), mbar_ref, bytes},
                                                Call::Intrinsic));
         Stmt load = Evaluate::make(Call::make(Int(32), "tma_load_2d",
-                                              {dst_ref, map_var, coordX, coordY, mbar_ref},
+                                              {dst_ref, map_var, coordX, coordY, mbar_ref, mc},
                                               Call::Intrinsic));
         Stmt wait = Evaluate::make(Call::make(Int(32), Call::async_wait,
                                               {Expr((int)CompletionKind::CpAsyncBulk),
