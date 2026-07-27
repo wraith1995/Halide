@@ -2737,7 +2737,8 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     const std::map<std::string, Function> &env;
     DeviceAPI device_api = DeviceAPI::None;
     bool active = false;
-    std::string ring_loop;
+    std::string ring_loop;   // innermost serial loop name (diagnostics only)
+    Expr ring_iter_expr;     // the ring's k-tile index, composed over the serial chain
     int wg_dim = -1;
     int num_producers = 0;  // producers occupy wg [0, num_producers); consumer is wg >= num_producers
     Expr thread_count;
@@ -2788,16 +2789,16 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     // "which k-tile am I on" exists in exactly one place instead of being re-derived at five call
     // sites.
     //
-    // It is still *inferred* from loop nesting (`ring_loop` = the innermost enclosing Serial loop, set
-    // in visit(For)), which is the known limitation: a schedule that splits and unrolls the ring loop
-    // leaves the innermost serial loop counting GROUPS of Q k-tiles, so this expression is wrong and
-    // the ring bookkeeping silently breaks (§12.18 -> CUDA_ERROR_LAUNCH_FAILED). Fixing that means
-    // giving this function a carried value instead of an inferred one -- and because every use now
-    // routes through here, that is a ONE-function change rather than five.
+    // It is COMPOSED over the whole enclosing chain of serial loops (visit(For)), not read off the
+    // innermost one. That matters when the ring loop is split: for `split(ko,koo,koi,Q)` the index is
+    // `koo*Q + koi`, so slot and parity stay correct. Reading only the innermost loop (`koi`) gave
+    // slot = koi (right) but parity = koi/Q = 0 ALWAYS (wrong -- the mbarrier phase never advanced),
+    // which is what made an unrolled ring fail to launch (§12.18). This pass runs BEFORE unroll_loops
+    // (Lower.cpp:299 vs :372), so every loop of the split is still visible here to compose from.
     Expr ring_iter() const {
-        internal_assert(!ring_loop.empty())
+        internal_assert(ring_iter_expr.defined())
             << "ring_iter() used outside a ring loop -- the ring's iteration index is undefined.\n";
-        return Variable::make(Int(32), ring_loop);
+        return ring_iter_expr;
     }
 
     // mode 0 = wait, 1 = arrive. id = base + (iter % ring_n) selects the slot.
@@ -2929,8 +2930,21 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     Stmt visit(const For *op) override {
         ScopedValue<DeviceAPI> d(device_api,
                                  op->device_api != DeviceAPI::None ? op->device_api : device_api);
-        ScopedValue<std::string> r(ring_loop,
-                                   (active && op->for_type == ForType::Serial) ? op->name : ring_loop);
+        // Compose the ring's iteration index over nested serial loops: entering an inner serial loop
+        // of constant extent E refines the index to `outer*E + inner`. A single serial loop therefore
+        // yields exactly `Variable(loop)` (byte-identical to the previous innermost-loop behaviour),
+        // while a split ring loop yields the true k-tile index. A non-constant extent restarts the
+        // chain (conservative: we cannot compose a stride we do not know).
+        Expr next_iter = ring_iter_expr;
+        std::string next_loop = ring_loop;
+        if (active && op->for_type == ForType::Serial) {
+            next_loop = op->name;
+            Expr v = Variable::make(Int(32), op->name);
+            auto e = as_const_int(simplify(op->max - op->min + 1));
+            next_iter = (ring_iter_expr.defined() && e) ? (ring_iter_expr * (int)*e + v) : v;
+        }
+        ScopedValue<std::string> r(ring_loop, next_loop);
+        ScopedValue<Expr> ri(ring_iter_expr, next_iter);
         return IRMutator::visit(op);
     }
 
