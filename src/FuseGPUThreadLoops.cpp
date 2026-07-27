@@ -2782,7 +2782,25 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     const bool share_full;
     using IRMutator::visit;
 
-    // mode 0 = wait, 1 = arrive. id = base + (ring_loop % ring_n) selects the slot.
+    // THE RING'S ITERATION INDEX -- the single definition point (research/schedule_fact_carriage.md
+    // §4b). Everything positional about the ring (slot = iter % Q, parity = iter / Q, the skip-first
+    // guards, the §12.4 empty-edge retiming) is built from THIS expression, so the ring's notion of
+    // "which k-tile am I on" exists in exactly one place instead of being re-derived at five call
+    // sites.
+    //
+    // It is still *inferred* from loop nesting (`ring_loop` = the innermost enclosing Serial loop, set
+    // in visit(For)), which is the known limitation: a schedule that splits and unrolls the ring loop
+    // leaves the innermost serial loop counting GROUPS of Q k-tiles, so this expression is wrong and
+    // the ring bookkeeping silently breaks (§12.18 -> CUDA_ERROR_LAUNCH_FAILED). Fixing that means
+    // giving this function a carried value instead of an inferred one -- and because every use now
+    // routes through here, that is a ONE-function change rather than five.
+    Expr ring_iter() const {
+        internal_assert(!ring_loop.empty())
+            << "ring_iter() used outside a ring loop -- the ring's iteration index is undefined.\n";
+        return Variable::make(Int(32), ring_loop);
+    }
+
+    // mode 0 = wait, 1 = arrive. id = base + (iter % ring_n) selects the slot.
     //
     // RETIMING (async_storage_model.md §12.4): on the EMPTY edge's arrive the consumer releases the
     // slot whose wgmma read has RETIRED, which under `wgmma.wait_group lam_out` is the slot from
@@ -2794,7 +2812,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     // expression exactly (NFC).
     Stmt emit_barrier(const BarrierInfo &b, int mode) {
         const bool retime = b.is_empty && mode == 1 && b.lam_out > 0;
-        Expr iter = Variable::make(Int(32), ring_loop);
+        Expr iter = ring_iter();
         Expr slot = (retime ? (iter - b.lam_out) : iter) % b.ring_n;
         Expr id = b.base == 0 ? slot : (b.base + slot);
         // Rectangular: every blockDim lane of both groups hits the barrier (2*max).
@@ -2814,7 +2832,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     // F3: a Load carrier addressing full mbarrier slot (ring_loop % ring_n). codegen derives the
     // addrspace(3) pointer from it (and ExtractSharedAndHeapAllocations folds the shared offset).
     Expr mbar_slot_ref(const BarrierInfo &b) {
-        Expr slot = Variable::make(Int(32), ring_loop) % b.ring_n;
+        Expr slot = ring_iter() % b.ring_n;
         return Load::make(UInt(64), b.mbar_name, slot, Buffer<>{}, Parameter{}, const_true(),
                           ModulusRemainder{});
     }
@@ -3133,7 +3151,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     // The try_wait.parity convention is ISA-ambiguous; HL_WG_MBAR_PFLIP toggles it
                     // empirically (start phase 0 vs 1) without a rebuild.
                     int pflip = get_env_variable("HL_WG_MBAR_PFLIP") == "1" ? 1 : 0;
-                    Expr parity = (Variable::make(Int(32), ring_loop) / b.ring_n + pflip) % 2;
+                    Expr parity = (ring_iter() / b.ring_n + pflip) % 2;
                     // Portable completion WAIT (M3b): the ring no longer hand-picks the mbarrier; it
                     // emits async_wait(CpAsyncGroup, WarpGroup, token, parity) and the S2 selector
                     // (lower_async_completions) lowers it to mbarrier_try_wait. The mbar slot array +
@@ -3149,7 +3167,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                 Stmt wait = emit_barrier(b, /*wait*/ 0);
                 if (b.is_empty) {
                     // Slots start free: skip the first N empty-waits or iter 0 deadlocks.
-                    wait = IfThenElse::make(Variable::make(Int(32), ring_loop) >= b.ring_n, wait);
+                    wait = IfThenElse::make(ring_iter() >= b.ring_n, wait);
                 }
                 return Block::make(wait, body);
             }
@@ -3191,7 +3209,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     // releases tiles [0, K-lam_out) while the producer only ever waits on tiles
                     // <= K-1-Q, and Q >= lam_out holds by the §12.3 bracket.
                     arrive = IfThenElse::make(
-                        Variable::make(Int(32), ring_loop) >= b.lam_out, arrive);
+                        ring_iter() >= b.lam_out, arrive);
                 }
                 return arrive;
             }
