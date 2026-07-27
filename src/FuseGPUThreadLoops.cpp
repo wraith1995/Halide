@@ -2922,6 +2922,28 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                                                             {}, lam_out};
             base += 2 * rn;
         }
+        // NAMED-BARRIER BUDGET. A CTA has 16 hardware named barriers (sm_90), and each ring producer
+        // is given a block of 2*Q ids (full edge + empty edge). Overrunning it used to be silent: the
+        // ids were emitted anyway, ptxas rejected the module, and the only symptom was
+        // CUDA_ERROR_INVALID_PTX at cuModuleLoadData -- a schedule-level constraint surfacing as a
+        // driver error with no mention of ring_buffer, depth, or producer count.
+        //
+        // (The reservation is 2*Q per producer even when HL_WG_MBAR realizes the full edge as an
+        // mbarrier and so consumes no named id. Reserving only the empty edge's Q would double the
+        // reachable depth; it renumbers every barrier, so it is a deliberate change and not this one.)
+        const int named_barrier_budget = 16;
+        user_assert(base <= named_barrier_budget)
+            << "This schedule needs " << base << " named barriers for its ring buffer(s), but a CUDA"
+            << " thread block has only " << named_barrier_budget << ". "
+            << collector.producers.size() << " async ring producer(s) at depth"
+            << [&] { std::ostringstream o;
+                     for (const auto &p : collector.producers) {
+                         o << " " << p << "="
+                           << *as_const_int(env.at(p).schedule().ring_buffer());
+                     }
+                     return o.str(); }()
+            << " reserve 2*depth barriers each. Reduce ring_buffer(), or give fewer producers their"
+            << " own warp group (co-place them with compute_with so they share one).\n";
         // Per-edge participant count: producer warp group + consumer warp group. With
         // equal one-warp groups this is 2x the per-dim thread extent, independent of the
         // producer count. Asymmetric sizing (plan §9.1) will make this per-edge.
