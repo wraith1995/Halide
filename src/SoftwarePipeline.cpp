@@ -8,6 +8,7 @@
 #include "IREquality.h"
 #include "IRMutator.h"
 #include "IROperator.h"
+#include "RingPipeline.h"
 #include "Schedule.h"
 #include "Simplify.h"
 #include "Substitute.h"
@@ -112,23 +113,20 @@ class SoftwarePipeline : public IRMutator {
                 return rebuild(op, body);
             }
         }
-        // Lead distance: maximal prefetch is D = Q-1 (produce Q-1 tiles ahead of the consume). But when
-        // the CONSUMER keeps N_w wgmma groups in flight (HL_WGMMA_INFLIGHT, wgmma pipelining), the wgmma
-        // reading a ring slot is not retired until N_w iterations after it issues. produce(v+D) overwrites
-        // slot (v+D)%Q, whose last reader was consume(v+D-Q); that read drains at iteration v+D-Q+N_w. For
-        // the produce at iteration v to not clobber an in-flight wgmma read, that drain (and its CTA
-        // barrier) must precede it: v+D-Q+N_w <= v-1  =>  D <= Q-1-N_w. So shrink the lead by N_w. This is
-        // the async_storage_model.md §8 empty-edge inequality Q >= N_c+N_w+1 realized in the skew (with the
-        // cp.async lead N_c <= D). NFC for N_w=0 (D = Q-1 unchanged); the wgmma overlap is preserved (it
-        // rides the codegen wgmma.wait_group N_w, not the lead), only the cp.async prefetch shortens by N_w.
-        int n_w = 0;
-        {
-            std::string e = get_env_variable("HL_WGMMA_INFLIGHT");
-            if (!e.empty()) {
-                n_w = std::max(0, atoi(e.c_str()));
-            }
-        }
-        const int D = Q - 1 - n_w;
+        // Lead distance: the two hazard edges of this ring BRACKET the lead (async_storage_model.md
+        // §12.3) -- full/RAW needs D >= lambda_in, empty/WAR needs D <= Q-1-lambda_out -- and we take
+        // the upper endpoint (maximal prefetch). Concretely for the empty edge: when the CONSUMER keeps
+        // lambda_out wgmma groups in flight, the wgmma reading a ring slot is not retired until
+        // lambda_out iterations after it issues. produce(v+D) overwrites slot (v+D)%Q, whose last reader
+        // was consume(v+D-Q); that read drains at iteration v+D-Q+lambda_out. For the produce at
+        // iteration v not to clobber an in-flight wgmma read, that drain (and its CTA barrier) must
+        // precede it: v+D-Q+lambda_out <= v-1 => D <= Q-1-lambda_out. So the lead shrinks by the drain
+        // edge's lag. Feasibility of the bracket IS the §8.3 inequality Q >= lambda_in+lambda_out+1.
+        // NFC for lambda_out=0 (D = Q-1 unchanged); the wgmma overlap is preserved (it rides the codegen
+        // wgmma.wait_group, not the lead), only the cp.async prefetch shortens.
+        RingPipeline rp = resolve_ring_pipeline(env, producers[0]->name);
+        rp.Q = Q;  // the depth validated above (proven shared by every collected producer)
+        const int D = rp.lead();
         if (D < 1) {
             return rebuild(op, body);
         }

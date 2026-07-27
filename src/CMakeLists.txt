@@ -190,6 +190,7 @@ target_sources(
     RemoveDeadAllocations.h
     RemoveExternLoops.h
     RemoveUndef.h
+    RingPipeline.h
     runtime/HalideBuffer.h
     runtime/HalideRuntime.h
     Schedule.h
