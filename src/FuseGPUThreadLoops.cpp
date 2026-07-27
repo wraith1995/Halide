@@ -2786,6 +2786,10 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     // §8.2 shared rendezvous: co-placed ring producers share ONE full-edge mbarrier, so the consumer
     // waits once per k-tile instead of once per operand. Off by default (NFC); HL_WS_SHARED_FULL=1.
     const bool share_full;
+    // Reserve named-barrier ids only for the edges that actually consume them (§12.20): an mbarrier
+    // full edge consumes none, so the block is Q ids per producer instead of 2Q, doubling the depth
+    // reachable under the hardware's 16. Renumbers barriers => not byte-identical; off by default.
+    const bool tight_barriers;
     using IRMutator::visit;
 
     // THE RING'S ITERATION INDEX -- the single definition point (research/schedule_fact_carriage.md
@@ -2897,7 +2901,21 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             // TRYWAIT + MEMBAR.ALL.CTA + FENCE.VIEW.ASYNC.S per extra operand from the hot loop.
             const std::string full_mbar_owner =
                 (share_full ? collector.producers[0] : prod) + ".full_mbar";
-            smap[prod + ".semaphore_0"] = {base, rn, /*is_empty*/ false, pi,
+            // NAMED-BARRIER RESERVATION. Each producer gets a block of ids, one per ring slot per
+            // edge. A full edge realized as an mbarrier (HL_WG_MBAR) takes the mbarrier path in
+            // visit(Acquire)/visit(Evaluate) and never calls emit_barrier, so it consumes NO named id
+            // -- yet the block still reserved Q of them for it. With 2 producers that made 4Q ids and
+            // pinned the ring at Q<=4 against the hardware's 16, which §12.20 measured as the BINDING
+            // constraint on performance (the Q curve is still rising steeply at 4). Reserving only the
+            // edges that actually consume ids doubles the reachable depth to Q<=8.
+            //
+            // Renumbers every barrier id, so it is not byte-identical: gated on HL_WS_TIGHT_BARRIERS
+            // while validating. Should become unconditional once the depth sweep confirms it, since
+            // reserving ids for an edge that cannot use them is waste with no upside.
+            const bool full_takes_id = !mbar || !tight_barriers;
+            const int full_base = base;
+            const int empty_base = full_takes_id ? base + rn : base;
+            smap[prod + ".semaphore_0"] = {full_base, rn, /*is_empty*/ false, pi,
                                            mbar ? full_mbar_owner : std::string()};
             // The empty edge carries the DRAIN edge's lag so its arrive can be retimed (§12.4).
             // Gated on HL_WS_EMPTY_SKEW while validating -- default OFF keeps lam_out = 0, i.e.
@@ -2918,20 +2936,16 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     << (rp.lam_in + rp.lam_out + 1) << ", or reduce the in-flight depths.\n";
                 lam_out = rp.release_retiming();
             }
-            smap[prod + ".folding_semaphore.ring_buffer"] = {base + rn, rn, /*is_empty*/ true, pi,
+            smap[prod + ".folding_semaphore.ring_buffer"] = {empty_base, rn, /*is_empty*/ true, pi,
                                                             {}, lam_out};
-            base += 2 * rn;
+            base += full_takes_id ? 2 * rn : rn;
         }
-        // NAMED-BARRIER BUDGET. A CTA has 16 hardware named barriers (sm_90), and each ring producer
-        // is given a block of 2*Q ids (full edge + empty edge). Overrunning it used to be silent: the
-        // ids were emitted anyway, ptxas rejected the module, and the only symptom was
+        // NAMED-BARRIER BUDGET. A CTA has 16 hardware named barriers (sm_90). Overrunning it used to
+        // be silent: the ids were emitted anyway, ptxas rejected the module, and the only symptom was
         // CUDA_ERROR_INVALID_PTX at cuModuleLoadData -- a schedule-level constraint surfacing as a
         // driver error with no mention of ring_buffer, depth, or producer count.
-        //
-        // (The reservation is 2*Q per producer even when HL_WG_MBAR realizes the full edge as an
-        // mbarrier and so consumes no named id. Reserving only the empty edge's Q would double the
-        // reachable depth; it renumbers every barrier, so it is a deliberate change and not this one.)
         const int named_barrier_budget = 16;
+        const int per_depth = (mbar && tight_barriers) ? 1 : 2;
         user_assert(base <= named_barrier_budget)
             << "This schedule needs " << base << " named barriers for its ring buffer(s), but a CUDA"
             << " thread block has only " << named_barrier_budget << ". "
@@ -2942,8 +2956,13 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                            << *as_const_int(env.at(p).schedule().ring_buffer());
                      }
                      return o.str(); }()
-            << " reserve 2*depth barriers each. Reduce ring_buffer(), or give fewer producers their"
-            << " own warp group (co-place them with compute_with so they share one).\n";
+            << " reserve " << per_depth << "*depth barriers each. Reduce ring_buffer(), or give fewer"
+            << " producers their own warp group (co-place them with compute_with so they share one)."
+            << (per_depth == 2 && mbar
+                    ? " Their mbarrier full edges consume no named barrier, so HL_WS_TIGHT_BARRIERS=1"
+                      " halves this reservation and doubles the reachable depth."
+                    : "")
+            << "\n";
         // Per-edge participant count: producer warp group + consumer warp group. With
         // equal one-warp groups this is 2x the per-dim thread extent, independent of the
         // producer count. Asymmetric sizing (plan §9.1) will make this per-edge.
@@ -3297,7 +3316,8 @@ public:
         : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") != "0"), warp_size(warp_size),
           mbar(get_env_variable("HL_WG_MBAR") == "1"),
           empty_skew(get_env_variable("HL_WS_EMPTY_SKEW") == "1"),
-          share_full(get_env_variable("HL_WS_SHARED_FULL") == "1") {
+          share_full(get_env_variable("HL_WS_SHARED_FULL") == "1"),
+          tight_barriers(get_env_variable("HL_WS_TIGHT_BARRIERS") == "1") {
     }
 };
 
