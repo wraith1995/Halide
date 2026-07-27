@@ -814,14 +814,15 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         // the .shared::cluster destination addressing works with no explicit cluster launch.
         // Args: (dst_smem_ref, tensor_map_ptr_u64, coord_x, coord_y, mbar_ref). dst/mbar are Load
         // carriers (shared byte offset = the addrspace(3) ptr's int value, dynamic shared base 0).
-        internal_assert(op->args.size() == 7u)
-            << "tma_load_2d expects (dst, map, x, y, mbar, mc_mask, elected_lane).\n";
+        internal_assert(op->args.size() == 10u)
+            << "tma_load_2d expects (dst, map, x, y, mbar, mc_mask, mc_parts, mc_slice_bytes, "
+               "mc_slice_rows, elected_lane).\n";
         llvm::Value *dst = mbar_shared_addr(op->args[0]);
         llvm::Value *map = codegen(op->args[1]);
         llvm::Value *x = codegen(op->args[2]);
         llvm::Value *y = codegen(op->args[3]);
         llvm::Value *mbar = mbar_shared_addr(op->args[4]);
-        llvm::Value *elected = codegen(op->args[6]);
+        llvm::Value *elected = codegen(op->args[9]);
         llvm::FunctionType *ft =
             llvm::FunctionType::get(void_t, {i32_t, i64_t, i32_t, i32_t, i32_t, i32_t}, false);
         // TMA MULTICAST: the cluster-shared operand is read ONCE by the cluster LEADER CTA and fanned to
@@ -849,18 +850,48 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
             "  setp.eq.and.u32 tma_e, tma_t0, $5, tma_p;\n"
             "  @tma_e cp.async.bulk.tensor.2d.shared::cluster.global.tile"
             ".mbarrier::complete_tx::bytes [$0], [$1, {$2, $3}], [$4]; }";
-        // The mask is a compile-time constant from the recognizer, so bake it into the asm.
+        // ISSUER TOPOLOGY (§12.11), decided by the recognizer and carried in args 6-8:
+        //   parts == 1      ELECTED    -- gate on cluster_ctarank == 0; the leader fetches the whole
+        //                                 tile. Traffic halved, issue serialized onto one CTA.
+        //   parts >  1      COOPERATIVE -- NO leader gate: every CTA fetches slice `rank` (global coord
+        //                                 shifted by rank*slice_rows, shared dst by rank*slice_bytes)
+        //                                 and multicasts it to the mask. Traffic halved AND issue
+        //                                 parallel. The descriptor was already narrowed to one slice,
+        //                                 and expect_tx still covers the FULL tile: each CTA receives
+        //                                 `parts` slice-transactions that sum to it.
+        auto mc_parts = as_const_int(op->args[6]);
+        auto mc_slice_bytes = as_const_int(op->args[7]);
+        auto mc_slice_rows = as_const_int(op->args[8]);
+        internal_assert(mc_parts && mc_slice_bytes && mc_slice_rows)
+            << "tma_load_2d multicast topology args must be constants.\n";
+        const bool cooperative = multicast && *mc_parts > 1;
+        // The mask/topology are compile-time constants from the recognizer, so bake them into the asm.
         std::string mc_asm_str =
-            "{ .reg .pred mc_e, mc_p, mc_l; .reg .u32 mc_t0, mc_t1; .reg .b16 mc_m;\n"
+            "{ .reg .pred mc_e, mc_p" + std::string(cooperative ? "" : ", mc_l") +
+            "; .reg .u32 mc_t0, mc_t1" + std::string(cooperative ? ", mc_r, mc_y, mc_d" : "") +
+            "; .reg .b16 mc_m;\n"
             "  mov.u32 mc_t0, %tid.y; mov.u32 mc_t1, %tid.z; or.b32 mc_t0, mc_t0, mc_t1;\n"
             "  setp.eq.u32 mc_p, mc_t0, 0;\n"
             "  mov.u32 mc_t0, %tid.x;\n"
-            "  setp.eq.and.u32 mc_e, mc_t0, $5, mc_p;\n"
-            "  mov.u32 mc_t0, %cluster_ctarank; setp.eq.u32 mc_l, mc_t0, 0;\n"
-            "  and.pred mc_e, mc_e, mc_l;\n"
+            "  setp.eq.and.u32 mc_e, mc_t0, $5, mc_p;\n";
+        if (cooperative) {
+            // Every CTA issues its own slice: shift the source coord and the shared destination by rank.
+            mc_asm_str +=
+                "  mov.u32 mc_r, %cluster_ctarank;\n"
+                "  mad.lo.u32 mc_y, mc_r, " + std::to_string(*mc_slice_rows) + ", $3;\n"
+                "  mad.lo.u32 mc_d, mc_r, " + std::to_string(*mc_slice_bytes) + ", $0;\n";
+        } else {
+            // Leader-only: additionally require cluster_ctarank == 0.
+            mc_asm_str +=
+                "  mov.u32 mc_t0, %cluster_ctarank; setp.eq.u32 mc_l, mc_t0, 0;\n"
+                "  and.pred mc_e, mc_e, mc_l;\n";
+        }
+        mc_asm_str +=
             "  mov.u16 mc_m, " + std::to_string(multicast ? *mc_mask : 0) + ";\n"
             "  @mc_e cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-            ".mbarrier::complete_tx::bytes.multicast::cluster [$0], [$1, {$2, $3}], [$4], mc_m; }";
+            ".mbarrier::complete_tx::bytes.multicast::cluster [" +
+            std::string(cooperative ? "mc_d" : "$0") + "], [$1, {$2, " +
+            std::string(cooperative ? "mc_y" : "$3") + "}], [$4], mc_m; }";
         llvm::InlineAsm *ia = llvm::InlineAsm::get(
             ft, multicast ? mc_asm_str.c_str() : asm_str, "r,l,r,r,r,r", /*hasSideEffects*/ true);
         builder->CreateCall(ia, {dst, map, x, y, mbar, elected});

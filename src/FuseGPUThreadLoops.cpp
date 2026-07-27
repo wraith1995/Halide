@@ -1580,8 +1580,9 @@ protected:
                     }
                 }
             }
-            // 6 base args now: (dst, map, x, y, mbar, mc_mask); the elected lane appends as arg 6.
-            return with_elected_lane(op, 6);
+            // 9 base args: (dst, map, x, y, mbar, mc_mask, mc_parts, mc_slice_bytes, mc_slice_rows);
+            // the elected lane appends as arg 9.
+            return with_elected_lane(op, 9);
         }
         if (op->is_intrinsic() && op->name == "cp_async_copy") {
             // cp_async_copy WRITES its shared destination (arg 0, a Load carrier) via cp.async --
@@ -3580,19 +3581,6 @@ private:
         Expr coordY = tc.coordY;
         Expr bytes = simplify(tc.box0 * tc.box1 * (tc.elem.bits() / 8));
 
-        std::string mbar = op->name + ".tma_mbar";
-        std::string tmap = op->name + ".tma_map";
-        int swz = swizzle_bytes(shared_swizzle[op->name]);
-        // The ring storage transform bakes the swizzle into the scalar store INDEX and clears the
-        // Allocate.swizzle, so a ring operand loses its swizzle here (swz=0) even though the wgmma
-        // descriptor still expects it -> the TMA would write unswizzled. HL_WG_TMA_SWZ overrides the
-        // tensor-map swizzle to confirm/repair this until the swizzle is kept as an attribute.
-        {
-            std::string ov = get_env_variable("HL_WG_TMA_SWZ");
-            if (!ov.empty() && swz == 0) swz = std::atoi(ov.c_str());
-        }
-        pending_maps.push_back({tmap, tc.src, tc.box0, tc.box1, swz});
-
         // TMA MULTICAST, DERIVED (async_storage_model.md §11/§12.9): multicast is `vectorize` placed at
         // the Cluster level -- one bulk read fanned to every CTA of the cluster. It is legal exactly when
         // the staged tile is the SAME for all CTAs in the cluster, i.e. when the tile's source coordinates
@@ -3611,7 +3599,54 @@ private:
             // Contiguous cluster along one axis: every CTA rank in [0, extent) participates.
             mc_mask = (1 << cluster_extent) - 1;
         }
+
+        // ISSUER TOPOLOGY (async_storage_model.md §12.11) -- the placement coordinate that says WHO
+        // issues this collective. It is NOT implied by the mechanism: the same multicast instruction
+        // admits both forms, and the choice is worth ~the whole benefit.
+        //   parts == 1          ELECTED    : the cluster leader fetches the whole tile and fans it out.
+        //                                   Traffic halved, but issue serialized onto one CTA.
+        //   parts == extent     COOPERATIVE: every CTA fetches a distinct SLICE and multicasts it, so
+        //                                   traffic is halved AND issue parallelism is preserved. This
+        //                                   is what CUTLASS does (its multicast carries no leader
+        //                                   predicate and its mask is computed per-CTA).
+        // Derived consequences (Stratum B, all from `parts`): the descriptor box shrinks to box1/parts,
+        // each CTA's global coord shifts by rank*(box1/parts), and its shared destination by
+        // rank*slice_bytes. `bytes` (expect_tx) is UNCHANGED and still the full tile -- each CTA
+        // receives `parts` slice-transactions that sum to it, so the completion arithmetic is untouched.
+        //
+        // Slicing the OUTER descriptor dim keeps each slice a contiguous, swizzle-aligned run of rows
+        // (a row is the swizzle unit), so it composes with swizzle_storage.
+        int mc_parts = 1;
+        Expr mc_box1 = tc.box1;  // the descriptor's outer extent (sliced when cooperative)
+        int mc_slice_bytes = 0, mc_slice_rows = 0;
+        if (mc_mask != 0 && get_env_variable("HL_MC_PARTITION") == "1") {
+            auto b1 = as_const_int(simplify(tc.box1));
+            auto b0 = as_const_int(simplify(tc.box0));
+            if (b1 && b0 && *b1 % cluster_extent == 0) {
+                mc_parts = cluster_extent;
+                mc_slice_rows = (int)(*b1 / cluster_extent);
+                mc_slice_bytes = (int)(*b0 * mc_slice_rows * (tc.elem.bits() / 8));
+                mc_box1 = Expr((int)(*b1 / cluster_extent));
+            }
+        }
         Expr mc = Expr(mc_mask);
+        Expr mc_p = Expr(mc_parts);
+        Expr mc_sb = Expr(mc_slice_bytes);
+        Expr mc_sr = Expr(mc_slice_rows);
+
+
+        std::string mbar = op->name + ".tma_mbar";
+        std::string tmap = op->name + ".tma_map";
+        int swz = swizzle_bytes(shared_swizzle[op->name]);
+        // The ring storage transform bakes the swizzle into the scalar store INDEX and clears the
+        // Allocate.swizzle, so a ring operand loses its swizzle here (swz=0) even though the wgmma
+        // descriptor still expects it -> the TMA would write unswizzled. HL_WG_TMA_SWZ overrides the
+        // tensor-map swizzle to confirm/repair this until the swizzle is kept as an attribute.
+        {
+            std::string ov = get_env_variable("HL_WG_TMA_SWZ");
+            if (!ov.empty() && swz == 0) swz = std::atoi(ov.c_str());
+        }
+        pending_maps.push_back({tmap, tc.src, tc.box0, mc_box1, swz});
 
         Expr mbar_ref = Load::make(UInt(64), mbar, 0, Buffer<>{}, Parameter{}, const_true(),
                                    ModulusRemainder{});
@@ -3641,7 +3676,7 @@ private:
                                                     {Expr((int)CompletionKind::CpAsyncBulk), ring_mbar, bytes},
                                                     Call::Intrinsic));
             Stmt rload = Evaluate::make(Call::make(Int(32), "tma_load_2d",
-                                                   {slot_dst, map_var, coordX, coordY, ring_mbar, mc},
+                                                   {slot_dst, map_var, coordX, coordY, ring_mbar, mc, mc_p, mc_sb, mc_sr},
                                                    Call::Intrinsic));
             return ProducerConsumer::make(op->name, true, Block::make(rissue, rload));
         }
@@ -3656,7 +3691,7 @@ private:
                                                {Expr((int)CompletionKind::CpAsyncBulk), mbar_ref, bytes},
                                                Call::Intrinsic));
         Stmt load = Evaluate::make(Call::make(Int(32), "tma_load_2d",
-                                              {dst_ref, map_var, coordX, coordY, mbar_ref, mc},
+                                              {dst_ref, map_var, coordX, coordY, mbar_ref, mc, mc_p, mc_sb, mc_sr},
                                               Call::Intrinsic));
         Stmt wait = Evaluate::make(Call::make(Int(32), Call::async_wait,
                                               {Expr((int)CompletionKind::CpAsyncBulk),
