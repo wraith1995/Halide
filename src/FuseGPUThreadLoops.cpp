@@ -19,6 +19,7 @@
 #include "IROperator.h"
 #include "IRPrinter.h"
 #include "Monotonic.h"
+#include "RingPipeline.h"
 #include "Simplify.h"
 #include "Solve.h"
 #include "Substitute.h"
@@ -2756,6 +2757,13 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         std::string mbar_name;  // F3: non-empty on the full (data) edge when HL_WG_MBAR is on ->
                                 // the edge is realized by an mbarrier (cp.async-completion arrive +
                                 // parity try_wait) instead of a named barrier. See §5e.
+        // The DRAIN edge's lag (async_storage_model.md §12.4), empty edge only: the consumer keeps
+        // lam_out wgmma groups in flight, so at iteration k its `wgmma.wait_group lam_out` has
+        // retired only the groups <= k-lam_out. The empty edge's ARRIVE must therefore release slot
+        // (k-lam_out)%ring_n, not slot k%ring_n -- the warp-spec realization of the same retiming
+        // the uniform path spends on shrinking the software-pipeline lead (D = Q-1-lam_out).
+        // 0 => byte-identical to the drain lowering (NFC).
+        int lam_out = 0;
     };
     std::map<std::string, BarrierInfo> sema_map;
     const int warp_size;
@@ -2763,11 +2771,26 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     // no loop skew) instead of the synchronous named-barrier + producer wait_group. Empty edge stays
     // a named barrier. Off by default (NFC); on with HL_WG_MBAR=1.
     const bool mbar;
+    // Retime the empty edge's arrive by the drain edge's lag (§12.4), which is what makes
+    // HL_WGMMA_INFLIGHT>0 WAR-safe on this (warp-specialized) placement. Off by default (NFC);
+    // on with HL_WS_EMPTY_SKEW=1.
+    const bool empty_skew;
     using IRMutator::visit;
 
     // mode 0 = wait, 1 = arrive. id = base + (ring_loop % ring_n) selects the slot.
+    //
+    // RETIMING (async_storage_model.md §12.4): on the EMPTY edge's arrive the consumer releases the
+    // slot whose wgmma read has RETIRED, which under `wgmma.wait_group lam_out` is the slot from
+    // lam_out iterations ago -- so its index is (ring_loop - lam_out) % ring_n. Every other
+    // (edge, mode) pair keeps ring_loop % ring_n: the empty edge's WAIT is the producer blocking on
+    // the very slot it is about to overwrite, and the full edge is not drain-lagged at all. The
+    // subtraction cannot go negative because the arrive is guarded by ring_loop >= lam_out at its
+    // emission site (and Halide's % is Euclidean regardless). lam_out == 0 reproduces the previous
+    // expression exactly (NFC).
     Stmt emit_barrier(const BarrierInfo &b, int mode) {
-        Expr slot = Variable::make(Int(32), ring_loop) % b.ring_n;
+        const bool retime = b.is_empty && mode == 1 && b.lam_out > 0;
+        Expr iter = Variable::make(Int(32), ring_loop);
+        Expr slot = (retime ? (iter - b.lam_out) : iter) % b.ring_n;
         Expr id = b.base == 0 ? slot : (b.base + slot);
         // Rectangular: every blockDim lane of both groups hits the barrier (2*max).
         // Flat partition: only the producing + consuming groups' lanes are in range.
@@ -2828,7 +2851,12 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             // Full (data) edge -> mbarrier when enabled; empty (slot-reuse control) edge stays named.
             smap[prod + ".semaphore_0"] = {base, rn, /*is_empty*/ false, pi,
                                            mbar ? (prod + ".full_mbar") : std::string()};
-            smap[prod + ".folding_semaphore.ring_buffer"] = {base + rn, rn, /*is_empty*/ true, pi, {}};
+            // The empty edge carries the DRAIN edge's lag so its arrive can be retimed (§12.4).
+            // Gated on HL_WS_EMPTY_SKEW while validating -- default OFF keeps lam_out = 0, i.e.
+            // byte-identical NFC (and the prior, WAR-unsafe, behaviour under HL_WGMMA_INFLIGHT>0).
+            const int lam_out = empty_skew ? resolve_ring_pipeline(env, prod).release_retiming() : 0;
+            smap[prod + ".folding_semaphore.ring_buffer"] = {base + rn, rn, /*is_empty*/ true, pi,
+                                                            {}, lam_out};
             base += 2 * rn;
         }
         // Per-edge participant count: producer warp group + consumer warp group. With
@@ -3104,7 +3132,18 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                         {Expr((int)CompletionKind::CpAsyncGroup), mbar_slot_ref(b)},
                         Call::Intrinsic));
                 }
-                return emit_barrier(b, /*arrive*/ 1);
+                Stmt arrive = emit_barrier(b, /*arrive*/ 1);
+                if (b.is_empty && b.lam_out > 0) {
+                    // Skip-first, the dual of the empty WAIT's `ring_loop >= ring_n` guard: the
+                    // retimed arrive releases slot (k-lam_out), which for k < lam_out names a tile
+                    // that was never read (nothing has retired yet), so there is nothing to release.
+                    // No epilogue release is needed for the final lam_out tiles either: the loop
+                    // releases tiles [0, K-lam_out) while the producer only ever waits on tiles
+                    // <= K-1-Q, and Q >= lam_out holds by the §12.3 bracket.
+                    arrive = IfThenElse::make(
+                        Variable::make(Int(32), ring_loop) >= b.lam_out, arrive);
+                }
+                return arrive;
             }
         }
         return IRMutator::visit(op);
@@ -3113,7 +3152,8 @@ class LowerGPUWarpAsyncFork : public IRMutator {
 public:
     LowerGPUWarpAsyncFork(const std::map<std::string, Function> &env, int warp_size)
         : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") != "0"), warp_size(warp_size),
-          mbar(get_env_variable("HL_WG_MBAR") == "1") {
+          mbar(get_env_variable("HL_WG_MBAR") == "1"),
+          empty_skew(get_env_variable("HL_WS_EMPTY_SKEW") == "1") {
     }
 };
 
