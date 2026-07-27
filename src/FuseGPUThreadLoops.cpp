@@ -2777,6 +2777,9 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     // HL_WGMMA_INFLIGHT>0 WAR-safe on this (warp-specialized) placement. Off by default (NFC);
     // on with HL_WS_EMPTY_SKEW=1.
     const bool empty_skew;
+    // §8.2 shared rendezvous: co-placed ring producers share ONE full-edge mbarrier, so the consumer
+    // waits once per k-tile instead of once per operand. Off by default (NFC); HL_WS_SHARED_FULL=1.
+    const bool share_full;
     using IRMutator::visit;
 
     // mode 0 = wait, 1 = arrive. id = base + (ring_loop % ring_n) selects the slot.
@@ -2851,8 +2854,20 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             internal_assert(n) << "ring_buffer extent must be a constant for warp specialization\n";
             int rn = (int)*n;
             // Full (data) edge -> mbarrier when enabled; empty (slot-reuse control) edge stays named.
+            //
+            // SHARED RENDEZVOUS (async_storage_model.md §5/§8.2): producers CO-PLACED on the same
+            // resource and feeding the same consumer may share ONE full[q] edge. Here every ring
+            // producer sits on the same producer warp group and feeds the same consumer, so they
+            // qualify: point them all at producer 0's mbarrier. Each producer's TMA still arrives
+            // with its OWN expect_tx byte count, and expect_tx ACCUMULATES on the mbarrier, so the
+            // single transaction count is the sum and the one try_wait completes exactly when every
+            // operand has landed -- no count arithmetic changes. The consumer then performs ONE
+            // rendezvous per k-tile instead of one per operand (see visit(Acquire)), removing a
+            // TRYWAIT + MEMBAR.ALL.CTA + FENCE.VIEW.ASYNC.S per extra operand from the hot loop.
+            const std::string full_mbar_owner =
+                (share_full ? collector.producers[0] : prod) + ".full_mbar";
             smap[prod + ".semaphore_0"] = {base, rn, /*is_empty*/ false, pi,
-                                           mbar ? (prod + ".full_mbar") : std::string()};
+                                           mbar ? full_mbar_owner : std::string()};
             // The empty edge carries the DRAIN edge's lag so its arrive can be retimed (§12.4).
             // Gated on HL_WS_EMPTY_SKEW while validating -- default OFF keeps lam_out = 0, i.e.
             // byte-identical NFC (and the prior, WAR-unsafe, behaviour under HL_WGMMA_INFLIGHT>0).
@@ -3093,6 +3108,14 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             if (it != sema_map.end()) {
                 const BarrierInfo &b = it->second;
                 Stmt body = mutate(op->body);
+                if (share_full && !b.mbar_name.empty() && b.producer != 0) {
+                    // §8.2 shared rendezvous: producer 0's wait already covers this slot's combined
+                    // transaction count (every co-placed producer arrives expect_tx on the SAME
+                    // mbarrier), so the extra per-operand wait is pure overhead in the hot loop --
+                    // elide it. Emitting it instead would spin-check an already-flipped phase and
+                    // still cost a MEMBAR.ALL.CTA + FENCE.VIEW.ASYNC.S per k-tile.
+                    return body;
+                }
                 if (!b.mbar_name.empty()) {
                     // F3 full-edge consumer wait: spin on the slot's mbarrier until the producer's
                     // cp.async copies complete (parity = (ko/N)&1, since the slot is reused every N
@@ -3170,7 +3193,8 @@ public:
     LowerGPUWarpAsyncFork(const std::map<std::string, Function> &env, int warp_size)
         : env(env), fork_fuse(get_env_variable("HL_GPU_WARP_FORK_FUSE") != "0"), warp_size(warp_size),
           mbar(get_env_variable("HL_WG_MBAR") == "1"),
-          empty_skew(get_env_variable("HL_WS_EMPTY_SKEW") == "1") {
+          empty_skew(get_env_variable("HL_WS_EMPTY_SKEW") == "1"),
+          share_full(get_env_variable("HL_WS_SHARED_FULL") == "1") {
     }
 };
 
