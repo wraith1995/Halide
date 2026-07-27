@@ -2739,6 +2739,11 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     bool active = false;
     std::string ring_loop;   // innermost serial loop name (diagnostics only)
     Expr ring_iter_expr;     // the ring's k-tile index, composed over the serial chain
+    // Are we inside a produce/consume body? The ring axis is the producer's compute_at level, so the
+    // loops that define the k-tile index are exactly those ABOVE the produce site; serial loops INSIDE
+    // it (a cooperative copy nest -- this pass runs before inject_tma_copies, Lower.cpp:299 vs :391)
+    // are not part of the ring axis and must not be folded in.
+    bool in_pc = false;
     int wg_dim = -1;
     int num_producers = 0;  // producers occupy wg [0, num_producers); consumer is wg >= num_producers
     Expr thread_count;
@@ -2927,6 +2932,15 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         return HoistedStorage::make(op->name, mutate(op->body));
     }
 
+    Stmt visit(const ProducerConsumer *op) override {
+        // Entering a produce/consume body FREEZES the ring's iteration index: everything below is the
+        // body of one k-tile, not a refinement of which k-tile we are on. Without this, the producer's
+        // own copy loops got folded into the index (iter = t*F+i), which multiplied the rendezvous per
+        // tile by F and deadlocked the ring -- see research/schedule_fact_carriage.md §9.
+        ScopedValue<bool> p(in_pc, true);
+        return IRMutator::visit(op);
+    }
+
     Stmt visit(const For *op) override {
         ScopedValue<DeviceAPI> d(device_api,
                                  op->device_api != DeviceAPI::None ? op->device_api : device_api);
@@ -2937,7 +2951,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         // chain (conservative: we cannot compose a stride we do not know).
         Expr next_iter = ring_iter_expr;
         std::string next_loop = ring_loop;
-        if (active && op->for_type == ForType::Serial) {
+        if (active && !in_pc && op->for_type == ForType::Serial) {
             next_loop = op->name;
             Expr v = Variable::make(Int(32), op->name);
             auto e = as_const_int(simplify(op->max - op->min + 1));
