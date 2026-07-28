@@ -1608,7 +1608,8 @@ protected:
         }
         if (op->is_intrinsic() && op->name == "mbarrier_try_wait") {
             std::string m = op->args.empty() ? std::string() : load_buffer(op->args[0]);
-            if (ends_with(m, ".empty_mbar") || ends_with(m, ".empty_cluster")) {
+            if (ends_with(m, ".empty_mbar") || ends_with(m, ".empty_cluster") ||
+                ends_with(m, ".empty_local")) {
                 // Empty (WAR) edge producer_acquire: only the TMA-issuing (elected) lane must wait for
                 // the slot to free before it overwrites it. Tag it with the elected lane so codegen
                 // gates the spin to that one lane (perf: avoids a 256-thread poll storm). It is a
@@ -2791,6 +2792,12 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         // suffix match capturing a buffer it was not written for: instance #7 of
         // research/schedule_fact_carriage.md's characteristic bug.
         std::string empty_mbar_name;
+        // §12.32: under a cluster launch a partial named barrier (`barrier.sync <id>, <count>`) is
+        // ILLEGAL -- bisected, both operand forms, no multicast needed. So the empty edge's CTA-local
+        // step cannot be a named barrier there; this is the mbarrier that replaces it. Its arrival
+        // count is count(consumer threads): every consumer thread arrives, as on the software-pipeline
+        // path. Empty => keep the named barrier (non-cluster kernels are unaffected, NFC).
+        std::string empty_local_name;
     };
     std::map<std::string, BarrierInfo> sema_map;
     const int warp_size;
@@ -2973,7 +2980,8 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             const bool cluster_scoped_empty = cluster_empty && cluster_ctas > 1 && mbar;
             smap[prod + ".folding_semaphore.ring_buffer"] = {
                 empty_base, rn, /*is_empty*/ true, pi, {}, lam_out,
-                cluster_scoped_empty ? (prod + ".empty_cluster") : std::string()};
+                cluster_scoped_empty ? (prod + ".empty_cluster") : std::string(),
+                cluster_scoped_empty ? (prod + ".empty_local") : std::string()};
             base += full_takes_id ? 2 * rn : rn;
         }
         // NAMED-BARRIER BUDGET. A CTA has 16 hardware named barriers (sm_90). Overrunning it used to
@@ -3250,6 +3258,16 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     BarrierInfo e = b;
                     e.mbar_name = b.empty_mbar_name;
                     mbar_allocs.push_back(e);
+                    // ... and the CTA-local empty mbarrier that replaces the named barrier (§12.32).
+                    // Count = the consumer threads that arrive. Named ".empty_local", NOT
+                    // ".empty_mbar", so PatchEmptyMbarCounts cannot rewrite it (instance #7).
+                    init_args.push_back(Load::make(UInt(64), b.empty_local_name, 0, Buffer<>{},
+                                                   Parameter{}, const_true(), ModulusRemainder{}));
+                    init_args.push_back(Expr(b.ring_n));
+                    init_args.push_back(simplify(consumer_threads));
+                    BarrierInfo l = b;
+                    l.mbar_name = b.empty_local_name;
+                    mbar_allocs.push_back(l);
                 }
                 // §10.2 CLUSTER EXIT RENDEZVOUS. A CTA that returns releases its shared memory, so if
                 // one CTA of the cluster leaves while a peer's multicast is still landing in that
@@ -3351,7 +3369,20 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                         Call::Intrinsic));
                     return Block::make(wait, body);
                 }
-                Stmt wait = emit_barrier(b, /*wait*/ 0);
+                Stmt wait;
+                if (b.is_empty && !b.empty_local_name.empty()) {
+                    // §12.32: CTA-local step as an MBARRIER, not a named barrier. Same role as before
+                    // ("my CTA has finished reading slot k-Q") and the same phase arithmetic, but legal
+                    // under a cluster launch.
+                    Expr lslot = ring_iter() % b.ring_n;
+                    Expr lpar = (ring_iter() / b.ring_n - 1) % 2;
+                    Expr lmb = Load::make(UInt(64), b.empty_local_name, lslot, Buffer<>{},
+                                          Parameter{}, const_true(), ModulusRemainder{});
+                    wait = Evaluate::make(Call::make(Int(32), Call::async_acquire, {lmb, lpar},
+                                                     Call::Intrinsic));
+                } else {
+                    wait = emit_barrier(b, /*wait*/ 0);
+                }
                 if (b.is_empty && !b.empty_mbar_name.empty()) {
                     // §10.2 CLUSTER-SCOPED RELEASE, composed on top of the CTA-local one rather than
                     // replacing it -- the two mechanisms are the two levels of the execution lattice
@@ -3422,7 +3453,18 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                         {Expr((int)CompletionKind::CpAsyncGroup), mbar_slot_ref(b)},
                         Call::Intrinsic));
                 }
-                Stmt arrive = emit_barrier(b, /*arrive*/ 1);
+                Stmt arrive;
+                if (b.is_empty && !b.empty_local_name.empty()) {
+                    // §12.32: every consumer thread arrives on the CTA-local empty mbarrier (arrival
+                    // count = count(consumer threads)), replacing the illegal named-barrier arrive.
+                    Expr lslot = (b.lam_out > 0 ? (ring_iter() - b.lam_out) : ring_iter()) % b.ring_n;
+                    Expr lmb = Load::make(UInt(64), b.empty_local_name, lslot, Buffer<>{},
+                                          Parameter{}, const_true(), ModulusRemainder{});
+                    arrive = Evaluate::make(Call::make(Int(32), Call::async_release, {lmb},
+                                                       Call::Intrinsic));
+                } else {
+                    arrive = emit_barrier(b, /*arrive*/ 1);
+                }
                 if (b.is_empty && b.lam_out > 0) {
                     // Skip-first, the dual of the empty WAIT's `ring_loop >= ring_n` guard: the
                     // retimed arrive releases slot (k-lam_out), which for k < lam_out names a tile
