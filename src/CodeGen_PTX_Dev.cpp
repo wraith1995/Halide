@@ -780,6 +780,41 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         value = ConstantInt::get(i32_t, 0);
         return;
     }
+    if (op->is_intrinsic() && op->name == "mbarrier_arrive_cluster") {
+        // CLUSTER-SCOPED arrive on the empty (WAR) ring edge -- async_storage_model.md §10.2.
+        //
+        // Why it exists: TMA multicast writes a tile into the ring slot of EVERY CTA of the cluster,
+        // so the slot's write set is cluster-wide and a CTA-local release is not enough. With a
+        // per-CTA empty edge the multicast leader can overrun a slot a peer has not consumed yet and
+        // deliver its transaction bytes to a phase nobody is waiting on. That configuration was
+        // measured to DEADLOCK at 512 CTAs (§12.25, reference implementation research/tma_ceiling.cu);
+        // it survives in our GEMM only because a named-barrier rendezvous lets the two CTAs drift very
+        // little -- a latent race, not a design.
+        //
+        // `mapa.shared::cluster` maps this CTA's shared address to the same offset in CTA `rank`'s
+        // window, so one thread can signal every CTA's copy of the slot. The arrive on a REMOTE
+        // mbarrier returns no state, hence the `_` sink (unlike the CTA-local mbarrier.arrive above).
+        internal_assert(op->args.size() == 3u)
+            << "mbarrier_arrive_cluster expects (mbar_ref, rank, elected_lane).\n";
+        llvm::Value *addr = mbar_shared_addr(op->args[0]);
+        llvm::Value *rank = codegen(op->args[1]);
+        llvm::Value *elected = codegen(op->args[2]);
+        llvm::FunctionType *ft = llvm::FunctionType::get(void_t, {i32_t, i32_t, i32_t}, false);
+        // One arrive per CTA (the model's elected lane, same guard as mbarrier_arrive_expect_tx): the
+        // edge's arrival count is count(cluster CTAs), so exactly one thread per CTA may signal.
+        const char *asm_str =
+            "{ .reg .pred ce_e, ce_p; .reg .u32 ce_t0, ce_t1, ce_a;\n"
+            "  mov.u32 ce_t0, %tid.y; mov.u32 ce_t1, %tid.z; or.b32 ce_t0, ce_t0, ce_t1;\n"
+            "  setp.eq.u32 ce_p, ce_t0, 0;\n"
+            "  mov.u32 ce_t1, %tid.x; setp.eq.u32 ce_e, ce_t1, $2; and.pred ce_e, ce_e, ce_p;\n"
+            "  mapa.shared::cluster.u32 ce_a, $0, $1;\n"
+            "  @ce_e mbarrier.arrive.shared::cluster.b64 _, [ce_a];\n"
+            "}";
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, asm_str, "r,r,r", /*hasSideEffects*/ true);
+        builder->CreateCall(ia, {addr, rank, elected});
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
     if (op->is_intrinsic() && op->name == "mbarrier_arrive_expect_tx") {
         // TMA (F4): the issuing thread arms the mbarrier with the EXPECTED transaction byte count of
         // an in-flight bulk-tensor copy. cp.async.bulk.tensor decrements this tx count as the bytes

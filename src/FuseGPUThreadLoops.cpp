@@ -1600,6 +1600,12 @@ protected:
         if (op->is_intrinsic() && op->name == "mbarrier_arrive_expect_tx") {
             return with_elected_lane(op, 2);
         }
+        if (op->is_intrinsic() && op->name == "mbarrier_arrive_cluster") {
+            // §10.2 cluster-scoped empty-edge arrive: exactly one thread per CTA signals (the edge's
+            // arrival count is count(cluster CTAs)), so it needs the model's elected lane -- same
+            // treatment as the expect_tx arm above. Args are (mbar_ref, rank) until this point.
+            return with_elected_lane(op, 2);
+        }
         if (op->is_intrinsic() && op->name == "mbarrier_try_wait") {
             std::string m = op->args.empty() ? std::string() : load_buffer(op->args[0]);
             if (ends_with(m, ".empty_mbar")) {
@@ -2772,6 +2778,11 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         // the uniform path spends on shrinking the software-pipeline lead (D = Q-1-lam_out).
         // 0 => byte-identical to the drain lowering (NFC).
         int lam_out = 0;
+        // §10.2: non-empty on the EMPTY edge when the ring's fill is a cluster collective (TMA
+        // multicast). The slot's write set is then cluster-wide, so releasing it CTA-locally is
+        // unsound; the release must additionally join across the cluster's CTAs on this mbarrier.
+        // Empty => CTA-local release only, byte-identical to the previous lowering (NFC).
+        std::string empty_mbar_name;
     };
     std::map<std::string, BarrierInfo> sema_map;
     const int warp_size;
@@ -2790,6 +2801,12 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     // full edge consumes none, so the block is Q ids per producer instead of 2Q, doubling the depth
     // reachable under the hardware's 16. Renumbers barriers => not byte-identical; off by default.
     const bool tight_barriers;
+    // §10.2: make the empty edge's release CLUSTER-scoped when the fill is a cluster collective.
+    // Off by default (NFC); HL_WS_CLUSTER_EMPTY=1.
+    const bool cluster_empty;
+    // Cluster width of the enclosing gpu_block axis (For::blocks_per_cluster), 1 = no cluster. This
+    // is the edge's arrival count under §10.2: one release per CTA.
+    int cluster_ctas = 1;
     using IRMutator::visit;
 
     // THE RING'S ITERATION INDEX -- the single definition point (research/schedule_fact_carriage.md
@@ -2936,8 +2953,19 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     << (rp.lam_in + rp.lam_out + 1) << ", or reduce the in-flight depths.\n";
                 lam_out = rp.release_retiming();
             }
-            smap[prod + ".folding_semaphore.ring_buffer"] = {empty_base, rn, /*is_empty*/ true, pi,
-                                                            {}, lam_out};
+            // §10.2: when this ring's fill is a cluster collective, the slot is written in EVERY CTA
+            // of the cluster, so a CTA-local release is unsound (§12.25). Add a cluster-wide join on
+            // a dedicated empty mbarrier.
+            //
+            // The condition is "the block axis is clustered", not "multicast was emitted": whether a
+            // given operand is actually multicast is decided later, in inject_tma_copies, from tile
+            // invariance. Being conservative here is the sound direction -- a cluster-scoped release
+            // on a ring that turns out not to be multicast costs one mbarrier join per k-tile, while
+            // the converse is a silent race.
+            const bool cluster_scoped_empty = cluster_empty && cluster_ctas > 1 && mbar;
+            smap[prod + ".folding_semaphore.ring_buffer"] = {
+                empty_base, rn, /*is_empty*/ true, pi, {}, lam_out,
+                cluster_scoped_empty ? (prod + ".empty_mbar") : std::string()};
             base += full_takes_id ? 2 * rn : rn;
         }
         // NAMED-BARRIER BUDGET. A CTA has 16 hardware named barriers (sm_90). Overrunning it used to
@@ -2998,6 +3026,12 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     Stmt visit(const For *op) override {
         ScopedValue<DeviceAPI> d(device_api,
                                  op->device_api != DeviceAPI::None ? op->device_api : device_api);
+        // The cluster width is a property of the enclosing gpu_block axis (Func::gpu_cluster ->
+        // For::blocks_per_cluster). It reaches us here rather than being re-derived, which is the
+        // whole point of §10.2: the empty edge's SCOPE follows the fill's scope, and the fill is a
+        // cluster collective exactly when this axis is clustered.
+        ScopedValue<int> cc(cluster_ctas,
+                            op->blocks_per_cluster > 1 ? op->blocks_per_cluster : cluster_ctas);
         // Compose the ring's iteration index over the enclosing chain of SEQUENTIAL loops: entering an
         // inner sequential loop of constant extent E refines the index to `outer*E + inner`. A single
         // loop therefore yields exactly `Variable(loop)` (byte-identical to the previous
@@ -3132,6 +3166,11 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                 // placed inside a tid==0 block by the scheduler, deadlocking its internal barrier.
                 std::vector<Expr> init_args;
                 std::vector<BarrierInfo> mbar_allocs;
+                bool cluster_exit_needed = false;
+                for (const auto &kv : sema_map) {
+                    cluster_exit_needed =
+                        cluster_exit_needed || !kv.second.empty_mbar_name.empty();
+                }
                 for (const auto &kv : sema_map) {
                     const BarrierInfo &b = kv.second;
                     if (b.mbar_name.empty()) {
@@ -3176,6 +3215,49 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     init_args.push_back(Expr(b.ring_n));
                     init_args.push_back(count);
                     mbar_allocs.push_back(b);
+                }
+                // §10.2: the cluster-scoped empty edges, in the SAME init (one opaque tid==0 init asm
+                // for every ring mbarrier -- a second, nested init got scheduled inside a tid==0 block
+                // and deadlocked its internal barrier). Arrival count = count(cluster CTAs): exactly
+                // one thread per CTA arrives, from its producer warp, after that CTA's own named
+                // barrier has already established that its consumers are done.
+                for (const auto &kv : sema_map) {
+                    const BarrierInfo &b = kv.second;
+                    if (b.empty_mbar_name.empty()) {
+                        continue;
+                    }
+                    bool already = false;
+                    for (const BarrierInfo &m : mbar_allocs) {
+                        already = already || m.empty_mbar_name == b.empty_mbar_name;
+                    }
+                    if (already) {
+                        continue;
+                    }
+                    init_args.push_back(Load::make(UInt(64), b.empty_mbar_name, 0, Buffer<>{},
+                                                   Parameter{}, const_true(), ModulusRemainder{}));
+                    init_args.push_back(Expr(b.ring_n));
+                    init_args.push_back(Expr(cluster_ctas));
+                    // Reuse the alloc list, keyed on the empty name; mbar_name is what the alloc loop
+                    // below reads, so push a copy that names the empty buffer.
+                    BarrierInfo e = b;
+                    e.mbar_name = b.empty_mbar_name;
+                    mbar_allocs.push_back(e);
+                }
+                // §10.2 CLUSTER EXIT RENDEZVOUS. A CTA that returns releases its shared memory, so if
+                // one CTA of the cluster leaves while a peer's multicast is still landing in that
+                // memory, the peer faults ("unspecified launch failure"). The reference implementation
+                // reproduced this at 512 CTAs *with* the cluster-scoped release already in place and
+                // was fixed only by a final cluster-wide join, so it is a separate obligation, not a
+                // consequence of the release. Invisible at one cluster -- which is exactly why it has
+                // to be reasoned about rather than tested into existence.
+                //
+                // In a cluster kernel gpu_thread_barrier lowers to barrier.cluster.arrive/wait
+                // (CodeGen_PTX_Dev), so one barrier here is the cluster-wide join. Reached by every
+                // thread: it sits after the warp-group fork, not inside a branch.
+                if (cluster_exit_needed) {
+                    Stmt exit_join = Evaluate::make(Call::make(
+                        Int(32), Call::gpu_thread_barrier, {Expr(0)}, Call::Intrinsic));
+                    result = Block::make(result, exit_join);
                 }
                 if (!init_args.empty()) {
                     // CUTLASS-style uniform prologue: ONE opaque tid==0-predicated init asm (no
@@ -3259,8 +3341,43 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                     return Block::make(wait, body);
                 }
                 Stmt wait = emit_barrier(b, /*wait*/ 0);
+                if (b.is_empty && !b.empty_mbar_name.empty()) {
+                    // §10.2 CLUSTER-SCOPED RELEASE, composed on top of the CTA-local one rather than
+                    // replacing it -- the two mechanisms are the two levels of the execution lattice
+                    // this edge has to join over:
+                    //
+                    //   1. the named barrier (already emitted) joins producer + consumers of THIS CTA
+                    //      => "my CTA has finished reading slot (k-Q)";
+                    //   2. this mbarrier joins the PRODUCERS of every CTA in the cluster
+                    //      => "every CTA has finished reading slot (k-Q)", which is what makes it safe
+                    //      to (multicast-)overwrite a slot that lives in all of them.
+                    //
+                    // Step 1 must precede step 2, so the arrive is emitted AFTER the named-barrier
+                    // wait: reaching it already means this CTA is done. One arrive per CTA (the edge's
+                    // arrival count is count(cluster CTAs)), placed on every rank's copy of the slot
+                    // via mapa; then a try_wait on our own copy completes the rendezvous. Arriving and
+                    // then waiting the same phase is exactly a barrier over the cluster's producers.
+                    //
+                    // Phase: slot q is joined at iterations q+Q, q+2Q, ... (the first Q iterations are
+                    // skipped -- slots start free), so the join at iteration k is the ((k/Q)-1)-th
+                    // completion and its parity is ((k/Q)-1)&1.
+                    Expr slot = ring_iter() % b.ring_n;
+                    Expr parity = (ring_iter() / b.ring_n - 1) % 2;
+                    Expr mbar = Load::make(UInt(64), b.empty_mbar_name, slot, Buffer<>{}, Parameter{},
+                                           const_true(), ModulusRemainder{});
+                    Stmt join = Evaluate::make(Call::make(
+                        Int(32), Call::async_acquire, {mbar, parity}, Call::Intrinsic));
+                    for (int r = cluster_ctas - 1; r >= 0; r--) {
+                        Stmt arrive = Evaluate::make(Call::make(
+                            Int(32), "mbarrier_arrive_cluster", {mbar, Expr(r)}, Call::Intrinsic));
+                        join = Block::make(arrive, join);
+                    }
+                    wait = Block::make(wait, join);
+                }
                 if (b.is_empty) {
-                    // Slots start free: skip the first N empty-waits or iter 0 deadlocks.
+                    // Slots start free: skip the first N empty-waits or iter 0 deadlocks. This guards
+                    // the cluster join too -- there is nothing to release before slot reuse begins,
+                    // and its parity expression is only valid for k >= Q.
                     wait = IfThenElse::make(ring_iter() >= b.ring_n, wait);
                 }
                 return Block::make(wait, body);
@@ -3317,7 +3434,8 @@ public:
           mbar(get_env_variable("HL_WG_MBAR") == "1"),
           empty_skew(get_env_variable("HL_WS_EMPTY_SKEW") == "1"),
           share_full(get_env_variable("HL_WS_SHARED_FULL") == "1"),
-          tight_barriers(get_env_variable("HL_WS_TIGHT_BARRIERS") == "1") {
+          tight_barriers(get_env_variable("HL_WS_TIGHT_BARRIERS") == "1"),
+          cluster_empty(get_env_variable("HL_WS_CLUSTER_EMPTY") == "1") {
     }
 };
 
