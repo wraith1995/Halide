@@ -3254,7 +3254,10 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                 // In a cluster kernel gpu_thread_barrier lowers to barrier.cluster.arrive/wait
                 // (CodeGen_PTX_Dev), so one barrier here is the cluster-wide join. Reached by every
                 // thread: it sits after the warp-group fork, not inside a branch.
-                if (cluster_exit_needed) {
+                // HL_WS_NO_CLUSTER_EXIT=1 drops it, to isolate a hang in the per-k-tile release from a
+                // hang in this exit join (a cluster barrier deadlocks if ANY thread of ANY CTA misses
+                // it, and this is the newest piece).
+                if (cluster_exit_needed && get_env_variable("HL_WS_NO_CLUSTER_EXIT") != "1") {
                     Stmt exit_join = Evaluate::make(Call::make(
                         Int(32), Call::gpu_thread_barrier, {Expr(0)}, Call::Intrinsic));
                     result = Block::make(result, exit_join);
