@@ -2836,13 +2836,17 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         if (!timeline || tl_buf.empty()) {
             return s;
         }
-        // Each read must be a DISTINCT node: two identical pure-intrinsic Calls get CSE'd and the
-        // shared one is hoisted to their common scope, which is OUTSIDE the kernel -- the host codegen
-        // then sees `gpu_clock64` and dies with "Unknown intrinsic". A serial tag per read keeps them
-        // distinct without pretending the intrinsic is impure.
+        // Halide has no notion that this intrinsic is impure, so a pure loop-invariant Call gets both
+        // CSE'd and LICM'd -- hoisted right out of the kernel, whereupon the HOST codegen sees
+        // `gpu_clock64` and dies with "Unknown intrinsic". Distinct constant tags fixed the merging
+        // and not the hoisting. Passing the ring's iteration index makes each read genuinely
+        // loop-VARIANT, which pins it inside the ring loop (and therefore inside the kernel); the
+        // serial offset keeps the two reads distinct from each other. codegen ignores the value.
         static int tl_tag = 0;
-        Expr now0 = Call::make(Int(64), "gpu_clock64", {Expr(tl_tag++)}, Call::Intrinsic);
-        Expr now1 = Call::make(Int(64), "gpu_clock64", {Expr(tl_tag++)}, Call::Intrinsic);
+        Expr tag0 = ring_iter() + (tl_tag++);
+        Expr tag1 = ring_iter() + (tl_tag++);
+        Expr now0 = Call::make(Int(64), "gpu_clock64", {tag0}, Call::Intrinsic);
+        Expr now1 = Call::make(Int(64), "gpu_clock64", {tag1}, Call::Intrinsic);
         std::string t = unique_name("tl_t0");
         Expr t0 = Variable::make(Int(64), t);
         Expr cur = Load::make(Int(64), tl_buf, phase, Buffer<>{}, Parameter{}, const_true(),
