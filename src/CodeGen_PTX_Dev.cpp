@@ -780,6 +780,70 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         value = ConstantInt::get(i32_t, 0);
         return;
     }
+    if (op->is_intrinsic() && op->name == "gpu_clock64") {
+        // PROTOCOL-PHASE TIMELINE (async_storage_model.md §12.34). A per-SM cycle counter, so phase
+        // deltas can be accumulated inside the ring's mainloop. §12.34 built this for a hand-written
+        // pipeline and it immediately localized the time (producer 75% empty_wait, consumer ~20%
+        // full_wait, release 1%); this is the same instrument for the kernel that actually matters.
+        internal_assert(op->args.empty()) << "gpu_clock64 takes no arguments.\n";
+        llvm::FunctionType *ft = llvm::FunctionType::get(i64_t, false);
+        llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, "mov.u64 $0, %clock64;", "=l",
+                                                   /*hasSideEffects*/ true);
+        value = builder->CreateCall(ia);
+        return;
+    }
+    if (op->is_intrinsic() && op->name == "gpu_timeline_report") {
+        // Print accumulated phase cycles from ONE CTA (block 0) and one lane per role, via NVPTX
+        // vprintf. Diagnostic only and gated: a debug buffer plumbed through the pipeline would need a
+        // new output for every instrumented schedule, whereas this needs nothing on the host side and
+        // lands straight in the run log.
+        internal_assert(op->args.size() == 6u)
+            << "gpu_timeline_report expects (tag, v0, v1, v2, v3, elected_lane).\n";
+        llvm::Value *tag = codegen(op->args[0]);
+        llvm::Value *vals[4] = {codegen(op->args[1]), codegen(op->args[2]),
+                                codegen(op->args[3]), codegen(op->args[4])};
+        llvm::Value *elected = codegen(op->args[5]);
+
+        // Gate: blockIdx.x == 0 && blockIdx.y == 0 && tid.x == elected && tid.y == tid.z == 0.
+        auto rd = [&](const char *reg) {
+            llvm::InlineAsm *a = llvm::InlineAsm::get(
+                llvm::FunctionType::get(i32_t, false),
+                (std::string("mov.u32 $0, %") + reg + ";").c_str(), "=r", true);
+            return builder->CreateCall(a);
+        };
+        llvm::Value *zero = ConstantInt::get(i32_t, 0);
+        llvm::Value *cond = builder->CreateICmpEQ(rd("ctaid.x"), zero);
+        cond = builder->CreateAnd(cond, builder->CreateICmpEQ(rd("ctaid.y"), zero));
+        cond = builder->CreateAnd(cond, builder->CreateICmpEQ(rd("tid.y"), zero));
+        cond = builder->CreateAnd(cond, builder->CreateICmpEQ(rd("tid.z"), zero));
+        cond = builder->CreateAnd(cond, builder->CreateICmpEQ(rd("tid.x"), elected));
+
+        llvm::BasicBlock *then_bb = llvm::BasicBlock::Create(*context, "tl_report", function);
+        llvm::BasicBlock *after_bb = llvm::BasicBlock::Create(*context, "tl_after", function);
+        builder->CreateCondBr(cond, then_bb, after_bb);
+        builder->SetInsertPoint(then_bb);
+        {
+            // vprintf(fmt, argbuf): the args are packed, each at its natural alignment.
+            llvm::Type *i64 = i64_t;
+            llvm::ArrayType *buf_ty = llvm::ArrayType::get(i64, 5);
+            llvm::Value *buf = builder->CreateAlloca(buf_ty);
+            llvm::Value *packed[5] = {tag, vals[0], vals[1], vals[2], vals[3]};
+            for (int i = 0; i < 5; i++) {
+                builder->CreateStore(packed[i], builder->CreateConstGEP2_32(buf_ty, buf, 0, i));
+            }
+            llvm::Constant *fmt = create_string_constant(
+                "[timeline] tag=%lld  a=%lld  b=%lld  c=%lld  d=%lld\n");
+            llvm::Type *ptr_ty = llvm::PointerType::get(*context, 0);
+            llvm::FunctionType *vp_ty = llvm::FunctionType::get(i32_t, {ptr_ty, ptr_ty}, false);
+            llvm::FunctionCallee vp = module->getOrInsertFunction("vprintf", vp_ty);
+            builder->CreateCall(vp, {builder->CreatePointerCast(fmt, ptr_ty),
+                                     builder->CreatePointerCast(buf, ptr_ty)});
+        }
+        builder->CreateBr(after_bb);
+        builder->SetInsertPoint(after_bb);
+        value = ConstantInt::get(i32_t, 0);
+        return;
+    }
     if (op->is_intrinsic() && op->name == "mbarrier_arrive_cluster") {
         // CLUSTER-SCOPED arrive on the empty (WAR) ring edge -- async_storage_model.md §10.2.
         //

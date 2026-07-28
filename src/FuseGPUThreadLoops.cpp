@@ -1600,6 +1600,9 @@ protected:
         if (op->is_intrinsic() && op->name == "mbarrier_arrive_expect_tx") {
             return with_elected_lane(op, 2);
         }
+        if (op->is_intrinsic() && op->name == "gpu_timeline_report") {
+            return with_elected_lane(op, 5);
+        }
         if (op->is_intrinsic() && op->name == "mbarrier_arrive_cluster") {
             // §10.2 cluster-scoped empty-edge arrive: exactly one thread per CTA signals (the edge's
             // arrival count is count(cluster CTAs)), so it needs the model's elected lane -- same
@@ -2819,6 +2822,29 @@ class LowerGPUWarpAsyncFork : public IRMutator {
     // §10.2: make the empty edge's release CLUSTER-scoped when the fill is a cluster collective.
     // Off by default (NFC); HL_WS_CLUSTER_EMPTY=1.
     const bool cluster_empty;
+    // PROTOCOL-PHASE TIMELINE (§12.34), HL_WS_TIMELINE=1, diagnostic only. Accumulates clock64 deltas
+    // per ring protocol phase into a per-warp-group register array and prints them from CTA 0. The
+    // hand-written pipeline instrument localized the time immediately (producer 75% empty_wait,
+    // consumer ~20% full_wait, release 1%); this is the same measurement on the generated kernel,
+    // which §12.34 showed the reference cannot substitute for.
+    const bool timeline;
+    std::string tl_buf;   // the current fork branch's accumulator, empty outside a branch
+    enum TLPhase { TL_EMPTY_WAIT = 0, TL_ISSUE = 1, TL_FULL_WAIT = 2, TL_BODY = 3, TL_N = 4 };
+
+    // Wrap `s` so its elapsed cycles accumulate into tl_buf[phase].
+    Stmt timed(Stmt s, int phase) const {
+        if (!timeline || tl_buf.empty()) {
+            return s;
+        }
+        Expr now = Call::make(Int(64), "gpu_clock64", {}, Call::Intrinsic);
+        std::string t = unique_name("tl_t0");
+        Expr t0 = Variable::make(Int(64), t);
+        Expr cur = Load::make(Int(64), tl_buf, phase, Buffer<>{}, Parameter{}, const_true(),
+                              ModulusRemainder{});
+        Stmt upd = Store::make(tl_buf, cur + (now - t0), phase, Parameter{}, const_true(),
+                               ModulusRemainder{});
+        return LetStmt::make(t, now, Block::make(std::move(s), upd));
+    }
     // Cluster width of the enclosing gpu_block axis (For::blocks_per_cluster), 1 = no cluster. This
     // is the edge's arrival count under §10.2: one release per CTA.
     int cluster_ctas = 1;
@@ -3157,7 +3183,30 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             std::set<std::string> lifted_seen;
             std::vector<Stmt> out(num_groups);
             for (int i = 0; i < num_groups; i++) {
+                // §12.34 timeline: one accumulator per fork branch (Register storage is thread-private,
+                // so each lane keeps its own totals) plus a report at the branch's end. Per-branch
+                // rather than one shared buffer, so the producer's and each consumer's phases are
+                // reported separately -- the roles are what carry the information.
+                ScopedValue<std::string> tb(tl_buf, timeline ? unique_name("ring_timeline")
+                                                             : std::string());
                 out[i] = mutate(peel_hoisted(branches[i], lifted, lifted_seen));
+                if (timeline) {
+                    std::vector<Expr> rep{Expr((int64_t)i)};
+                    for (int ph = 0; ph < TL_N; ph++) {
+                        rep.push_back(Load::make(Int(64), tl_buf, ph, Buffer<>{}, Parameter{},
+                                                 const_true(), ModulusRemainder{}));
+                    }
+                    out[i] = Block::make(out[i], Evaluate::make(Call::make(
+                        Int(32), "gpu_timeline_report", rep, Call::Intrinsic)));
+                    Stmt zero;
+                    for (int ph = 0; ph < TL_N; ph++) {
+                        Stmt z = Store::make(tl_buf, Expr((int64_t)0), ph, Parameter{}, const_true(),
+                                             ModulusRemainder{});
+                        zero = zero.defined() ? Block::make(zero, z) : z;
+                    }
+                    out[i] = Allocate::make(tl_buf, Int(64), MemoryType::Register, {Expr(TL_N)},
+                                            const_true(), Block::make(zero, out[i]));
+                }
             }
             Stmt result = out.back();  // right-nested fork, consumer innermost
             for (int i = num_groups - 2; i >= 0; i--) {
@@ -3367,7 +3416,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                         {Expr((int)CompletionKind::CpAsyncGroup), Expr((int)SyncScope::WarpGroup),
                          mbar_slot_ref(b), parity},
                         Call::Intrinsic));
-                    return Block::make(wait, body);
+                    return Block::make(timed(wait, TL_FULL_WAIT), timed(body, TL_BODY));
                 }
                 Stmt wait;
                 if (b.is_empty && !b.empty_local_name.empty()) {
@@ -3415,6 +3464,9 @@ class LowerGPUWarpAsyncFork : public IRMutator {
                         join = Block::make(arrive, join);
                     }
                     wait = Block::make(wait, join);
+                }
+                if (b.is_empty) {
+                    wait = timed(wait, TL_EMPTY_WAIT);
                 }
                 if (b.is_empty) {
                     // Slots start free: skip the first N empty-waits or iter 0 deadlocks. This guards
@@ -3488,7 +3540,8 @@ public:
           empty_skew(get_env_variable("HL_WS_EMPTY_SKEW") == "1"),
           share_full(get_env_variable("HL_WS_SHARED_FULL") == "1"),
           tight_barriers(get_env_variable("HL_WS_TIGHT_BARRIERS") == "1"),
-          cluster_empty(get_env_variable("HL_WS_CLUSTER_EMPTY") == "1") {
+          cluster_empty(get_env_variable("HL_WS_CLUSTER_EMPTY") == "1"),
+          timeline(get_env_variable("HL_WS_TIMELINE") == "1") {
     }
 };
 
