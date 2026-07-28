@@ -2836,14 +2836,20 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         if (!timeline || tl_buf.empty()) {
             return s;
         }
-        Expr now = Call::make(Int(64), "gpu_clock64", {}, Call::Intrinsic);
+        // Each read must be a DISTINCT node: two identical pure-intrinsic Calls get CSE'd and the
+        // shared one is hoisted to their common scope, which is OUTSIDE the kernel -- the host codegen
+        // then sees `gpu_clock64` and dies with "Unknown intrinsic". A serial tag per read keeps them
+        // distinct without pretending the intrinsic is impure.
+        static int tl_tag = 0;
+        Expr now0 = Call::make(Int(64), "gpu_clock64", {Expr(tl_tag++)}, Call::Intrinsic);
+        Expr now1 = Call::make(Int(64), "gpu_clock64", {Expr(tl_tag++)}, Call::Intrinsic);
         std::string t = unique_name("tl_t0");
         Expr t0 = Variable::make(Int(64), t);
         Expr cur = Load::make(Int(64), tl_buf, phase, Buffer<>{}, Parameter{}, const_true(),
                               ModulusRemainder{});
-        Stmt upd = Store::make(tl_buf, cur + (now - t0), phase, Parameter{}, const_true(),
+        Stmt upd = Store::make(tl_buf, cur + (now1 - t0), phase, Parameter{}, const_true(),
                                ModulusRemainder{});
-        return LetStmt::make(t, now, Block::make(std::move(s), upd));
+        return LetStmt::make(t, now0, Block::make(std::move(s), upd));
     }
     // Cluster width of the enclosing gpu_block axis (For::blocks_per_cluster), 1 = no cluster. This
     // is the edge's arrival count under §10.2: one release per CTA.

@@ -785,7 +785,9 @@ void CodeGen_PTX_Dev::visit(const Call *op) {
         // deltas can be accumulated inside the ring's mainloop. §12.34 built this for a hand-written
         // pipeline and it immediately localized the time (producer 75% empty_wait, consumer ~20%
         // full_wait, release 1%); this is the same instrument for the kernel that actually matters.
-        internal_assert(op->args.empty()) << "gpu_clock64 takes no arguments.\n";
+        // One dummy arg: a serial tag that keeps successive reads distinct so CSE cannot merge
+        // them (see FuseGPUThreadLoops::timed). Its value is irrelevant here.
+        internal_assert(op->args.size() <= 1u) << "gpu_clock64 takes at most a tag argument.\n";
         llvm::FunctionType *ft = llvm::FunctionType::get(i64_t, false);
         llvm::InlineAsm *ia = llvm::InlineAsm::get(ft, "mov.u64 $0, %clock64;", "=l",
                                                    /*hasSideEffects*/ true);
