@@ -1608,7 +1608,7 @@ protected:
         }
         if (op->is_intrinsic() && op->name == "mbarrier_try_wait") {
             std::string m = op->args.empty() ? std::string() : load_buffer(op->args[0]);
-            if (ends_with(m, ".empty_mbar")) {
+            if (ends_with(m, ".empty_mbar") || ends_with(m, ".empty_cluster")) {
                 // Empty (WAR) edge producer_acquire: only the TMA-issuing (elected) lane must wait for
                 // the slot to free before it overwrites it. Tag it with the elected lane so codegen
                 // gates the spin to that one lane (perf: avoids a 256-thread poll storm). It is a
@@ -2782,6 +2782,14 @@ class LowerGPUWarpAsyncFork : public IRMutator {
         // multicast). The slot's write set is then cluster-wide, so releasing it CTA-locally is
         // unsound; the release must additionally join across the cluster's CTAs on this mbarrier.
         // Empty => CTA-local release only, byte-identical to the previous lowering (NFC).
+        //
+        // NB the buffer is named "<prod>.empty_cluster", NOT "<prod>.empty_mbar": PatchEmptyMbarCounts
+        // rewrites the arrival count of EVERY mbarrier_init triple whose buffer ends in ".empty_mbar"
+        // to the software-pipeline path's block-thread total. Our count is count(cluster CTAs), so the
+        // ".empty_mbar" spelling had it silently overwritten -- the mbarrier then expected the block
+        // thread total and received 2, which is a deadlock and is exactly what §12.26 measured. A
+        // suffix match capturing a buffer it was not written for: instance #7 of
+        // research/schedule_fact_carriage.md's characteristic bug.
         std::string empty_mbar_name;
     };
     std::map<std::string, BarrierInfo> sema_map;
@@ -2965,7 +2973,7 @@ class LowerGPUWarpAsyncFork : public IRMutator {
             const bool cluster_scoped_empty = cluster_empty && cluster_ctas > 1 && mbar;
             smap[prod + ".folding_semaphore.ring_buffer"] = {
                 empty_base, rn, /*is_empty*/ true, pi, {}, lam_out,
-                cluster_scoped_empty ? (prod + ".empty_mbar") : std::string()};
+                cluster_scoped_empty ? (prod + ".empty_cluster") : std::string()};
             base += full_takes_id ? 2 * rn : rn;
         }
         // NAMED-BARRIER BUDGET. A CTA has 16 hardware named barriers (sm_90). Overrunning it used to
