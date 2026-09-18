@@ -113,7 +113,25 @@ Benchmark 2048x2048 recurrence, 14 cores:
    task is a block) and a heavier per-point body. That composition (reindex +
    tile) is the natural follow-up.
 
-## NEXT: Toeplitz / sliding-window reuse (reindex a conv by k=x+r)
+## TOEPLITZ FINDING (attempted; a boundary of reduction-domain reindex)
+Tried: out(x) += wt(r)*in(x+r); reindex r -> k = x+r (inverse r = k-x) so in(x+r)
+= in(k) depends only on k (sliding-window/Toeplitz reuse).
+- reindex BUILDS it fine; loop nest = `for x: for k:` with in(...) indexed by k.
+- But it FAILS at codegen: "Symbol not found: x". The forward k=x+r couples the
+  pure var x with rvar r, so the new reduction var k has bounds [x, x+R-1] --
+  i.e. the reduction domain depends on a pure loop var, which Halide computes
+  loop-invariantly and cannot lower.
+=> Efficient Toeplitz reuse is fundamentally a STORAGE/producer-scheduling
+   transform (line-buffer `in` via store_at/compute_at/fold), NOT a reduction-
+   domain reindex. Guidance for the API: reduction-domain reindex is sound only
+   when the new domain bounds are independent of pure vars (rvar-only bijections
+   like the 2D skew). A pure/reduction-coupled map would need the pure vars'
+   ranges supplied to build a constant predicated box -- but that yields the
+   explicit O(N^2) Toeplitz matrix (no reuse win). So: defer to the storage-side
+   bijection (which the user deferred) for real Toeplitz.
+
+## Branch state for review: 9 commits + this finding. reindex_skew + wavefront_skew
+## registered and passing; rfactor + hoist_invariants unchanged and passing.
 Goal (user): "index bijection command" = given a stage + forward map (new = phi(old))
 and its inverse (old = phi^{-1}(new)) on the iteration space, rewrite the loop nest to
 iterate the IMAGE of phi and access via the inverse. Prototype affine SKEW on a
