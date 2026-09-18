@@ -75,7 +75,19 @@
   all match the plain sum. Verified loop nest: v in [0,W-1+H-1], u in [0,W-1].
 - SECOND client validates the pure API generalizes beyond split-materialization.
 
-## NEXT: skewing for parallelism / Toeplitz (design + prototype)
+## DONE (commit 8): wavefront parallelism via skew
+- test/correctness/wavefront_skew.cpp: 2D neighbour recurrence
+  f(x,y)=f(x-1,y)+f(x,y-1)+in; reindex u=r.x, v=r.x+r.y makes anti-diagonals
+  independent. Loop nest: `for v in [2,12]: parallel u in [1,7]:`. All 3 modes
+  (unskewed / skewed serial / skewed parallel(u)) MATCH the serial reference.
+- Confirms reindex works on a SELF-REFERENTIAL (recurrence) update, not just a
+  commutative sum, and that the exposed dim is genuinely parallelizable
+  (allow_race_conditions().parallel(RVar("u"))).
+- API guidance discovered: reindex takes Var new_vars but produces RVar dims, so
+  later parallel/reorder must reference them as RVar (name clash otherwise).
+  Candidate refinement: have reindex return the new RVars, or accept RVar.
+
+## NEXT (options): Toeplitz reuse; storage bijection; return-new-RVars API tweak
 Goal (user): "index bijection command" = given a stage + forward map (new = phi(old))
 and its inverse (old = phi^{-1}(new)) on the iteration space, rewrite the loop nest to
 iterate the IMAGE of phi and access via the inverse. Prototype affine SKEW on a
