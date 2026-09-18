@@ -878,6 +878,34 @@ vector<Dim> build_reduced_dims(const StageSchedule &sched,
     return dims;
 }
 
+// Overwrite the loop structure of a stage schedule -- its dim list, reduction
+// variables, and splits -- leaving every other scheduling decision
+// (parallelism, vectorization, fusion, storage, etc.) intact. This is the
+// common tail of rewriting a reduction stage: once the new domain and dim order
+// are known, they are stamped onto the schedule here.
+void set_loop_structure(StageSchedule &sched,
+                        vector<Dim> dims,
+                        vector<ReductionVariable> rvars,
+                        vector<Split> splits) {
+    sched.dims() = std::move(dims);
+    sched.rvars() = std::move(rvars);
+    sched.splits() = std::move(splits);
+}
+
+// Build a schedule for a stage derived from `src` (an existing update's
+// schedule): inherit all of src's loop-level scheduling (parallel/vectorize/
+// reorder/fusion, carried in the copied dims and their flags) but replace the
+// loop structure with the given dims/rvars/splits. Used to give a generated
+// intermediate Func the parent update's schedule with a fresh reduction domain.
+StageSchedule make_sub_schedule(const StageSchedule &src,
+                                vector<Dim> dims,
+                                vector<ReductionVariable> rvars,
+                                vector<Split> splits) {
+    StageSchedule sched = src.get_copy();
+    set_loop_structure(sched, std::move(dims), std::move(rvars), std::move(splits));
+    return sched;
+}
+
 void materialize_reduction_domain(Definition &def, const string &stage_name) {
     StageSchedule &sched = def.schedule();
 
@@ -1342,10 +1370,9 @@ Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
             }
         }
 
-        intm.function().update(0).schedule() = definition.schedule().get_copy();
-        intm.function().update(0).schedule().dims() = to_intermediate(intm_dims);
-        intm.function().update(0).schedule().rvars() = intermediate_rdom.domain();
-        intm.function().update(0).schedule().splits() = var_splits;
+        intm.function().update(0).schedule() =
+            make_sub_schedule(definition.schedule(), to_intermediate(intm_dims),
+                              intermediate_rdom.domain(), var_splits);
     }
 
     // Preserved update definition
@@ -1382,9 +1409,8 @@ Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
         definition.args() = dim_vars_exprs;
         definition.values() = to_preserved(prover_result.pattern.ops);
         definition.predicate() = preserved_rdom.predicate();
-        definition.schedule().dims() = to_preserved(reducing_dims);
-        definition.schedule().rvars() = preserved_rdom.domain();
-        definition.schedule().splits() = var_splits;
+        set_loop_structure(definition.schedule(), to_preserved(reducing_dims),
+                           preserved_rdom.domain(), var_splits);
     }
 
     return intm;
@@ -1496,9 +1522,8 @@ FuncVec Stage::hoist_invariants() {
         definition.args() = dim_vars_exprs;
         definition.values() = substitute(writeback_map, prover_result.pattern.ops);
         definition.predicate() = or_condition_over_domain(definition.predicate(), reduction_bounds);
-        definition.schedule().dims() = std::move(writeback_dims);
-        definition.schedule().rvars().clear();
-        definition.schedule().splits() = var_splits;
+        // No rvars: the reduction has moved entirely into the intermediates.
+        set_loop_structure(definition.schedule(), std::move(writeback_dims), {}, var_splits);
     }
 
     return intms;
