@@ -847,6 +847,37 @@ select_subdomain(const vector<Dim> &dims, const ReductionDomain &rdom) {
     return project_rdom(dims, rdom, {});
 }
 
+// Build the dim list for a factored stage that no longer iterates the reduction
+// dims that were split off: keep every pure-Var dim plus any rvar dim named in
+// `keep_rvars`, dropping the rest. Then re-insert any pure Var that the update
+// args don't mention, just before outermost -- the histogram/scatter case, where
+// a pure dimension is otherwise absent from the loop nest, e.g.
+//     g(x) = 0; g(f(r.x, r.y)) += 1;  Func intm = g.rfactor(r.y, u);
+// yields intm(x, u) = 0; intm(f(r.x, u), u) += 1; and the reducing stage
+//     g(x) += intm(x, r.y);
+// needs an x loop even though x never appeared in the update's args.
+// Shared by rfactor()'s reducing stage (keep = preserved rvars) and
+// hoist_invariants()'s write-back stage (keep = {}).
+vector<Dim> build_reduced_dims(const StageSchedule &sched,
+                               const vector<Expr> &update_args,
+                               const vector<Var> &dim_vars,
+                               const unordered_set<string> &keep_rvars) {
+    vector<Dim> dims;
+    for (const Dim &dim : sched.dims()) {
+        if (!dim.is_rvar() || keep_rvars.count(dim.var)) {
+            dims.push_back(dim);
+        }
+    }
+    for (size_t i = 0; i < dim_vars.size(); i++) {
+        if (!expr_uses_var(update_args[i], dim_vars[i].name())) {
+            Dim d = {dim_vars[i].name(), ForType::Serial, DeviceAPI::None,
+                     DimType::PureVar, Partition::Auto};
+            dims.insert(dims.end() - 1, d);
+        }
+    }
+    return dims;
+}
+
 void materialize_reduction_domain(Definition &def, const string &stage_name) {
     StageSchedule &sched = def.schedule();
 
@@ -1343,33 +1374,10 @@ Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
             }
         }
 
-        vector<Dim> reducing_dims;
-        {
-            // Remove rvar dims NOT IN the preserved list from the REDUCING Func
-            for (const auto &dim : definition.schedule().dims()) {
-                if (!dim.is_rvar() || preserved_rdims_set.count(dim.var)) {
-                    reducing_dims.push_back(dim);
-                }
-            }
-
-            // Add missing pure vars to the REDUCING func just before outermost.
-            // This is necessary whenever the update does not reference one of the
-            // pure variables. For instance, factoring a histogram (clamps elided):
-            //     g(x) = 0; g(f(r.x, r.y)) += 1;
-            //     Func intm = g.rfactor(r.y, u);
-            // Here we generate an intermediate func intm that looks like:
-            //     intm(x, u) = 0; intm(f(r.x, u), u) += 1;
-            // And we need the reducing func to be:
-            //     g(x) += intm(x, r.y);
-            // But x was not referenced in the original update definition, so that
-            // dimension is added here.
-            for (size_t i = 0; i < dim_vars.size(); i++) {
-                if (!expr_uses_var(definition.args()[i], dim_vars[i].name())) {
-                    Dim d = {dim_vars[i].name(), ForType::Serial, DeviceAPI::None, DimType::PureVar, Partition::Auto};
-                    reducing_dims.insert(reducing_dims.end() - 1, d);
-                }
-            }
-        }
+        // The reducing stage keeps the pure dims and the preserved rvar dims
+        // (which it still iterates), dropping the factored-away rvars.
+        vector<Dim> reducing_dims =
+            build_reduced_dims(definition.schedule(), definition.args(), dim_vars, preserved_rdims_set);
 
         definition.args() = dim_vars_exprs;
         definition.values() = to_preserved(prover_result.pattern.ops);
@@ -1480,21 +1488,10 @@ FuncVec Stage::hoist_invariants() {
             }
         }
 
-        vector<Dim> writeback_dims;
-        for (const Dim &dim : definition.schedule().dims()) {
-            if (!dim.is_rvar()) {
-                writeback_dims.push_back(dim);
-            }
-        }
-        // Add pure vars not referenced by the original update just before
-        // outermost, as rfactor() does for histogram-style updates.
-        for (size_t i = 0; i < dim_vars.size(); i++) {
-            if (!expr_uses_var(definition.args()[i], dim_vars[i].name())) {
-                Dim d = {dim_vars[i].name(), ForType::Serial, DeviceAPI::None,
-                         DimType::PureVar, Partition::Auto};
-                writeback_dims.insert(writeback_dims.end() - 1, d);
-            }
-        }
+        // The write-back stage iterates no rvars at all (they have moved into the
+        // intermediates), so keep only the pure dims.
+        vector<Dim> writeback_dims =
+            build_reduced_dims(definition.schedule(), definition.args(), dim_vars, /*keep_rvars=*/{});
 
         definition.args() = dim_vars_exprs;
         definition.values() = substitute(writeback_map, prover_result.pattern.ops);

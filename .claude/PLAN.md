@@ -19,11 +19,21 @@
 - Tests: correctness_rfactor 0, correctness_hoist_invariants 0, error test exit 1
   ("...fused a Var into an RVar: y, r$z").
 
-## STILL TODO (isolation, next commits)
-- Extract shared write-back/reducing dim-list builder (drop rvar dims not in `keep`,
-  re-insert missing pure Vars for histogram) used by rfactor (reducing_dims, keep=
-  preserved) and hoist (writeback_dims, keep={}).
-- Possibly a sub-schedule builder (copy schedule + set dims/rvars/splits).
+## DONE (commit 3): shared build_reduced_dims
+- build_reduced_dims(sched, update_args, dim_vars, keep_rvars): keep pure dims +
+  rvar dims in keep_rvars, drop the rest, re-insert missing pure Vars (histogram).
+  Used by rfactor reducing stage (keep=preserved) and hoist write-back (keep={}).
+- Tests still green (rfactor 0, hoist 0, error 1).
+
+## Reusable reduction-schedule primitives now isolated (anon ns, Func.cpp)
+  partition_reduction_splits | select_subdomain | build_reduced_dims |
+  materialize_reduction_domain | (existing: project_rdom, RFactorProjection, add_let)
+
+## STILL TODO (further isolation, if desired)
+- Sub-schedule builder: copy schedule + set dims/rvars/splits (appears in rfactor
+  intermediate build + both write-back assignments).
+- Extract the "promote preserved rvar dims -> pure Var dims" dim rewrite.
+- Longer term: a small typed "reduction rewrite" API both directives target.
 
 ## (superseded) original NEXT plan
 Step A [make default + delete dead code]:
