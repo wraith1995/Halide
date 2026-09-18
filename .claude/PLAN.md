@@ -38,15 +38,23 @@
   Used for the rfactor intermediate. (hoist intermediate stays a plain get_copy.)
 - Tests still green (rfactor 0, hoist 0, error 1).
 
+## DONE (commit 5): promote_preserved_dims
+- promote_preserved_dims(source_dims, preserved_rvars, preserved_vars, pure_dims):
+  the RVar->Var promotion for the rfactor intermediate -- replace each preserved
+  rvar Dim with its pure Var Dim (from the intermediate's pure dims), then insert
+  any preserved Var missing, just before outermost. Replaces the inline intm_dims
+  loops. Tests still green (rfactor 0, hoist 0, error 1).
+
 ## Reusable reduction-schedule primitives now isolated (anon ns, Func.cpp)
   partition_reduction_splits | select_subdomain | build_reduced_dims |
-  set_loop_structure | make_sub_schedule | materialize_reduction_domain
+  set_loop_structure | make_sub_schedule | promote_preserved_dims |
+  materialize_reduction_domain
   (existing: project_rdom, RFactorProjection, add_let)
 
 ## STILL TODO (further isolation, if desired)
-- Extract the "promote preserved rvar dims -> pure Var dims" dim rewrite
-  (the intm_dims loop that swaps preserved rvar Dims for their pure Var Dims).
-- Longer term: a small typed "reduction rewrite" API both directives target.
+- Longer term: a small typed "reduction rewrite" API both directives target
+  (bundle prover_result + preserved partition + the maps, so rfactor/hoist read
+  as short compositions of the primitives above).
 
 ## (superseded) original NEXT plan
 Step A [make default + delete dead code]:

@@ -906,6 +906,45 @@ StageSchedule make_sub_schedule(const StageSchedule &src,
     return sched;
 }
 
+// Build the intermediate stage's dim list for rfactor(). Starting from the
+// parent update's dims, each preserved rvar Dim is replaced by the pure-Var Dim
+// it becomes in the intermediate (the RVar->Var promotion), and any preserved
+// Var still not present is inserted just before outermost. `pure_dims` is the
+// intermediate's pure (init) dim list, which supplies the canonical Var Dims
+// (carrying their default schedule flags).
+vector<Dim> promote_preserved_dims(const vector<Dim> &source_dims,
+                                   const vector<RVar> &preserved_rvars,
+                                   const vector<Var> &preserved_vars,
+                                   const vector<Dim> &pure_dims) {
+    vector<Dim> dims = source_dims;
+
+    // Promote: preserved rvar Dim -> the corresponding pure Var Dim.
+    for (Dim &dim : dims) {
+        const auto it = std::find_if(preserved_rvars.begin(), preserved_rvars.end(),
+                                     [&](const RVar &rv) { return dim_match(dim, rv); });
+        if (it != preserved_rvars.end()) {
+            const auto offset = it - preserved_rvars.begin();
+            const optional<Dim> pure_dim = find_dim(pure_dims, preserved_vars[offset]);
+            internal_assert(pure_dim);
+            dim = *pure_dim;
+        }
+    }
+
+    // Insert any preserved Var not already present, just before outermost.
+    unordered_set<string> present;
+    for (const Dim &dim : dims) {
+        present.insert(dim.var);
+    }
+    for (const Var &var : preserved_vars) {
+        const optional<Dim> dim = find_dim(pure_dims, var);
+        internal_assert(dim) << "Failed to find " << var.name() << " in list of pure dims";
+        if (!present.count(dim->var)) {
+            dims.insert(dims.end() - 1, *dim);
+        }
+    }
+    return dims;
+}
+
 void materialize_reduction_domain(Definition &def, const string &stage_name) {
     StageSchedule &sched = def.schedule();
 
@@ -1340,35 +1379,11 @@ Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
         values = to_intermediate(values);
         intm.function().define_update(args, values, intermediate_rdom);
 
-        // Intermediate schedule
-        vector<Dim> intm_dims = definition.schedule().dims();
-
-        // Replace rvar dims IN the preserved list with their Vars in the INTERMEDIATE Func
-        for (auto &dim : intm_dims) {
-            const auto it = std::find_if(preserved_rvars.begin(), preserved_rvars.end(), [&](const auto &rv) {
-                return dim_match(dim, rv);
-            });
-            if (it != preserved_rvars.end()) {
-                const auto offset = it - preserved_rvars.begin();
-                const auto &var = preserved_vars[offset];
-                const auto &pure_dim = find_dim(intm.function().definition().schedule().dims(), var);
-                internal_assert(pure_dim);
-                dim = *pure_dim;
-            }
-        }
-
-        // Add factored pure dims to the INTERMEDIATE func just before outermost
-        unordered_set<string> dims;
-        for (const auto &dim : intm_dims) {
-            dims.insert(dim.var);
-        }
-        for (const Var &var : preserved_vars) {
-            const optional<Dim> &dim = find_dim(intm.function().definition().schedule().dims(), var);
-            internal_assert(dim) << "Failed to find " << var.name() << " in list of pure dims";
-            if (!dims.count(dim->var)) {
-                intm_dims.insert(intm_dims.end() - 1, *dim);
-            }
-        }
+        // Intermediate schedule: the parent update's dims, with preserved rvars
+        // promoted to the pure Vars they become in the intermediate.
+        vector<Dim> intm_dims = promote_preserved_dims(
+            definition.schedule().dims(), preserved_rvars, preserved_vars,
+            intm.function().definition().schedule().dims());
 
         intm.function().update(0).schedule() =
             make_sub_schedule(definition.schedule(), to_intermediate(intm_dims),
