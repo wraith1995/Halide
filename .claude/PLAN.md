@@ -51,10 +51,25 @@
   materialize_reduction_domain
   (existing: project_rdom, RFactorProjection, add_let)
 
-## STILL TODO (further isolation, if desired)
-- Longer term: a small typed "reduction rewrite" API both directives target
-  (bundle prover_result + preserved partition + the maps, so rfactor/hoist read
-  as short compositions of the primitives above).
+## DONE (commit 6): pure reduction-rewrite API
+- ReductionStage {args,values,predicate,dims,rvars,splits} + read/write_reduction_stage.
+- reindex_reduction_domain(in, inverse, new_rdom, new_dims, new_splits) -> ReductionStage:
+  PURE core. inverse: old rvar name -> Expr(new rvars) (= phi^{-1}); wraps old rvars
+  in bounds promises, projects args/values/predicate, strips domain back-pointers.
+- helpers: reduction_bounds_promises, drop_rvar_domains.
+- materialize_reduction_domain is now a thin client: project_rdom gives (flat_rdom,
+  inverse) + dim rename, then reindex_reduction_domain does the rewrite.
+- Tests green.
+
+## NEXT: index-bijection / skew directive as a second client of the API
+Goal (user): "index bijection command" = given a stage + forward map (new = phi(old))
+and its inverse (old = phi^{-1}(new)) on the iteration space, rewrite the loop nest to
+iterate the IMAGE of phi and access via the inverse. Prototype affine SKEW on a
+reduction domain via reindex_reduction_domain; test numerically (commutative sum over a
+box, skewed -> same result). Then: skew for parallelism (wavefront), Toeplitz codegen,
+and a storage analogue. Design decisions to settle: directive surface (Func-based
+forward/inverse vs explicit affine exprs), image bounding-box + predicate computation,
+pure-Func vs reduction iteration spaces.
 
 ## (superseded) original NEXT plan
 Step A [make default + delete dead code]:

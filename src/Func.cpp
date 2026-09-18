@@ -945,11 +945,107 @@ vector<Dim> promote_preserved_dims(const vector<Dim> &source_dims,
     return dims;
 }
 
+// ----------------------------------------------------------------------------
+// Reduction-rewrite API (pure core)
+//
+// A small vocabulary for rewriting one associative update definition, shared by
+// every reduction-domain-manipulating directive (rfactor's Phase A, and any
+// iteration-space bijection such as skew). The core, reindex_reduction_domain(),
+// is a pure function of plain data: it maps a ReductionStage to a new one and
+// mutates nothing.
+// ----------------------------------------------------------------------------
+
+// A pure snapshot of the parts of one update definition that a reduction rewrite
+// reads and writes: the algorithm side (args/values/predicate) and the loop
+// structure (dims/rvars/splits).
+struct ReductionStage {
+    vector<Expr> args;
+    vector<Expr> values;
+    Expr predicate;
+    vector<Dim> dims;
+    vector<ReductionVariable> rvars;
+    vector<Split> splits;
+};
+
+ReductionStage read_reduction_stage(const Definition &def) {
+    const StageSchedule &s = def.schedule();
+    return {def.args(), def.values(), def.predicate(), s.dims(), s.rvars(), s.splits()};
+}
+
+void write_reduction_stage(Definition &def, ReductionStage stage) {
+    def.args() = std::move(stage.args);
+    def.values() = std::move(stage.values);
+    def.predicate() = std::move(stage.predicate);
+    set_loop_structure(def.schedule(), std::move(stage.dims),
+                       std::move(stage.rvars), std::move(stage.splits));
+}
+
+// Wrap each rvar of `rdom` in a bounds promise carrying its (tight) bounds. When
+// composed before an index rewrite, this keeps the promise on the reconstructed
+// (possibly wider) index expression, so bounds inference does not over-estimate.
+SubstitutionMap reduction_bounds_promises(const ReductionDomain &rdom) {
+    SubstitutionMap promises;
+    for (int i = 0; i < (int)rdom.domain().size(); i++) {
+        const auto &[var, min, extent] = rdom.domain()[i];
+        promises.emplace(var, promise_clamped(RVar(rdom, i), min, min + extent - 1));
+    }
+    return promises;
+}
+
+// Strip reduction-domain back-pointers from a predicate so it refers to its
+// rvars by name only, as a stored definition predicate must (see
+// DropSelfReferences in Reduction.cpp); otherwise re-homing it into a freshly
+// built ReductionDomain trips the "predicate may only refer to its own RVars"
+// check.
+Expr drop_rvar_domains(const Expr &e) {
+    return mutate_with(e, [](auto *self, const Variable *v) -> Expr {
+        if (v->reduction_domain.defined()) {
+            return Variable::make(v->type, v->name);
+        }
+        return v;
+    });
+}
+
+// Pure reduction rewrite: reindex an update's reduction domain by an
+// iteration-space bijection phi, given its inverse.
+//
+// `inverse` maps each ORIGINAL rvar name to an Expr over the NEW rvars, i.e.
+// original = phi^{-1}(new). Original rvars are wrapped in promise_clamped() with
+// their original (tight) bounds before substitution, so the reconstructed
+// indices keep the tight original range for bounds inference.
+//
+// `new_rdom`'s predicate() supplies the predicate to carry: it may reference
+// original rvars (projected through `inverse`) and/or new rvars (left as-is) --
+// e.g. a carried .where(), split-tail guards, or the image of the old box under
+// phi. `new_dims` is the new loop order (already expressed over the new rvars
+// and any pure Vars) and `new_splits` the surviving pure-Var splits.
+//
+// Nothing is mutated; args/values in the result reference the new rvars and the
+// predicate refers to its rvars by name only.
+ReductionStage reindex_reduction_domain(const ReductionStage &in,
+                                        const SubstitutionMap &inverse,
+                                        const ReductionDomain &new_rdom,
+                                        vector<Dim> new_dims,
+                                        vector<Split> new_splits) {
+    const ReductionDomain old_rdom{in.rvars, in.predicate, true};
+    const SubstitutionMap promises = reduction_bounds_promises(old_rdom);
+    RFactorProjection project{promises, inverse};
+
+    ReductionStage out;
+    out.args = project(in.args);
+    out.values = project(in.values);
+    out.predicate = drop_rvar_domains(simplify(project(new_rdom.predicate())));
+    out.dims = std::move(new_dims);
+    out.rvars = new_rdom.domain();
+    out.splits = std::move(new_splits);
+    return out;
+}
+
 void materialize_reduction_domain(Definition &def, const string &stage_name) {
     StageSchedule &sched = def.schedule();
 
     // Lower every reduction-domain split into the flat leaf domain. Pure-Var
-    // splits are returned separately and left in the schedule untouched.
+    // splits stay in the schedule untouched.
     auto [var_splits, rvar_splits] = partition_reduction_splits(sched, stage_name);
 
     // Nothing touches the reduction domain: it is already flat, so the source
@@ -966,53 +1062,22 @@ void materialize_reduction_domain(Definition &def, const string &stage_name) {
         }
     }
 
-    // Reuse the canonical split machinery (project_rdom -> apply_split) to
-    // expand the domain and build a substitution from each original rvar to its
-    // expression in the new leaf rvars.
-    ReductionDomain rdom{sched.rvars(), def.predicate(), true};
-    auto [flat_rdom, projection] = project_rdom(rvar_dims, rdom, rvar_splits);
+    // The split machinery (project_rdom -> apply_split) supplies the new (flat)
+    // domain and the inverse map from each original rvar to its expression in the
+    // new leaf rvars (r.x -> 8*rxo + rxi). That inverse is exactly what the
+    // reduction rewrite consumes, so materialization is just an instance of it.
+    const ReductionStage in = read_reduction_stage(def);
+    const ReductionDomain rdom{in.rvars, in.predicate, true};
+    auto [flat_rdom, inverse] = project_rdom(rvar_dims, rdom, rvar_splits);
 
-    // Wrap each original rvar in a bounds promise carrying its (tight,
-    // pre-split) bounds, so that after projection the reconstructed split index
-    // (e.g. 4*rxo + rxi, whose naive range is wider than the original) retains
-    // the original domain bound. Bounds inference reads this promise off the
-    // access index; without it the input read region would over-estimate. This
-    // mirrors exactly the RFactorProjection the factoring phase applies to its
-    // own values. (The factoring phase then re-promises on the leaf rvars; the
-    // resulting nested promise_clamped is harmless -- the outer, tighter bound
-    // dominates.)
-    SubstitutionMap rdom_promises;
-    for (int i = 0; i < (int)rdom.domain().size(); i++) {
-        const auto &[var, min, extent] = rdom.domain()[i];
-        rdom_promises.emplace(var, promise_clamped(RVar(rdom, i), min, min + extent - 1));
-    }
-    RFactorProjection project{rdom_promises, projection};
+    // The leaf dims are renamed to the flat domain's rvars (each leaf maps to a
+    // single new RVar, so the dims-overload of the projector is a pure rename).
+    const SubstitutionMap promises = reduction_bounds_promises(rdom);
+    RFactorProjection rename{promises, inverse};
+    vector<Dim> new_dims = rename(in.dims);
 
-    // Rewrite the algorithm ("regular language") side of the definition.
-    def.args() = project(def.args());
-    def.values() = project(def.values());
-
-    // The projection re-homes rvar references onto the transient flat_rdom.
-    // Strip those reduction-domain back-pointers so the stored predicate refers
-    // to its rvars by name only, exactly as a normal definition predicate does
-    // (see DropSelfReferences in Reduction.cpp). Otherwise the factoring phase,
-    // which rebuilds its own ReductionDomains, would trip the "predicate may
-    // only refer to its own RVars" check. The values are left as-is: the
-    // factoring phase re-homes them by name via substitution.
-    Expr pred = simplify(project(flat_rdom.predicate()));
-    pred = mutate_with(pred, [](auto *self, const Variable *v) -> Expr {
-        if (v->reduction_domain.defined()) {
-            return Variable::make(v->type, v->name);
-        }
-        return v;
-    });
-    def.predicate() = pred;
-
-    // Rewrite the schedule side to match: a flat rdom, renamed leaf dims, and
-    // only the pure-Var splits left to apply at lowering.
-    sched.rvars() = flat_rdom.domain();
-    sched.dims() = project(sched.dims());
-    sched.splits() = var_splits;
+    write_reduction_stage(def, reindex_reduction_domain(in, inverse, flat_rdom,
+                                                        std::move(new_dims), var_splits));
 }
 
 // A semiring distributive law used by hoist_invariants(): `inner` distributes
