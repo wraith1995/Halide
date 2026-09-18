@@ -1609,9 +1609,185 @@ FuncVec Stage::hoist_invariants() {
     return intms;
 }
 
-void Stage::reindex(const vector<Var> &new_vars,
-                    const vector<Expr> &forward,
-                    const vector<Expr> &inverse) {
+namespace {
+
+// If `e` is an integer-affine function of `vars`, return its coefficients (one
+// per var, in order) followed by the constant term; otherwise nullopt.
+optional<vector<int64_t>> affine_int_coeffs(const Expr &e, const vector<string> &vars) {
+    std::map<string, Expr> zero;
+    for (const string &v : vars) {
+        zero[v] = 0;
+    }
+    const Expr c0 = simplify(substitute(zero, e));
+    const auto cc = as_const_int(c0);
+    if (!cc) {
+        return std::nullopt;
+    }
+    vector<int64_t> coeffs;
+    Expr recon = make_const(Int(32), *cc);
+    for (const string &v : vars) {
+        std::map<string, Expr> one = zero;
+        one[v] = 1;
+        const Expr cj = simplify(substitute(one, e) - c0);
+        const auto ci = as_const_int(cj);
+        if (!ci) {
+            return std::nullopt;
+        }
+        coeffs.push_back(*ci);
+        recon = recon + make_const(Int(32), *ci) * Variable::make(Int(32), v);
+    }
+    if (!is_const_zero(simplify(e - recon))) {
+        return std::nullopt;  // not affine
+    }
+    coeffs.push_back(*cc);
+    return coeffs;
+}
+
+// Collect the argument lists of every self-reference to `func_name` in `values`.
+vector<vector<Expr>> collect_self_ref_args(const vector<Expr> &values, const string &func_name) {
+    class Collector : public IRVisitor {
+        using IRVisitor::visit;
+        void visit(const Call *op) override {
+            IRVisitor::visit(op);
+            if (op->call_type == Call::Halide && op->name == func_name) {
+                refs.push_back(op->args);
+            }
+        }
+
+    public:
+        const string &func_name;
+        vector<vector<Expr>> refs;
+        explicit Collector(const string &fn)
+            : func_name(fn) {
+        }
+    } c(func_name);
+    for (const Expr &v : values) {
+        v.accept(&c);
+    }
+    return c.refs;
+}
+
+// Dependence analysis for reindex(). Given the pre-rewrite stage `in`, the Func
+// name, the forward map, the new rvar names and the produced (renamed) dim list,
+// decide for each new reduction dim whether it is safe to parallelize -- i.e. it
+// carries no loop-carried dependence under the produced loop order. Handles the
+// uniform-affine recurrence shape (LHS args = rvar_i + const, self-refs =
+// rvar_i + const); returns all-false if it cannot prove that shape.
+vector<bool> reindex_parallel_safe(const ReductionStage &in,
+                                   const string &func_name,
+                                   const vector<Expr> &forward,
+                                   const vector<Var> &new_vars,
+                                   const vector<Dim> &new_dims) {
+    const size_t n = in.rvars.size();
+    vector<bool> unsafe(n, true);  // conservative default: nothing is safe
+
+    vector<string> old_names;
+    for (const auto &rv : in.rvars) {
+        old_names.push_back(rv.var);
+    }
+
+    // LHS must write f at rvar_i + const_i (a shifted identity), and there must
+    // be one output arg per reduction dim.
+    if (in.args.size() != n) {
+        return vector<bool>(n, false);
+    }
+    vector<int64_t> lhs_const(n);
+    for (size_t i = 0; i < n; i++) {
+        const auto c = affine_int_coeffs(in.args[i], old_names);
+        if (!c) {
+            return vector<bool>(n, false);
+        }
+        for (size_t k = 0; k < n; k++) {
+            if ((*c)[k] != (k == i ? 1 : 0)) {
+                return vector<bool>(n, false);
+            }
+        }
+        lhs_const[i] = (*c)[n];
+    }
+
+    // Uniform dependence vectors from the self-references: dep_i = L_const - R_const
+    // for a self-ref whose i-th arg is rvar_i + R_const_i.
+    vector<vector<int64_t>> deps;
+    for (const vector<Expr> &args : collect_self_ref_args(in.values, func_name)) {
+        if (args.size() != n) {
+            return vector<bool>(n, false);
+        }
+        vector<int64_t> d(n);
+        for (size_t i = 0; i < n; i++) {
+            const auto c = affine_int_coeffs(args[i], old_names);
+            if (!c) {
+                return vector<bool>(n, false);
+            }
+            for (size_t k = 0; k < n; k++) {
+                if ((*c)[k] != (k == i ? 1 : 0)) {
+                    return vector<bool>(n, false);
+                }
+            }
+            d[i] = lhs_const[i] - (*c)[n];
+        }
+        deps.push_back(d);
+    }
+
+    // Forward Jacobian J (rows = new dims, cols = old dims).
+    vector<vector<int64_t>> J(n);
+    for (size_t j = 0; j < n; j++) {
+        const auto c = affine_int_coeffs(forward[j], old_names);
+        if (!c) {
+            return vector<bool>(n, false);
+        }
+        J[j].assign(c->begin(), c->begin() + n);
+    }
+
+    // Loop level of each new rvar (0 = outermost). new_dims is innermost-first.
+    std::map<string, int> loop_level;
+    int level = 0;
+    for (auto it = new_dims.rbegin(); it != new_dims.rend(); ++it) {
+        loop_level[it->var] = level++;
+    }
+    vector<int> level_of_new(n);
+    for (size_t j = 0; j < n; j++) {
+        level_of_new[j] = loop_level.at(new_vars[j].name());
+    }
+
+    // For each dependence, the outermost new dim with a nonzero component carries
+    // it (and must be positive for the loop order to be legal).
+    std::fill(unsafe.begin(), unsafe.end(), false);
+    for (const vector<int64_t> &d : deps) {
+        vector<int64_t> nd(n, 0);
+        for (size_t j = 0; j < n; j++) {
+            for (size_t k = 0; k < n; k++) {
+                nd[j] += J[j][k] * d[k];
+            }
+        }
+        int carry = -1, carry_level = (int)n + 1;
+        for (size_t j = 0; j < n; j++) {
+            if (nd[j] != 0 && level_of_new[j] < carry_level) {
+                carry_level = level_of_new[j];
+                carry = (int)j;
+            }
+        }
+        if (carry >= 0) {
+            unsafe[carry] = true;
+            if (nd[carry] < 0) {
+                user_warning << "reindex(): the resulting loop order violates a "
+                             << "dependence (a dependence vector is lexicographically "
+                             << "negative); the schedule may be incorrect.\n";
+            }
+        }
+    }
+
+    vector<bool> safe(n);
+    for (size_t j = 0; j < n; j++) {
+        safe[j] = !unsafe[j];
+    }
+    return safe;
+}
+
+}  // namespace
+
+ReindexResult Stage::reindex(const vector<Var> &new_vars,
+                             const vector<Expr> &forward,
+                             const vector<Expr> &inverse) {
     user_assert(!definition.is_init()) << "reindex() must be called on an update definition\n";
     definition.schedule().touched() = true;
 
@@ -1698,9 +1874,20 @@ void Stage::reindex(const vector<Var> &new_vars,
         }
     }
 
+    // Dependence check: which new dims are safe to parallelize under this order.
+    const vector<bool> parallel_safe =
+        reindex_parallel_safe(in, function.name(), forward, new_vars, new_dims);
+
     write_reduction_stage(definition,
                           reindex_reduction_domain(in, inverse_map, new_rdom,
                                                    std::move(new_dims), in.splits));
+
+    ReindexResult result;
+    for (size_t j = 0; j < n; j++) {
+        result.vars.push_back(RVar(new_rdom, (int)j));
+    }
+    result.parallel_safe = parallel_safe;
+    return result;
 }
 
 void Stage::split(const string &old, const string &outer, const string &inner, const Expr &factor_arg, bool exact, TailStrategy tail) {

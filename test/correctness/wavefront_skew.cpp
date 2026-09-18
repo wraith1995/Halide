@@ -36,10 +36,23 @@ Buffer<int> compute(const Buffer<int> &in, int mode) {
     if (mode != 0) {
         Var u("u"), v("v");
         // u = r.x, v = r.x + r.y ; inverse r.x = u, r.y = v - u.
-        f.update().reindex({u, v}, {r.x, r.x + r.y}, {u, v - u});
+        ReindexResult res =
+            f.update().reindex({u, v}, {r.x, r.x + r.y}, {u, v - u});
         if (mode == 2) {
-            // The reindexed dims are RVars; u is independent within each v.
-            f.update().allow_race_conditions().parallel(RVar("u"));
+            // Parallelize every dimension the dependence check proved safe. For
+            // this skew that is exactly u (the intra-anti-diagonal index); v,
+            // which carries the wavefront dependence, is left serial.
+            bool any = false;
+            for (size_t k = 0; k < res.vars.size(); k++) {
+                if (res.parallel_safe[k]) {
+                    f.update().allow_race_conditions().parallel(res.vars[k]);
+                    any = true;
+                }
+            }
+            if (!any) {
+                printf("dependence check found no parallel-safe dim after skew\n");
+                exit(1);
+            }
         }
     }
     return f.realize({W, H});

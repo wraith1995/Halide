@@ -87,7 +87,33 @@
   later parallel/reorder must reference them as RVar (name clash otherwise).
   Candidate refinement: have reindex return the new RVars, or accept RVar.
 
-## NEXT (options): Toeplitz reuse; storage bijection; return-new-RVars API tweak
+## DONE (commit 9): reindex returns RVars + dependence check
+- Stage::reindex now returns ReindexResult {vector<RVar> vars; vector<bool> parallel_safe}.
+- Dependence check (reindex_parallel_safe, anon ns): extracts uniform integer
+  dependence vectors from the update's self-refs (LHS = rvar_i+const, self-ref =
+  rvar_i+const; else conservative all-false), transforms by the forward Jacobian,
+  and per new dim decides parallel-safety = carries no loop-carried dependence in
+  the produced (outer->inner) loop order. Warns if the order is dep-illegal.
+- helpers: affine_int_coeffs (integer-affine coeff extraction), collect_self_ref_args.
+- wavefront_skew.cpp now parallelizes exactly the dims the check proves safe (u),
+  not v; still MATCHes. Confirms the check is discriminating (parallelizing v
+  would race). as_const_int returns std::optional in this tree (fixed).
+
+## SPEEDUP FINDING (answer to "is there a speedup for parallelism in skewing?")
+Benchmark 2048x2048 recurrence, 14 cores:
+  unskewed serial   3.54 ms
+  skewed serial    16.09 ms   (~4.5x slower: parallelogram predicate + bigger
+                                bounding box + worse locality than row-major)
+  skewed parallel  374.29 ms  (~100x SLOWER: a parallel region spawned per
+                                anti-diagonal, ~4096 of them, tiny/varying width
+                                -> spawn overhead dominates the 2-add payload)
+=> Naive point-wise wavefront parallelism does NOT speed this up. The parallelism
+   is real/correct but too fine-grained + skew hurts locality. A real win needs
+   coarsening (wavefront/diamond TILING: skew then split/tile so each parallel
+   task is a block) and a heavier per-point body. That composition (reindex +
+   tile) is the natural follow-up.
+
+## NEXT: Toeplitz / sliding-window reuse (reindex a conv by k=x+r)
 Goal (user): "index bijection command" = given a stage + forward map (new = phi(old))
 and its inverse (old = phi^{-1}(new)) on the iteration space, rewrite the loop nest to
 iterate the IMAGE of phi and access via the inverse. Prototype affine SKEW on a

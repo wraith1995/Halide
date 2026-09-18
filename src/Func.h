@@ -68,6 +68,14 @@ struct Split;
 struct StorageDim;
 }  // namespace Internal
 
+/** Result of Stage::reindex(): the new reduction variables produced by an
+ * iteration-space bijection, and whether each is safe to parallelize under the
+ * resulting loop order (carries no loop-carried dependence). */
+struct ReindexResult {
+    std::vector<RVar> vars;
+    std::vector<bool> parallel_safe;
+};
+
 /** A single definition of a Func. May be a pure or update definition. */
 class Stage {
     /** Reference to the Function this stage (or definition) belongs to. */
@@ -216,10 +224,18 @@ public:
      * g(u, v - u). Any reduction-domain splits are materialized first.
      *
      * Built on the pure reduction-rewrite core; primarily a testbed for that API
-     * (e.g. skewing to expose wavefront parallelism). */
-    void reindex(const std::vector<Var> &new_vars,
-                 const std::vector<Expr> &forward,
-                 const std::vector<Expr> &inverse);
+     * (e.g. skewing to expose wavefront parallelism).
+     *
+     * Returns the new reduction variables (positionally, in 'new_vars' order) so
+     * they can be scheduled directly, together with a per-variable flag saying
+     * whether that dimension is safe to parallelize under the produced loop
+     * order (it carries no loop-carried dependence). The flags are computed by a
+     * dependence analysis of the update's self-references; when the analysis
+     * cannot prove a uniform affine dependence structure it conservatively
+     * reports every dimension as unsafe. */
+    ReindexResult reindex(const std::vector<Var> &new_vars,
+                          const std::vector<Expr> &forward,
+                          const std::vector<Expr> &inverse);
 
     /** Immediately inline direct calls to each of the given Funcs into this
      * stage's definition. The Funcs are inlined in dependency order regardless
