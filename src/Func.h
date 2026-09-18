@@ -193,6 +193,34 @@ public:
     Func rfactor(const RVar &r, const Var &v);
     // @}
 
+    /** (Experimental) Reindex the reduction domain of this update definition by
+     * an affine bijection phi of the iteration space. This is an "index
+     * bijection" directive: the loop nest is rewritten to iterate over the image
+     * of the current reduction domain under phi, and every access to the original
+     * coordinates is expressed through the inverse phi^{-1}.
+     *
+     * 'new_vars' name the new reduction loop variables (one per current
+     * reduction dimension, in positional correspondence; their names must be
+     * fresh -- they are Vars only so they can appear in the Exprs below without a
+     * bound domain). 'forward[j]' gives new_vars[j] as an Expr over the current
+     * RVars (used to bound the image), and 'inverse[i]' gives the i-th current
+     * RVar as an Expr over 'new_vars' (used to rewrite accesses). The new domain
+     * is the bounding box of the image with a predicate carving out exactly the
+     * original points, so for an associative/commutative reduction the result is
+     * unchanged.
+     *
+     * For example, skewing a 2D reduction with new_vars {u, v},
+     * forward {r.x, r.y + r.x}, inverse {u, v - u} rewrites
+     *   f() += g(r.x, r.y);
+     * to iterate (u, v) over the skewed (parallelogram) domain and accumulate
+     * g(u, v - u). Any reduction-domain splits are materialized first.
+     *
+     * Built on the pure reduction-rewrite core; primarily a testbed for that API
+     * (e.g. skewing to expose wavefront parallelism). */
+    void reindex(const std::vector<Var> &new_vars,
+                 const std::vector<Expr> &forward,
+                 const std::vector<Expr> &inverse);
+
     /** Immediately inline direct calls to each of the given Funcs into this
      * stage's definition. The Funcs are inlined in dependency order regardless
      * of the order they are passed, so if one inlined Func's body calls another,

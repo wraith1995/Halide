@@ -1609,6 +1609,100 @@ FuncVec Stage::hoist_invariants() {
     return intms;
 }
 
+void Stage::reindex(const vector<Var> &new_vars,
+                    const vector<Expr> &forward,
+                    const vector<Expr> &inverse) {
+    user_assert(!definition.is_init()) << "reindex() must be called on an update definition\n";
+    definition.schedule().touched() = true;
+
+    // Reindexing composes on top of a flat reduction domain: lower any
+    // reduction-domain splits first (Phase A), then reindex the plain domain.
+    materialize_reduction_domain(definition, name());
+
+    const ReductionStage in = read_reduction_stage(definition);
+    const size_t n = in.rvars.size();
+    user_assert(new_vars.size() == n && forward.size() == n && inverse.size() == n)
+        << "reindex() expects a square bijection: " << n << " new vars, forward, and "
+        << "inverse expressions to match the " << n << " reduction dimensions.\n";
+
+    // New var names must be fresh (disjoint from the current rvars), so the
+    // old->new substitutions below don't alias.
+    std::set<string> old_names;
+    for (const auto &rv : in.rvars) {
+        old_names.insert(rv.var);
+    }
+    for (const Var &v : new_vars) {
+        user_assert(!old_names.count(v.name()))
+            << "reindex() new var " << v.name() << " collides with an existing RVar; "
+            << "use fresh names.\n";
+    }
+
+    // Bounds of the current domain, for interval-evaluating the image.
+    Scope<Interval> old_bounds;
+    for (const auto &rv : in.rvars) {
+        old_bounds.push(rv.var, Interval{rv.min, rv.min + rv.extent - 1});
+    }
+
+    // Image bounding box: interval-evaluate each forward expression over the box.
+    vector<ReductionVariable> new_rvars(n);
+    for (size_t j = 0; j < n; j++) {
+        const Interval b = bounds_of_expr_in_scope(forward[j], old_bounds);
+        user_assert(b.is_bounded())
+            << "reindex(): could not bound new var " << new_vars[j].name()
+            << " from its forward map.\n";
+        new_rvars[j] = ReductionVariable{new_vars[j].name(), simplify(b.min),
+                                         simplify(b.max - b.min + 1)};
+    }
+    ReductionDomain new_rdom(new_rvars);
+
+    // Express the inverse over the new domain's RVars: old rvar i = phi^{-1}(new).
+    SubstitutionMap to_new_rvars;
+    for (size_t j = 0; j < n; j++) {
+        to_new_rvars[new_vars[j].name()] = RVar(new_rdom, (int)j);
+    }
+    SubstitutionMap inverse_map;
+    for (size_t i = 0; i < n; i++) {
+        inverse_map[in.rvars[i].var] = substitute(to_new_rvars, inverse[i]);
+    }
+
+    // Carve the image: the original box constraints, written in new coordinates,
+    // restrict the bounding box to exactly the original points (a bijection).
+    Expr image_pred;
+    for (size_t i = 0; i < n; i++) {
+        const Expr lo = in.rvars[i].min;
+        const Expr hi = in.rvars[i].min + in.rvars[i].extent - 1;
+        const Expr old_i = inverse_map[in.rvars[i].var];
+        const Expr c = (lo <= old_i) && (old_i <= hi);
+        image_pred = image_pred.defined() ? (image_pred && c) : c;
+    }
+    new_rdom.where(simplify(image_pred));
+    if (in.predicate.defined()) {
+        // Carry any existing predicate; it is in old-rvar terms and gets
+        // projected through the inverse by reindex_reduction_domain().
+        new_rdom.where(in.predicate);
+    }
+
+    // Rename each current rvar dim to its new rvar (positional correspondence),
+    // preserving the dim's other scheduling flags.
+    std::map<string, string> dim_rename;
+    for (size_t i = 0; i < n; i++) {
+        dim_rename[in.rvars[i].var] = new_vars[i].name();
+    }
+    vector<Dim> new_dims = in.dims;
+    for (Dim &d : new_dims) {
+        if (d.is_rvar()) {
+            const auto it = dim_rename.find(d.var);
+            if (it != dim_rename.end()) {
+                d.var = it->second;
+            }
+        }
+    }
+
+    write_reduction_stage(definition,
+                          reindex_reduction_domain(in, inverse_map, new_rdom,
+                                                   std::move(new_dims), in.splits));
+}
+
 void Stage::split(const string &old, const string &outer, const string &inner, const Expr &factor_arg, bool exact, TailStrategy tail) {
     debug(4) << "In schedule for " << name() << ", split " << old << " into "
              << outer << " and " << inner << " with factor of " << factor_arg << "\n";

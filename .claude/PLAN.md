@@ -61,7 +61,21 @@
   inverse) + dim rename, then reindex_reduction_domain does the rewrite.
 - Tests green.
 
-## NEXT: index-bijection / skew directive as a second client of the API
+## DONE (commit 7): index-bijection / skew directive (Stage::reindex)
+- Stage::reindex(new_vars(Var), forward, inverse): affine iteration-space bijection
+  on a reduction domain, built on reindex_reduction_domain.
+    * materializes reduction-domain splits first (composes with Phase A);
+    * image bounding box via bounds_of_expr_in_scope over the old box;
+    * predicate carves the parallelogram (original box constraints in new coords)
+      so it's a bijection onto exactly the original points;
+    * inverse rewrites accesses (old = phi^{-1}(new)); dims renamed positionally.
+- new_vars are Var (not RVar) so forward/inverse Exprs don't need a bound domain
+  (RVar->Expr requires defined bounds; caught that during bring-up).
+- test/correctness/reindex_skew.cpp (registered): skew, reverse-shear, identity;
+  all match the plain sum. Verified loop nest: v in [0,W-1+H-1], u in [0,W-1].
+- SECOND client validates the pure API generalizes beyond split-materialization.
+
+## NEXT: skewing for parallelism / Toeplitz (design + prototype)
 Goal (user): "index bijection command" = given a stage + forward map (new = phi(old))
 and its inverse (old = phi^{-1}(new)) on the iteration space, rewrite the loop nest to
 iterate the IMAGE of phi and access via the inverse. Prototype affine SKEW on a

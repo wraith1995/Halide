@@ -308,6 +308,7 @@ tests(
     realize_over_shifted_domain.cpp
     recursive_box_filters.cpp
     reduction_chain.cpp
+    reindex_skew.cpp
     reduction_non_rectangular.cpp
     reduction_predicate_racing.cpp
     reduction_schedule.cpp
