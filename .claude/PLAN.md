@@ -149,8 +149,26 @@ Tried: out(x) += wt(r)*in(x+r); reindex r -> k = x+r (inverse r = k-x) so in(x+r
   miscompiles it (serial reindexed schedule is still correct -> Halide lowering
   interaction, not a reindex bug). Diamond tiling assumes/pads tile-multiple sizes.
 
-## Branch state for review: 11 commits. reindex_skew, wavefront_skew, diamond_tile
-## registered and passing; rfactor + hoist_invariants unchanged and passing.
+## DONE (commit 12): fix the Halide solve bug + enable non-divisible diamond
+- Root cause (found by digging): NOT the partitioner. partition_loops is correct.
+  trim_no_ops relaxes a loop's no-op condition over an inner loop -> min(bv<0,bv<2)
+  (AND-of-bools as min); then solve_for_outer_interval(!min(...),bv) returned
+  [2,+inf) instead of [0,+inf). SolveForInterval (src/Solve.cpp) had visit(And/Or/
+  Not) but NO visit(Min)/visit(Max), so !min-of-bools wasn't De-Morgan'd.
+- FIX (src/Solve.cpp): add visit(Min)=And, visit(Max)=Or for bool operands
+  (mirrors the existing visit(Select)). ~14 lines.
+- Verified: solve_probe now [0,+inf); bug_repro both plain+likely correct;
+  diamond_tile extended with NON-divisible cases (16x12,17x13,23x19) -> Success.
+  Speedup intact (~2.2x T=64, maxerr 0).
+- No regressions: trim_no_ops, boundary_conditions, bad_likely, bounds,
+  bounds_inference(+complex), bounds_of_split, align_bounds, reduction_schedule,
+  argmax, histogram, vectorize_guard_with_if, multi_splits_with_diff_tail_strategies,
+  + rfactor/hoist/reindex/wavefront/diamond (all pass); fuzz_solve 8s clean.
+- Artifacts: .claude/BUG_REPORT.md (file-ready, min repro = solve_probe),
+  .claude/halide-solve-bug/{solve_probe.cpp,bug_repro.cpp,race_free_proof.py}.
+
+## Branch state for review: 12 commits. Halide solve bug FIXED; diamond parallel
+## works for arbitrary sizes; all reindex/rfactor/hoist tests + regressions pass.
 Goal (user): "index bijection command" = given a stage + forward map (new = phi(old))
 and its inverse (old = phi^{-1}(new)) on the iteration space, rewrite the loop nest to
 iterate the IMAGE of phi and access via the inverse. Prototype affine SKEW on a

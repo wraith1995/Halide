@@ -72,20 +72,20 @@ bool run(int W, int H, int T) {
 }  // namespace
 
 int main() {
-    // Interior extents (W-1, H-1) are chosen divisible by the tile size T. When
-    // they are not, the split emits a `likely` tail guard on the (now parallel)
-    // block index, and Halide's allow_race_conditions() + predicated-parallel-RVar
-    // lowering miscompiles it (the serial reindexed schedule is still correct --
-    // this is a lowering interaction, not a reindex bug). Diamond tiling normally
-    // pads/assumes tile-multiple extents, which is what we test here.
+    // Both tile-multiple and non-tile-multiple interior extents. The latter make
+    // the split emit a `likely` tail guard on the (parallel) block index; these
+    // used to miscompile via trim_no_ops / solve_for_outer_interval mishandling
+    // min/max of booleans (fixed in src/Solve.cpp).
     struct Case {
         int W, H, T;
     };
     const Case cases[] = {
-        {9, 9, 2},     // interior 8x8, T=2
-        {17, 9, 4},    // interior 16x8, T=4
-        {13, 13, 3},   // interior 12x12, T=3
-        {33, 17, 8},   // interior 32x16, T=8
+        {9, 9, 2},     // interior 8x8, T=2   (divisible)
+        {17, 9, 4},    // interior 16x8, T=4  (divisible)
+        {33, 17, 8},   // interior 32x16, T=8 (divisible)
+        {16, 12, 4},   // interior 15x11, T=4 (NON-divisible -> likely tail guard)
+        {17, 13, 4},   // interior 16x12, T=4 (mixed)
+        {23, 19, 8},   // interior 22x18, T=8 (NON-divisible)
         {5, 5, 4},     // one tile per axis (interior 4x4, T=4)
     };
     for (const Case &c : cases) {
