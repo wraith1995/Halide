@@ -785,61 +785,74 @@ pair<ReductionDomain, SubstitutionMap> project_rdom(const vector<Dim> &dims, con
 // Rvar references in the rewritten source are wrapped in bounds promises
 // carrying the original (pre-split) bounds, so bounds inference does not
 // over-estimate the reconstructed split indices (see below).
-void materialize_reduction_domain(Definition &def) {
-    StageSchedule &sched = def.schedule();
-
-    // Partition the recorded splits into those that touch the reduction domain
-    // and those that only touch pure Vars. Only the former are materialized.
-    // (This mirrors the partitioning in Stage::rfactor_validate_args.)
+// Partition a stage's recorded splits into those that touch the reduction
+// domain (rvar_splits) and those that only touch pure Vars (var_splits),
+// replaying them in schedule order. Fusing a pure Var into an RVar cannot be
+// factored and is rejected here with a user error. Shared reduction-schedule
+// primitive used to lower splits into the reduction domain (Phase A).
+pair<vector<Split>, vector<Split>>
+partition_reduction_splits(const StageSchedule &sched, const string &stage_name) {
     vector<Split> var_splits, rvar_splits;
-    {
-        Scope<> rdims;
-        for (const ReductionVariable &rv : sched.rvars()) {
-            rdims.push(rv.var);
-        }
-        for (const Split &split : sched.splits()) {
-            switch (split.split_type) {
-            case Split::SplitVar:
-                if (rdims.contains(split.old_var)) {
-                    rdims.pop(split.old_var);
-                    rdims.push(split.outer);
-                    rdims.push(split.inner);
-                    rvar_splits.push_back(split);
-                } else {
-                    var_splits.push_back(split);
-                }
-                break;
-            case Split::FuseVars:
-                if (rdims.contains(split.outer) || rdims.contains(split.inner)) {
-                    if (!(rdims.contains(split.outer) && rdims.contains(split.inner))) {
-                        // A Var was fused into an RVar, which rfactor cannot
-                        // handle. Bail out without mutating anything and let the
-                        // factoring phase's rfactor_validate_args() emit the
-                        // canonical user error (a user_error, not an internal
-                        // one). Materialization has made no changes yet, so this
-                        // is safe.
-                        return;
-                    }
-                    rdims.pop(split.outer);
-                    rdims.pop(split.inner);
-                    rdims.push(split.old_var);
-                    rvar_splits.push_back(split);
-                } else {
-                    var_splits.push_back(split);
-                }
-                break;
-            case Split::RenameVar:
-                if (rdims.contains(split.old_var)) {
-                    rdims.pop(split.old_var);
-                    rdims.push(split.outer);
-                    rvar_splits.push_back(split);
-                } else {
-                    var_splits.push_back(split);
-                }
-                break;
+    Scope<> rdims;
+    for (const ReductionVariable &rv : sched.rvars()) {
+        rdims.push(rv.var);
+    }
+    for (const Split &split : sched.splits()) {
+        switch (split.split_type) {
+        case Split::SplitVar:
+            if (rdims.contains(split.old_var)) {
+                rdims.pop(split.old_var);
+                rdims.push(split.outer);
+                rdims.push(split.inner);
+                rvar_splits.push_back(split);
+            } else {
+                var_splits.push_back(split);
             }
+            break;
+        case Split::FuseVars:
+            if (rdims.contains(split.outer) || rdims.contains(split.inner)) {
+                user_assert(rdims.contains(split.outer) && rdims.contains(split.inner))
+                    << "In schedule for " << stage_name << ": can't rfactor a Func "
+                    << "that has fused a Var into an RVar: " << split.outer
+                    << ", " << split.inner << "\n";
+                rdims.pop(split.outer);
+                rdims.pop(split.inner);
+                rdims.push(split.old_var);
+                rvar_splits.push_back(split);
+            } else {
+                var_splits.push_back(split);
+            }
+            break;
+        case Split::RenameVar:
+            if (rdims.contains(split.old_var)) {
+                rdims.pop(split.old_var);
+                rdims.push(split.outer);
+                rvar_splits.push_back(split);
+            } else {
+                var_splits.push_back(split);
+            }
+            break;
         }
     }
+    return {std::move(var_splits), std::move(rvar_splits)};
+}
+
+// Select the sub-ReductionDomain spanned by `dims` (a subset of `rdom`'s
+// dimensions), returning it together with a substitution rebinding each selected
+// rvar to the new domain's RVar. This is the split-free specialization of
+// project_rdom() used by the factoring phase once Phase A has flattened the
+// domain: there are no splits left to replay, so it is a pure filter + rename.
+pair<ReductionDomain, SubstitutionMap>
+select_subdomain(const vector<Dim> &dims, const ReductionDomain &rdom) {
+    return project_rdom(dims, rdom, {});
+}
+
+void materialize_reduction_domain(Definition &def, const string &stage_name) {
+    StageSchedule &sched = def.schedule();
+
+    // Lower every reduction-domain split into the flat leaf domain. Pure-Var
+    // splits are returned separately and left in the schedule untouched.
+    auto [var_splits, rvar_splits] = partition_reduction_splits(sched, stage_name);
 
     // Nothing touches the reduction domain: it is already flat, so the source
     // already refers to the leaf RVars 1:1. Leave the definition untouched.
@@ -902,17 +915,6 @@ void materialize_reduction_domain(Definition &def) {
     sched.rvars() = flat_rdom.domain();
     sched.dims() = project(sched.dims());
     sched.splits() = var_splits;
-}
-
-// Shared entry point for the experimental two-phase mode used by both
-// rfactor() and hoist_invariants(). When HL_MATERIALIZE_REDUCTION_DOMAIN is
-// set, both directives first lower all reduction-domain loop transformations
-// into the definition (Phase A) and then run their existing factoring logic on
-// the resulting flat, split-free reduction.
-void maybe_materialize_reduction_domain(Definition &def) {
-    if (!get_env_variable("HL_MATERIALIZE_REDUCTION_DOMAIN").empty()) {
-        materialize_reduction_domain(def);
-    }
 }
 
 // A semiring distributive law used by hoist_invariants(): `inner` distributes
@@ -1102,7 +1104,7 @@ Expr apply_hoisted_factor(const Expr &r, const optional<HoistedFactor> &factor) 
 
 }  // namespace
 
-pair<vector<Split>, vector<Split>> Stage::rfactor_validate_args(const std::vector<std::pair<RVar, Var>> &preserved, const AssociativeOp &prover_result) {
+void Stage::rfactor_validate_args(const std::vector<std::pair<RVar, Var>> &preserved, const AssociativeOp &prover_result) {
     const vector<Dim> &dims = definition.schedule().dims();
 
     user_assert(prover_result.associative())
@@ -1148,52 +1150,10 @@ pair<vector<Split>, vector<Split>> Stage::rfactor_validate_args(const std::vecto
         }
     }
 
-    // Check that no Vars were fused into RVars
-    vector<Split> var_splits, rvar_splits;
-    Scope<> rdims;
-    for (const ReductionVariable &rv : definition.schedule().rvars()) {
-        rdims.push(rv.var);
-    }
-    for (const Split &split : definition.schedule().splits()) {
-        switch (split.split_type) {
-        case Split::SplitVar:
-            if (rdims.contains(split.old_var)) {
-                rdims.pop(split.old_var);
-                rdims.push(split.outer);
-                rdims.push(split.inner);
-                rvar_splits.emplace_back(split);
-            } else {
-                var_splits.emplace_back(split);
-            }
-            break;
-        case Split::FuseVars:
-            if (rdims.contains(split.outer) || rdims.contains(split.inner)) {
-                user_assert(rdims.contains(split.outer) && rdims.contains(split.inner))
-                    << "In schedule for " << name() << ": can't rfactor an Func "
-                    << "that has fused a Var into an RVar: " << split.outer
-                    << ", " << split.inner << "\n"
-                    << dump_argument_list();
-
-                rdims.pop(split.outer);
-                rdims.pop(split.inner);
-                rdims.push(split.old_var);
-                rvar_splits.emplace_back(split);
-            } else {
-                var_splits.emplace_back(split);
-            }
-            break;
-        case Split::RenameVar:
-            if (rdims.contains(split.old_var)) {
-                rdims.pop(split.old_var);
-                rdims.push(split.outer);
-                rvar_splits.emplace_back(split);
-            } else {
-                var_splits.emplace_back(split);
-            }
-            break;
-        }
-    }
-    return std::make_pair(std::move(var_splits), std::move(rvar_splits));
+    // Note: reduction-domain splits (and the "Var fused into an RVar" check)
+    // are handled up front by materialize_reduction_domain() /
+    // partition_reduction_splits(), so by the time we get here the schedule
+    // holds only pure-Var splits. This routine is now validation-only.
 }
 
 Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
@@ -1201,18 +1161,21 @@ Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
 
     definition.schedule().touched() = true;
 
-    // Two-phase mode (experimental): first apply all reduction-domain loop
-    // transformations to the definition, so that the factoring logic below
-    // operates on a plain, split-free reduction. The partitioning/projection
-    // below then sees no rvar splits and degrades to a pure domain split +
-    // rename. See materialize_reduction_domain().
-    maybe_materialize_reduction_domain(definition);
+    // Phase A: lower every reduction-domain loop transformation into the
+    // definition, so the factoring logic below operates on a plain, split-free
+    // reduction (the projections below then reduce to filter + rename). Pure-Var
+    // splits are left in the schedule. See materialize_reduction_domain().
+    materialize_reduction_domain(definition, name());
 
     // Check whether the operator is associative and determine the operator and
     // its identity for each value in the definition if it is a Tuple
     const auto &prover_result = prove_associativity(function.name(), definition.args(), definition.values());
 
-    const auto &[var_splits, rvar_splits] = rfactor_validate_args(preserved, prover_result);
+    rfactor_validate_args(preserved, prover_result);
+
+    // Phase A has consumed all reduction-domain splits; only pure-Var splits
+    // remain, and those are carried through onto both generated stages.
+    const vector<Split> var_splits = definition.schedule().splits();
 
     const vector<Expr> dim_vars_exprs = [&] {
         vector<Expr> result;
@@ -1272,7 +1235,7 @@ Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
 
     {
         // Intermediate
-        std::tie(intermediate_rdom, intermediate_map) = project_rdom(intermediate_rdims, rdom, rvar_splits);
+        std::tie(intermediate_rdom, intermediate_map) = select_subdomain(intermediate_rdims, rdom);
         for (size_t i = 0; i < preserved.size(); i++) {
             add_let(intermediate_map, preserved_rdims[i].var, preserved_vars[i]);
         }
@@ -1283,7 +1246,7 @@ Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
         }
 
         // Preserved
-        std::tie(preserved_rdom, preserved_map) = project_rdom(preserved_rdims, rdom, rvar_splits);
+        std::tie(preserved_rdom, preserved_map) = select_subdomain(preserved_rdims, rdom);
         Scope<Interval> intm_rdom;
         for (size_t i = 0; i < intermediate_rdom.domain().size(); i++) {
             const auto &var = intermediate_rdims[i].var;
@@ -1424,17 +1387,21 @@ FuncVec Stage::hoist_invariants() {
 
     definition.schedule().touched() = true;
 
-    // Two-phase mode (experimental): share rfactor()'s Phase A so hoisting also
-    // operates on a flat, split-free reduction. The intermediates then reduce
-    // over the materialized leaf rvars directly, and the write-back eliminates
-    // them via the (flat) reduction_bounds below. See
+    // Phase A: share rfactor()'s reduction-domain materialization so hoisting
+    // also operates on a flat, split-free reduction. The intermediates then
+    // reduce over the materialized leaf rvars directly, and the write-back
+    // eliminates them via the (flat) reduction_bounds below. See
     // materialize_reduction_domain().
-    maybe_materialize_reduction_domain(definition);
+    materialize_reduction_domain(definition, name());
 
     // Check whether the operator is associative and determine the operator and
     // its identity for each value in the definition if it is a Tuple.
     const auto &prover_result = prove_associativity(function.name(), definition.args(), definition.values());
-    const auto &[var_splits, _] = rfactor_validate_args({}, prover_result);
+    rfactor_validate_args({}, prover_result);
+
+    // Phase A has consumed all reduction-domain splits; only pure-Var splits
+    // remain in the schedule.
+    const vector<Split> var_splits = definition.schedule().splits();
 
     const vector<Expr> dim_vars_exprs(dim_vars.begin(), dim_vars.end());
 

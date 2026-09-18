@@ -91,7 +91,7 @@ class Stage {
 
     Stage &compute_with(LoopLevel loop_level, const std::map<std::string, LoopAlignStrategy> &align);
 
-    std::pair<std::vector<Internal::Split>, std::vector<Internal::Split>>
+    void
     rfactor_validate_args(const std::vector<std::pair<RVar, Var>> &preserved, const Internal::AssociativeOp &prover_result);
 
 public:

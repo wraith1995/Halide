@@ -1,5 +1,48 @@
 # PLAN — Two-phase rfactor experiment (branch: experiment/rfactor-two-phase)
 
+## Repo / PR
+- Private repo: github.com/wraith1995/halide-experiments (origin). upstream=halide/Halide.
+- Internal PR #1: experiment/rfactor-two-phase -> main (isCrossRepository=false).
+- Commit 1 (9a8ac02f4): two-phase materialization, env-gated.
+
+## DONE (commit 2): Phase A default + dead code deleted + first isolation
+- Phase A now unconditional (env gate removed); materialize_reduction_domain(def, name()).
+- rfactor_validate_args() is validation-only (returns void); dead split-partition removed.
+  rfactor/hoist read var_splits = schedule().splits() (Phase A leaves only pure splits).
+- Extracted shared reduction-schedule primitives (anon namespace in Func.cpp):
+    * partition_reduction_splits(sched, stage_name) -> {var,rvar}; owns the
+      "Var fused into RVar" user error (canonical msg preserved; verified exit 1).
+    * select_subdomain(dims, rdom) = project_rdom(dims, rdom, {}) -- the split-free
+      filter+rename used by Phase B; project_rdom keeps full split handling for Phase A.
+    * materialize_reduction_domain shared by rfactor() + hoist_invariants().
+- Func.h: rfactor_validate_args declaration updated to void.
+- Tests: correctness_rfactor 0, correctness_hoist_invariants 0, error test exit 1
+  ("...fused a Var into an RVar: y, r$z").
+
+## STILL TODO (isolation, next commits)
+- Extract shared write-back/reducing dim-list builder (drop rvar dims not in `keep`,
+  re-insert missing pure Vars for histogram) used by rfactor (reducing_dims, keep=
+  preserved) and hoist (writeback_dims, keep={}).
+- Possibly a sub-schedule builder (copy schedule + set dims/rvars/splits).
+
+## (superseded) original NEXT plan
+Step A [make default + delete dead code]:
+  - Remove env gate: maybe_materialize_reduction_domain always materializes.
+  - Move the "Var fused into RVar" user_error into Phase A (needs stage-name ctx);
+    Phase A currently BAILS expecting rfactor_validate_args to catch it.
+  - Delete the split-partition loop from rfactor_validate_args (now validation-only;
+    rvar_splits always empty after Phase A). rfactor/hoist read var_splits =
+    schedule().splits() directly (Phase A leaves only pure splits there).
+  - Phase B project_rdom calls now always pass empty splits (degenerate filter+rename).
+    NOTE: project_rdom's split-replay is NOT dead -- Phase A uses it with real splits.
+Step B [isolate reusable schedule ops]:
+  - partition_reduction_splits(StageSchedule&) -> {var,rvar} (used by Phase A).
+  - select_subdomain(dims, rdom) = project_rdom(dims, rdom, {}) for Phase B.
+  - build_reduction_dims / writeback-dim builder shared by rfactor + hoist
+    (drop rvar dims, keep preserved, histogram pure-dim insertion).
+  - Verify correctness_rfactor + correctness_hoist_invariants + error test after each.
+
+
 ## Goal
 Reimplement Stage::rfactor as two decoupled phases:
 - Phase A `materialize_reduction_domain(Definition&)`: apply ALL rvar-affecting
