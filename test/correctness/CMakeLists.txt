@@ -111,6 +111,7 @@ tests(
     div_round_to_zero.cpp
     downsampling_reduce.cpp
     dynamic_allocation_in_gpu_kernel.cpp
+    diamond_tile.cpp
     dynamic_reduction_bounds.cpp
     eager_inline.cpp
     early_out.cpp

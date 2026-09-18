@@ -130,7 +130,26 @@ Tried: out(x) += wt(r)*in(x+r); reindex r -> k = x+r (inverse r = k-x) so in(x+r
    explicit O(N^2) Toeplitz matrix (no reuse win). So: defer to the storage-side
    bijection (which the user deferred) for real Toeplitz.
 
-## Branch state for review: 9 commits + this finding. reindex_skew + wavefront_skew
+## DONE (commit 11): diamond (wavefront) tiling -> REAL SPEEDUP
+- Added reindex loop_order param: sets the new rvar loop order directly, bypassing
+  reorder()'s assoc/comm check on RVars (which refuses recurrence reorders). This
+  lets reindex produce dependence-legal orders reorder() can't (e.g. diamond).
+- Diamond tiling = split(r.x)/split(r.y) then reindex a 4D bijection skewing the
+  BLOCK indices: bv = rxo+ryo (block anti-diagonal, serial), nyo = ryo (block
+  position, PARALLEL), nxi/nyi within-block; loop_order {nxi,nyi,nyo,bv}.
+  Refer to split leaves by name-matched Var placeholders (leaves are schedule-only).
+- test/correctness/diamond_tile.cpp (registered): divisible interior extents, with
+  parallel, all correct.
+- SPEEDUP (compute-heavy recurrence, 2049x2049, 14 cores):
+    serial 35.5 ms; diamond T=32 12.4 ms (2.86x); T=64 11.2 ms (3.18x); bit-exact.
+  (Cheap 2-add recurrence: diamond fixes the 100x point-wise disaster -> ~par with
+   serial, since it's memory-bandwidth-bound. Speedup needs a compute-bound body.)
+- LIMITATION: non-divisible extents emit a `likely` split tail guard on the now-
+  parallel block index; allow_race_conditions()+predicated-parallel-RVar lowering
+  miscompiles it (serial reindexed schedule is still correct -> Halide lowering
+  interaction, not a reindex bug). Diamond tiling assumes/pads tile-multiple sizes.
+
+## Branch state for review: 11 commits. reindex_skew, wavefront_skew, diamond_tile
 ## registered and passing; rfactor + hoist_invariants unchanged and passing.
 Goal (user): "index bijection command" = given a stage + forward map (new = phi(old))
 and its inverse (old = phi^{-1}(new)) on the iteration space, rewrite the loop nest to

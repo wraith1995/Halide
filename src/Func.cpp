@@ -1787,7 +1787,8 @@ vector<bool> reindex_parallel_safe(const ReductionStage &in,
 
 ReindexResult Stage::reindex(const vector<Var> &new_vars,
                              const vector<Expr> &forward,
-                             const vector<Expr> &inverse) {
+                             const vector<Expr> &inverse,
+                             const vector<Var> &loop_order) {
     user_assert(!definition.is_init()) << "reindex() must be called on an update definition\n";
     definition.schedule().touched() = true;
 
@@ -1872,6 +1873,33 @@ ReindexResult Stage::reindex(const vector<Var> &new_vars,
                 d.var = it->second;
             }
         }
+    }
+
+    // Optionally set the loop order directly (innermost first). This lets reindex
+    // produce dependence-legal orders that reorder() would refuse for RVars.
+    if (!loop_order.empty()) {
+        std::map<string, Dim> by_name;
+        for (const Dim &d : new_dims) {
+            by_name.emplace(d.var, d);
+        }
+        std::set<string> placed;
+        vector<Dim> ordered;
+        for (const Var &v : loop_order) {
+            const auto it = by_name.find(v.name());
+            user_assert(it != by_name.end())
+                << "reindex(): loop_order names " << v.name()
+                << ", which is not one of the new reduction dims.\n";
+            ordered.push_back(it->second);
+            placed.insert(v.name());
+        }
+        // Keep any unmentioned dims (e.g. pure Vars) in their original order,
+        // placed outermost.
+        for (const Dim &d : new_dims) {
+            if (!placed.count(d.var)) {
+                ordered.push_back(d);
+            }
+        }
+        new_dims = std::move(ordered);
     }
 
     // Dependence check: which new dims are safe to parallelize under this order.

@@ -232,10 +232,18 @@ public:
      * order (it carries no loop-carried dependence). The flags are computed by a
      * dependence analysis of the update's self-references; when the analysis
      * cannot prove a uniform affine dependence structure it conservatively
-     * reports every dimension as unsafe. */
+     * reports every dimension as unsafe.
+     *
+     * 'loop_order', if non-empty, sets the loop order of the new reduction dims
+     * directly (innermost first), bypassing the associativity/commutativity
+     * check reorder() applies to RVars -- reindex may legally produce loop orders
+     * (e.g. a diamond-tiled wavefront) that reorder() would refuse. The caller is
+     * responsible for the order being dependence-legal. New rvars omitted from
+     * loop_order keep their relative order, placed outermost. */
     ReindexResult reindex(const std::vector<Var> &new_vars,
                           const std::vector<Expr> &forward,
-                          const std::vector<Expr> &inverse);
+                          const std::vector<Expr> &inverse,
+                          const std::vector<Var> &loop_order = {});
 
     /** Immediately inline direct calls to each of the given Funcs into this
      * stage's definition. The Funcs are inlined in dependency order regardless
