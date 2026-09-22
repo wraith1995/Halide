@@ -903,19 +903,28 @@ pair<vector<Split>, vector<Split>> Stage::rfactor_validate_args(const std::vecto
 // ============================================================================
 namespace {
 
-struct RFactorProjection {
-    const SubstitutionMap &rdom_promises;
-    const SubstitutionMap &vars;
+// The change-of-variables core shared by every reindex directive. It rewrites
+// Exprs (and renames dims) that reference a set of "old" coordinate variables
+// into new coordinates: `inverse` maps each old variable name to an Expr over the
+// new variables (old = phi^{-1}(new)). If `promises` is non-empty, each old
+// variable is first wrapped in promise_clamped with its original bounds, so a
+// reconstructed (possibly wider) index keeps a tight range for bounds inference.
+// reindex_reduction_domain() carries a definition's args/values/predicate through
+// it (with bounds promises on the reduction leaves); reindex_storage() rewrites a
+// pure definition's values through it (no promises needed).
+struct ChangeOfVars {
+    const SubstitutionMap &promises;
+    const SubstitutionMap &inverse;
 
     template<typename T>
     T operator()(const T &x) const {
-        return substitute(vars, substitute(rdom_promises, x));
+        return substitute(inverse, substitute(promises, x));
     }
 
     vector<Dim> operator()(const vector<Dim> &dims) const {
         auto new_dims = dims;
         for (auto &dim : new_dims) {
-            if (const auto it = vars.find(dim.var); it != vars.end()) {
+            if (const auto it = inverse.find(dim.var); it != inverse.end()) {
                 const Variable *new_var = it->second.as<Variable>();
                 internal_assert(new_var);
                 dim.var = new_var->name;
@@ -1075,7 +1084,7 @@ ReductionStage reindex_reduction_domain(const ReductionStage &in,
                                         vector<Split> new_splits) {
     const ReductionDomain old_rdom{in.rvars, in.predicate, true};
     const SubstitutionMap promises = reduction_bounds_promises(old_rdom);
-    RFactorProjection project{promises, inverse};
+    ChangeOfVars project{promises, inverse};
 
     ReductionStage out;
     out.args = project(in.args);
@@ -1119,7 +1128,7 @@ void materialize_reduction_domain(Definition &def, const string &stage_name) {
     // The leaf dims are renamed to the flat domain's rvars (each leaf maps to a
     // single new RVar, so the dims-overload of the projector is a pure rename).
     const SubstitutionMap promises = reduction_bounds_promises(rdom);
-    RFactorProjection rename{promises, inverse};
+    ChangeOfVars rename{promises, inverse};
     vector<Dim> new_dims = rename(in.dims);
 
     write_reduction_stage(def, reindex_reduction_domain(in, inverse, flat_rdom,
@@ -3921,20 +3930,20 @@ Func Func::reindex_storage(const std::vector<Var> &new_vars,
         << "forward, and inverse expressions to match the " << n << " pure "
         << "dimensions of " << name() << ".\n";
 
-    // old pure var i = phi^{-1}(new), for rewriting the value into new coords.
-    std::map<std::string, Expr> to_old;
+    // old pure var i = phi^{-1}(new): the same change of variables used by the
+    // reduction path (reindex_reduction_domain), here with no bounds promises --
+    // a pure store's reconstructed indices carry no rvar range to preserve.
+    std::map<std::string, Expr> inverse_map, no_promises;
     for (size_t i = 0; i < n; i++) {
-        to_old[old_names[i]] = inverse[i];
+        inverse_map[old_names[i]] = inverse[i];
     }
+    const ChangeOfVars to_new_coords{no_promises, inverse_map};
 
     // The reindexed store: f_storage(new) holds this Func's value at phi^{-1}(new).
     const size_t arity = func.values().size();
     Func fs(name() + "_storage");
     {
-        vector<Expr> vals = func.values();
-        for (Expr &v : vals) {
-            v = substitute(to_old, v);
-        }
+        vector<Expr> vals = to_new_coords(func.values());
         vector<Var> fs_args(new_vars);
         if (arity == 1) {
             fs(fs_args) = vals[0];
