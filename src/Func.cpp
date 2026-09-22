@@ -893,6 +893,410 @@ pair<vector<Split>, vector<Split>> Stage::rfactor_validate_args(const std::vecto
     return std::make_pair(std::move(var_splits), std::move(rvar_splits));
 }
 
+// ============================================================================
+// reindex(): affine iteration-space bijection on a reduction domain.
+// Ported onto the inductive-function substrate. Helpers below reuse this TU's
+// existing rfactor internals (project_rdom, add_let, substitute_self_reference,
+// promise_clamped).
+// ============================================================================
+namespace {
+
+struct RFactorProjection {
+    const SubstitutionMap &rdom_promises;
+    const SubstitutionMap &vars;
+
+    template<typename T>
+    T operator()(const T &x) const {
+        return substitute(vars, substitute(rdom_promises, x));
+    }
+
+    vector<Dim> operator()(const vector<Dim> &dims) const {
+        auto new_dims = dims;
+        for (auto &dim : new_dims) {
+            if (const auto it = vars.find(dim.var); it != vars.end()) {
+                const Variable *new_var = it->second.as<Variable>();
+                internal_assert(new_var);
+                dim.var = new_var->name;
+            }
+        }
+        return new_dims;
+    }
+};
+
+// Partition a stage's recorded splits into those that touch the reduction
+// domain (rvar_splits) and those that only touch pure Vars (var_splits),
+// replaying them in schedule order. Fusing a pure Var into an RVar cannot be
+// factored and is rejected here with a user error. Shared reduction-schedule
+// primitive used to lower splits into the reduction domain (Phase A).
+pair<vector<Split>, vector<Split>>
+partition_reduction_splits(const StageSchedule &sched, const string &stage_name) {
+    vector<Split> var_splits, rvar_splits;
+    Scope<> rdims;
+    for (const ReductionVariable &rv : sched.rvars()) {
+        rdims.push(rv.var);
+    }
+    for (const Split &split : sched.splits()) {
+        switch (split.split_type) {
+        case Split::SplitVar:
+            if (rdims.contains(split.old_var)) {
+                rdims.pop(split.old_var);
+                rdims.push(split.outer);
+                rdims.push(split.inner);
+                rvar_splits.push_back(split);
+            } else {
+                var_splits.push_back(split);
+            }
+            break;
+        case Split::FuseVars:
+            if (rdims.contains(split.outer) || rdims.contains(split.inner)) {
+                user_assert(rdims.contains(split.outer) && rdims.contains(split.inner))
+                    << "In schedule for " << stage_name << ": can't rfactor a Func "
+                    << "that has fused a Var into an RVar: " << split.outer
+                    << ", " << split.inner << "\n";
+                rdims.pop(split.outer);
+                rdims.pop(split.inner);
+                rdims.push(split.old_var);
+                rvar_splits.push_back(split);
+            } else {
+                var_splits.push_back(split);
+            }
+            break;
+        case Split::RenameVar:
+            if (rdims.contains(split.old_var)) {
+                rdims.pop(split.old_var);
+                rdims.push(split.outer);
+                rvar_splits.push_back(split);
+            } else {
+                var_splits.push_back(split);
+            }
+            break;
+        }
+    }
+    return {std::move(var_splits), std::move(rvar_splits)};
+}
+
+// Overwrite the loop structure of a stage schedule -- its dim list, reduction
+// variables, and splits -- leaving every other scheduling decision
+// (parallelism, vectorization, fusion, storage, etc.) intact. This is the
+// common tail of rewriting a reduction stage: once the new domain and dim order
+// are known, they are stamped onto the schedule here.
+void set_loop_structure(StageSchedule &sched,
+                        vector<Dim> dims,
+                        vector<ReductionVariable> rvars,
+                        vector<Split> splits) {
+    sched.dims() = std::move(dims);
+    sched.rvars() = std::move(rvars);
+    sched.splits() = std::move(splits);
+}
+
+// ----------------------------------------------------------------------------
+// Reduction-rewrite API (pure core)
+//
+// A small vocabulary for rewriting one associative update definition, shared by
+// every reduction-domain-manipulating directive (rfactor's Phase A, and any
+// iteration-space bijection such as skew). The core, reindex_reduction_domain(),
+// is a pure function of plain data: it maps a ReductionStage to a new one and
+// mutates nothing.
+// ----------------------------------------------------------------------------
+
+// A pure snapshot of the parts of one update definition that a reduction rewrite
+// reads and writes: the algorithm side (args/values/predicate) and the loop
+// structure (dims/rvars/splits).
+struct ReductionStage {
+    vector<Expr> args;
+    vector<Expr> values;
+    Expr predicate;
+    vector<Dim> dims;
+    vector<ReductionVariable> rvars;
+    vector<Split> splits;
+};
+
+ReductionStage read_reduction_stage(const Definition &def) {
+    const StageSchedule &s = def.schedule();
+    return {def.args(), def.values(), def.predicate(), s.dims(), s.rvars(), s.splits()};
+}
+
+void write_reduction_stage(Definition &def, ReductionStage stage) {
+    def.args() = std::move(stage.args);
+    def.values() = std::move(stage.values);
+    def.predicate() = std::move(stage.predicate);
+    set_loop_structure(def.schedule(), std::move(stage.dims),
+                       std::move(stage.rvars), std::move(stage.splits));
+}
+
+// Wrap each rvar of `rdom` in a bounds promise carrying its (tight) bounds. When
+// composed before an index rewrite, this keeps the promise on the reconstructed
+// (possibly wider) index expression, so bounds inference does not over-estimate.
+SubstitutionMap reduction_bounds_promises(const ReductionDomain &rdom) {
+    SubstitutionMap promises;
+    for (int i = 0; i < (int)rdom.domain().size(); i++) {
+        const auto &[var, min, extent] = rdom.domain()[i];
+        promises.emplace(var, promise_clamped(RVar(rdom, i), min, min + extent - 1));
+    }
+    return promises;
+}
+
+// Strip reduction-domain back-pointers from a predicate so it refers to its
+// rvars by name only, as a stored definition predicate must (see
+// DropSelfReferences in Reduction.cpp); otherwise re-homing it into a freshly
+// built ReductionDomain trips the "predicate may only refer to its own RVars"
+// check.
+Expr drop_rvar_domains(const Expr &e) {
+    return mutate_with(e, [](auto *self, const Variable *v) -> Expr {
+        if (v->reduction_domain.defined()) {
+            return Variable::make(v->type, v->name);
+        }
+        return v;
+    });
+}
+
+// Pure reduction rewrite: reindex an update's reduction domain by an
+// iteration-space bijection phi, given its inverse.
+//
+// `inverse` maps each ORIGINAL rvar name to an Expr over the NEW rvars, i.e.
+// original = phi^{-1}(new). Original rvars are wrapped in promise_clamped() with
+// their original (tight) bounds before substitution, so the reconstructed
+// indices keep the tight original range for bounds inference.
+//
+// `new_rdom`'s predicate() supplies the predicate to carry: it may reference
+// original rvars (projected through `inverse`) and/or new rvars (left as-is) --
+// e.g. a carried .where(), split-tail guards, or the image of the old box under
+// phi. `new_dims` is the new loop order (already expressed over the new rvars
+// and any pure Vars) and `new_splits` the surviving pure-Var splits.
+//
+// Nothing is mutated; args/values in the result reference the new rvars and the
+// predicate refers to its rvars by name only.
+ReductionStage reindex_reduction_domain(const ReductionStage &in,
+                                        const SubstitutionMap &inverse,
+                                        const ReductionDomain &new_rdom,
+                                        vector<Dim> new_dims,
+                                        vector<Split> new_splits) {
+    const ReductionDomain old_rdom{in.rvars, in.predicate, true};
+    const SubstitutionMap promises = reduction_bounds_promises(old_rdom);
+    RFactorProjection project{promises, inverse};
+
+    ReductionStage out;
+    out.args = project(in.args);
+    out.values = project(in.values);
+    out.predicate = drop_rvar_domains(simplify(project(new_rdom.predicate())));
+    out.dims = std::move(new_dims);
+    out.rvars = new_rdom.domain();
+    out.splits = std::move(new_splits);
+    return out;
+}
+
+void materialize_reduction_domain(Definition &def, const string &stage_name) {
+    StageSchedule &sched = def.schedule();
+
+    // Lower every reduction-domain split into the flat leaf domain. Pure-Var
+    // splits stay in the schedule untouched.
+    auto [var_splits, rvar_splits] = partition_reduction_splits(sched, stage_name);
+
+    // Nothing touches the reduction domain: it is already flat, so the source
+    // already refers to the leaf RVars 1:1. Leave the definition untouched.
+    if (rvar_splits.empty()) {
+        return;
+    }
+
+    // The reduction leaf dims, in their current (post-split, post-reorder) order.
+    vector<Dim> rvar_dims;
+    for (const Dim &dim : sched.dims()) {
+        if (dim.is_rvar()) {
+            rvar_dims.push_back(dim);
+        }
+    }
+
+    // The split machinery (project_rdom -> apply_split) supplies the new (flat)
+    // domain and the inverse map from each original rvar to its expression in the
+    // new leaf rvars (r.x -> 8*rxo + rxi). That inverse is exactly what the
+    // reduction rewrite consumes, so materialization is just an instance of it.
+    const ReductionStage in = read_reduction_stage(def);
+    const ReductionDomain rdom{in.rvars, in.predicate, true};
+    auto [flat_rdom, inverse] = project_rdom(rvar_dims, rdom, rvar_splits);
+
+    // The leaf dims are renamed to the flat domain's rvars (each leaf maps to a
+    // single new RVar, so the dims-overload of the projector is a pure rename).
+    const SubstitutionMap promises = reduction_bounds_promises(rdom);
+    RFactorProjection rename{promises, inverse};
+    vector<Dim> new_dims = rename(in.dims);
+
+    write_reduction_stage(def, reindex_reduction_domain(in, inverse, flat_rdom,
+                                                        std::move(new_dims), var_splits));
+}
+
+// If `e` is an integer-affine function of `vars`, return its coefficients (one
+// per var, in order) followed by the constant term; otherwise nullopt.
+optional<vector<int64_t>> affine_int_coeffs(const Expr &e, const vector<string> &vars) {
+    std::map<string, Expr> zero;
+    for (const string &v : vars) {
+        zero[v] = 0;
+    }
+    const Expr c0 = simplify(substitute(zero, e));
+    const auto cc = as_const_int(c0);
+    if (!cc) {
+        return std::nullopt;
+    }
+    vector<int64_t> coeffs;
+    Expr recon = make_const(Int(32), *cc);
+    for (const string &v : vars) {
+        std::map<string, Expr> one = zero;
+        one[v] = 1;
+        const Expr cj = simplify(substitute(one, e) - c0);
+        const auto ci = as_const_int(cj);
+        if (!ci) {
+            return std::nullopt;
+        }
+        coeffs.push_back(*ci);
+        recon = recon + make_const(Int(32), *ci) * Variable::make(Int(32), v);
+    }
+    if (!is_const_zero(simplify(e - recon))) {
+        return std::nullopt;  // not affine
+    }
+    coeffs.push_back(*cc);
+    return coeffs;
+}
+
+// Collect the argument lists of every self-reference to `func_name` in `values`.
+vector<vector<Expr>> collect_self_ref_args(const vector<Expr> &values, const string &func_name) {
+    class Collector : public IRVisitor {
+        using IRVisitor::visit;
+        void visit(const Call *op) override {
+            IRVisitor::visit(op);
+            if (op->call_type == Call::Halide && op->name == func_name) {
+                refs.push_back(op->args);
+            }
+        }
+
+    public:
+        const string &func_name;
+        vector<vector<Expr>> refs;
+        explicit Collector(const string &fn)
+            : func_name(fn) {
+        }
+    } c(func_name);
+    for (const Expr &v : values) {
+        v.accept(&c);
+    }
+    return c.refs;
+}
+
+// Dependence analysis for reindex(). Given the pre-rewrite stage `in`, the Func
+// name, the forward map, the new rvar names and the produced (renamed) dim list,
+// decide for each new reduction dim whether it is safe to parallelize -- i.e. it
+// carries no loop-carried dependence under the produced loop order. Handles the
+// uniform-affine recurrence shape (LHS args = rvar_i + const, self-refs =
+// rvar_i + const); returns all-false if it cannot prove that shape.
+vector<bool> reindex_parallel_safe(const ReductionStage &in,
+                                   const string &func_name,
+                                   const vector<Expr> &forward,
+                                   const vector<Var> &new_vars,
+                                   const vector<Dim> &new_dims) {
+    const size_t n = in.rvars.size();
+    vector<bool> unsafe(n, true);  // conservative default: nothing is safe
+
+    vector<string> old_names;
+    for (const auto &rv : in.rvars) {
+        old_names.push_back(rv.var);
+    }
+
+    // LHS must write f at rvar_i + const_i (a shifted identity), and there must
+    // be one output arg per reduction dim.
+    if (in.args.size() != n) {
+        return vector<bool>(n, false);
+    }
+    vector<int64_t> lhs_const(n);
+    for (size_t i = 0; i < n; i++) {
+        const auto c = affine_int_coeffs(in.args[i], old_names);
+        if (!c) {
+            return vector<bool>(n, false);
+        }
+        for (size_t k = 0; k < n; k++) {
+            if ((*c)[k] != (k == i ? 1 : 0)) {
+                return vector<bool>(n, false);
+            }
+        }
+        lhs_const[i] = (*c)[n];
+    }
+
+    // Uniform dependence vectors from the self-references: dep_i = L_const - R_const
+    // for a self-ref whose i-th arg is rvar_i + R_const_i.
+    vector<vector<int64_t>> deps;
+    for (const vector<Expr> &args : collect_self_ref_args(in.values, func_name)) {
+        if (args.size() != n) {
+            return vector<bool>(n, false);
+        }
+        vector<int64_t> d(n);
+        for (size_t i = 0; i < n; i++) {
+            const auto c = affine_int_coeffs(args[i], old_names);
+            if (!c) {
+                return vector<bool>(n, false);
+            }
+            for (size_t k = 0; k < n; k++) {
+                if ((*c)[k] != (k == i ? 1 : 0)) {
+                    return vector<bool>(n, false);
+                }
+            }
+            d[i] = lhs_const[i] - (*c)[n];
+        }
+        deps.push_back(d);
+    }
+
+    // Forward Jacobian J (rows = new dims, cols = old dims).
+    vector<vector<int64_t>> J(n);
+    for (size_t j = 0; j < n; j++) {
+        const auto c = affine_int_coeffs(forward[j], old_names);
+        if (!c) {
+            return vector<bool>(n, false);
+        }
+        J[j].assign(c->begin(), c->begin() + n);
+    }
+
+    // Loop level of each new rvar (0 = outermost). new_dims is innermost-first.
+    std::map<string, int> loop_level;
+    int level = 0;
+    for (auto it = new_dims.rbegin(); it != new_dims.rend(); ++it) {
+        loop_level[it->var] = level++;
+    }
+    vector<int> level_of_new(n);
+    for (size_t j = 0; j < n; j++) {
+        level_of_new[j] = loop_level.at(new_vars[j].name());
+    }
+
+    // For each dependence, the outermost new dim with a nonzero component carries
+    // it (and must be positive for the loop order to be legal).
+    std::fill(unsafe.begin(), unsafe.end(), false);
+    for (const vector<int64_t> &d : deps) {
+        vector<int64_t> nd(n, 0);
+        for (size_t j = 0; j < n; j++) {
+            for (size_t k = 0; k < n; k++) {
+                nd[j] += J[j][k] * d[k];
+            }
+        }
+        int carry = -1, carry_level = (int)n + 1;
+        for (size_t j = 0; j < n; j++) {
+            if (nd[j] != 0 && level_of_new[j] < carry_level) {
+                carry_level = level_of_new[j];
+                carry = (int)j;
+            }
+        }
+        if (carry >= 0) {
+            unsafe[carry] = true;
+            if (nd[carry] < 0) {
+                user_warning << "reindex(): the resulting loop order violates a "
+                             << "dependence (a dependence vector is lexicographically "
+                             << "negative); the schedule may be incorrect.\n";
+            }
+        }
+    }
+
+    vector<bool> safe(n);
+    for (size_t j = 0; j < n; j++) {
+        safe[j] = !unsafe[j];
+    }
+    return safe;
+}
+
+}  // namespace
 Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
     user_assert(!definition.is_init()) << "rfactor() must be called on an update definition\n";
 
@@ -1110,6 +1514,139 @@ Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
     }
 
     return intm;
+}
+
+ReindexResult Stage::reindex(const vector<Var> &new_vars,
+                             const vector<Expr> &forward,
+                             const vector<Expr> &inverse,
+                             const vector<Var> &loop_order) {
+    user_assert(!definition.is_init()) << "reindex() must be called on an update definition\n";
+    definition.schedule().touched() = true;
+
+    // Reindexing composes on top of a flat reduction domain: lower any
+    // reduction-domain splits first (Phase A), then reindex the plain domain.
+    materialize_reduction_domain(definition, name());
+
+    const ReductionStage in = read_reduction_stage(definition);
+    const size_t n = in.rvars.size();
+    user_assert(new_vars.size() == n && forward.size() == n && inverse.size() == n)
+        << "reindex() expects a square bijection: " << n << " new vars, forward, and "
+        << "inverse expressions to match the " << n << " reduction dimensions.\n";
+
+    // New var names must be fresh (disjoint from the current rvars), so the
+    // old->new substitutions below don't alias.
+    std::set<string> old_names;
+    for (const auto &rv : in.rvars) {
+        old_names.insert(rv.var);
+    }
+    for (const Var &v : new_vars) {
+        user_assert(!old_names.count(v.name()))
+            << "reindex() new var " << v.name() << " collides with an existing RVar; "
+            << "use fresh names.\n";
+    }
+
+    // Bounds of the current domain, for interval-evaluating the image.
+    Scope<Interval> old_bounds;
+    for (const auto &rv : in.rvars) {
+        old_bounds.push(rv.var, Interval{rv.min, rv.min + rv.extent - 1});
+    }
+
+    // Image bounding box: interval-evaluate each forward expression over the box.
+    vector<ReductionVariable> new_rvars(n);
+    for (size_t j = 0; j < n; j++) {
+        const Interval b = bounds_of_expr_in_scope(forward[j], old_bounds);
+        user_assert(b.is_bounded())
+            << "reindex(): could not bound new var " << new_vars[j].name()
+            << " from its forward map.\n";
+        new_rvars[j] = ReductionVariable{new_vars[j].name(), simplify(b.min),
+                                         simplify(b.max - b.min + 1)};
+    }
+    ReductionDomain new_rdom(new_rvars);
+
+    // Express the inverse over the new domain's RVars: old rvar i = phi^{-1}(new).
+    SubstitutionMap to_new_rvars;
+    for (size_t j = 0; j < n; j++) {
+        to_new_rvars[new_vars[j].name()] = RVar(new_rdom, (int)j);
+    }
+    SubstitutionMap inverse_map;
+    for (size_t i = 0; i < n; i++) {
+        inverse_map[in.rvars[i].var] = substitute(to_new_rvars, inverse[i]);
+    }
+
+    // Carve the image: the original box constraints, written in new coordinates,
+    // restrict the bounding box to exactly the original points (a bijection).
+    Expr image_pred;
+    for (size_t i = 0; i < n; i++) {
+        const Expr lo = in.rvars[i].min;
+        const Expr hi = in.rvars[i].min + in.rvars[i].extent - 1;
+        const Expr old_i = inverse_map[in.rvars[i].var];
+        const Expr c = (lo <= old_i) && (old_i <= hi);
+        image_pred = image_pred.defined() ? (image_pred && c) : c;
+    }
+    new_rdom.where(simplify(image_pred));
+    if (in.predicate.defined()) {
+        // Carry any existing predicate; it is in old-rvar terms and gets
+        // projected through the inverse by reindex_reduction_domain().
+        new_rdom.where(in.predicate);
+    }
+
+    // Rename each current rvar dim to its new rvar (positional correspondence),
+    // preserving the dim's other scheduling flags.
+    std::map<string, string> dim_rename;
+    for (size_t i = 0; i < n; i++) {
+        dim_rename[in.rvars[i].var] = new_vars[i].name();
+    }
+    vector<Dim> new_dims = in.dims;
+    for (Dim &d : new_dims) {
+        if (d.is_rvar()) {
+            const auto it = dim_rename.find(d.var);
+            if (it != dim_rename.end()) {
+                d.var = it->second;
+            }
+        }
+    }
+
+    // Optionally set the loop order directly (innermost first). This lets reindex
+    // produce dependence-legal orders that reorder() would refuse for RVars.
+    if (!loop_order.empty()) {
+        std::map<string, Dim> by_name;
+        for (const Dim &d : new_dims) {
+            by_name.emplace(d.var, d);
+        }
+        std::set<string> placed;
+        vector<Dim> ordered;
+        for (const Var &v : loop_order) {
+            const auto it = by_name.find(v.name());
+            user_assert(it != by_name.end())
+                << "reindex(): loop_order names " << v.name()
+                << ", which is not one of the new reduction dims.\n";
+            ordered.push_back(it->second);
+            placed.insert(v.name());
+        }
+        // Keep any unmentioned dims (e.g. pure Vars) in their original order,
+        // placed outermost.
+        for (const Dim &d : new_dims) {
+            if (!placed.count(d.var)) {
+                ordered.push_back(d);
+            }
+        }
+        new_dims = std::move(ordered);
+    }
+
+    // Dependence check: which new dims are safe to parallelize under this order.
+    const vector<bool> parallel_safe =
+        reindex_parallel_safe(in, function.name(), forward, new_vars, new_dims);
+
+    write_reduction_stage(definition,
+                          reindex_reduction_domain(in, inverse_map, new_rdom,
+                                                   std::move(new_dims), in.splits));
+
+    ReindexResult result;
+    for (size_t j = 0; j < n; j++) {
+        result.vars.push_back(RVar(new_rdom, (int)j));
+    }
+    result.parallel_safe = parallel_safe;
+    return result;
 }
 
 void Stage::split(const string &old, const string &outer, const string &inner, const Expr &factor_arg, bool exact, TailStrategy tail) {

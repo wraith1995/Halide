@@ -99,6 +99,7 @@ tests(
     device_copy_at_inner_loop.cpp
     device_crop.cpp
     device_slice.cpp
+    diamond_tile.cpp
     dilate3x3.cpp
     div_by_zero.cpp
     div_round_to_zero.cpp
@@ -311,6 +312,7 @@ tests(
     reduction_predicate_racing.cpp
     reduction_schedule.cpp
     register_shuffle.cpp
+    reindex_skew.cpp
     reorder_storage.cpp
     require.cpp
     reschedule.cpp
@@ -420,6 +422,7 @@ tests(
     vectorized_initialization.cpp
     vectorized_load_from_vectorized_allocation.cpp
     vectorized_reduction_bug.cpp
+    wavefront_skew.cpp
     widening_reduction.cpp
     wmma_matmul.cpp
     wmma_row_max.cpp
