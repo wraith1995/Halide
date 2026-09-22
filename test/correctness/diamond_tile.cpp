@@ -54,7 +54,9 @@ bool run(int W, int H, int T) {
         {lxi, lxo + lyo, lyi, lyo},
         {nxi, bv - nyo, nyi, nyo},
         {nxi, nyi, nyo, bv});
-    f.update().allow_race_conditions().parallel(res.vars[3]);  // nyo
+    // nyo (block position on the anti-diagonal) was classified a PureRVar by
+    // reindex(), so it parallelizes without allow_race_conditions().
+    f.update().parallel(res.vars[3]);  // nyo
 
     Buffer<int> out = f.realize({W, H});
     for (int y = 0; y < H; y++) {

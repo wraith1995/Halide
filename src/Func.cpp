@@ -37,6 +37,7 @@
 #include "LLVM_Output.h"
 #include "Lower.h"
 #include "Param.h"
+#include "ParallelRVar.h"
 #include "PrintLoopNest.h"
 #include "RealizationOrder.h"
 #include "Simplify.h"
@@ -1633,13 +1634,73 @@ ReindexResult Stage::reindex(const vector<Var> &new_vars,
         new_dims = std::move(ordered);
     }
 
-    // Dependence check: which new dims are safe to parallelize under this order.
-    const vector<bool> parallel_safe =
-        reindex_parallel_safe(in, function.name(), forward, new_vars, new_dims);
+    // Emit a warning if the requested loop order violates a uniform-affine
+    // dependence (best effort; silent on shapes it can't analyze, e.g. tiled).
+    (void)reindex_parallel_safe(in, function.name(), forward, new_vars, new_dims);
 
     write_reduction_stage(definition,
                           reindex_reduction_domain(in, inverse_map, new_rdom,
                                                    std::move(new_dims), in.splits));
+
+    // Classify each new axis for parallel safety using Halide's own race
+    // analysis, so a parallelizable axis becomes a PureRVar and .parallel()
+    // needs no allow_race_conditions() -- valid Halide by construction. The
+    // dependence-carrying axes are the serial ones; treating them as serial
+    // (shared across threads, exactly as an inductive dimension is) is what lets
+    // an orthogonal axis be proven race-free.
+    vector<bool> parallel_safe(n, false);
+    {
+        // Run the analysis on a promise-stripped copy: reindex wraps the
+        // reconstructed indices in promise_clamped() to keep bounds inference
+        // tight, but those tags hide the affine access pattern from
+        // can_parallelize_rvar(). The stored definition keeps its promises.
+        Definition race_def = definition.get_copy();
+        for (Expr &a : race_def.args()) {
+            a = remove_promises(a);
+        }
+        for (Expr &v : race_def.values()) {
+            v = remove_promises(v);
+        }
+        if (race_def.predicate().defined()) {
+            race_def.predicate() = remove_promises(race_def.predicate());
+        }
+
+        auto parallelizable = [&](size_t j, const std::set<string> &serial) {
+            return can_parallelize_rvar(new_vars[j].name(), function.name(),
+                                        race_def, serial);
+        };
+
+        // Pass 1: an axis that races even when every other axis is serial is
+        // itself a serial (dependence-carrying) axis.
+        std::set<string> serial_set;
+        for (size_t j = 0; j < n; j++) {
+            std::set<string> others;
+            for (size_t k = 0; k < n; k++) {
+                if (k != j) {
+                    others.insert(new_vars[k].name());
+                }
+            }
+            if (!parallelizable(j, others)) {
+                serial_set.insert(new_vars[j].name());
+            }
+        }
+        // Pass 2: a non-serial axis is parallel-safe iff it is race-free with
+        // exactly the serial set shared -- so two axes that are each safe only
+        // when the other is serial are not both reported safe.
+        for (size_t j = 0; j < n; j++) {
+            if (!serial_set.count(new_vars[j].name())) {
+                parallel_safe[j] = parallelizable(j, serial_set);
+            }
+        }
+        for (Dim &d : definition.schedule().dims()) {
+            for (size_t j = 0; j < n; j++) {
+                if (d.var == new_vars[j].name()) {
+                    d.dim_type = parallel_safe[j] ? DimType::PureRVar
+                                                  : DimType::ImpureRVar;
+                }
+            }
+        }
+    }
 
     ReindexResult result;
     for (size_t j = 0; j < n; j++) {

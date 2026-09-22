@@ -41,11 +41,13 @@ Buffer<int> compute(const Buffer<int> &in, int mode) {
         if (mode == 2) {
             // Parallelize every dimension the dependence check proved safe. For
             // this skew that is exactly u (the intra-anti-diagonal index); v,
-            // which carries the wavefront dependence, is left serial.
+            // which carries the wavefront dependence, is left serial. reindex()
+            // classified u as a PureRVar (treating v as serial in the race
+            // analysis), so no allow_race_conditions() is needed.
             bool any = false;
             for (size_t k = 0; k < res.vars.size(); k++) {
                 if (res.parallel_safe[k]) {
-                    f.update().allow_race_conditions().parallel(res.vars[k]);
+                    f.update().parallel(res.vars[k]);
                     any = true;
                 }
             }
