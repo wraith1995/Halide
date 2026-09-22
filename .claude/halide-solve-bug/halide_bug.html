@@ -1,0 +1,373 @@
+<title>Halide Solve Min/Max Bug</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --bg: #eef0f4;
+    --surface: #ffffff;
+    --surface-2: #f4f5f8;
+    --ink: #191c24;
+    --muted: #5c6270;
+    --faint: #878d9b;
+    --border: #dfe2e9;
+    --border-strong: #c9ceda;
+    --accent: #4f46e5;
+    --accent-soft: #ecebfd;
+    --bug: #b6362b;
+    --bug-soft: #fbecea;
+    --ok: #1c7a4d;
+    --ok-soft: #e6f4ec;
+    --code-bg: #f5f6f9;
+    --code-ink: #22262f;
+    --shadow: 0 1px 2px rgba(20, 24, 40, .06), 0 8px 24px rgba(20, 24, 40, .05);
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  }
+  :root:not([data-theme="light"]) {
+    @media (prefers-color-scheme: dark) {
+      --bg: #0e1015;
+      --surface: #161922;
+      --surface-2: #1b1f2a;
+      --ink: #e7e9ee;
+      --muted: #9aa1b0;
+      --faint: #6f7686;
+      --border: #262b37;
+      --border-strong: #333a49;
+      --accent: #8f8cf8;
+      --accent-soft: #211f3a;
+      --bug: #f0796c;
+      --bug-soft: #2a1a18;
+      --ok: #55cc8e;
+      --ok-soft: #10241a;
+      --code-bg: #10131a;
+      --code-ink: #cdd2dc;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 10px 30px rgba(0, 0, 0, .35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1015;
+    --surface: #161922;
+    --surface-2: #1b1f2a;
+    --ink: #e7e9ee;
+    --muted: #9aa1b0;
+    --faint: #6f7686;
+    --border: #262b37;
+    --border-strong: #333a49;
+    --accent: #8f8cf8;
+    --accent-soft: #211f3a;
+    --bug: #f0796c;
+    --bug-soft: #2a1a18;
+    --ok: #55cc8e;
+    --ok-soft: #10241a;
+    --code-bg: #10131a;
+    --code-ink: #cdd2dc;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 10px 30px rgba(0, 0, 0, .35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 800px; margin: 0 auto; padding: 20px; }
+
+  /* sticky nav */
+  nav {
+    position: sticky;
+    top: env(safe-area-inset-top, 0px);
+    z-index: 5;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  nav .inner {
+    max-width: 800px; margin: 0 auto;
+    padding: 10px 20px;
+    display: flex; align-items: center; gap: 8px 18px; flex-wrap: wrap;
+  }
+  nav .brand { font-family: var(--mono); font-weight: 600; font-size: 13px; letter-spacing: -.01em; margin-right: auto; }
+  nav a { color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; }
+  nav a:hover { color: var(--accent); }
+  nav a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+
+  header.hero { padding: 34px 0 10px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; font-weight: 500;
+    letter-spacing: .12em; text-transform: uppercase; color: var(--faint);
+  }
+  h1 {
+    font-size: clamp(28px, 6vw, 40px); line-height: 1.08; font-weight: 700;
+    letter-spacing: -.02em; text-wrap: balance; margin: 12px 0 14px;
+  }
+  h1 .mono { font-family: var(--mono); font-weight: 600; }
+  .lede { font-size: 18px; color: var(--muted); max-width: 62ch; margin: 0; text-wrap: pretty; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 20px 0 4px; }
+  .chip {
+    font-family: var(--mono); font-size: 12px; font-weight: 500;
+    padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border-strong);
+    color: var(--muted); background: var(--surface); white-space: nowrap;
+  }
+  .chip.bug { color: var(--bug); border-color: color-mix(in srgb, var(--bug) 40%, var(--border)); background: var(--bug-soft); }
+
+  section { margin: 40px 0; scroll-margin-top: 64px; }
+  h2 {
+    font-size: 13px; font-family: var(--mono); text-transform: uppercase;
+    letter-spacing: .1em; color: var(--accent); font-weight: 600;
+    margin: 0 0 6px; display: flex; align-items: baseline; gap: 10px;
+  }
+  h2 .n { color: var(--faint); }
+  .sec-title { font-size: 24px; font-weight: 600; letter-spacing: -.015em; margin: 0 0 18px; text-wrap: balance; }
+  p { margin: 0 0 14px; max-width: 66ch; }
+  p.tight { margin-bottom: 8px; }
+  code.inl { font-family: var(--mono); font-size: .88em; background: var(--surface-2); border: 1px solid var(--border); padding: .06em .38em; border-radius: 5px; color: var(--code-ink); }
+
+  /* expected / actual contrast */
+  .contrast { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 18px 0; }
+  .cell { border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; background: var(--surface); box-shadow: var(--shadow); }
+  .cell .k { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+  .cell .v { font-family: var(--mono); font-size: 21px; font-weight: 600; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .cell.good { border-color: color-mix(in srgb, var(--ok) 35%, var(--border)); background: var(--ok-soft); }
+  .cell.good .v { color: var(--ok); }
+  .cell.bad { border-color: color-mix(in srgb, var(--bug) 35%, var(--border)); background: var(--bug-soft); }
+  .cell.bad .v { color: var(--bug); }
+
+  /* code blocks */
+  figure.code { margin: 16px 0; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--code-bg); box-shadow: var(--shadow); }
+  figure.code figcaption {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 14px; border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 12px; color: var(--muted); background: var(--surface-2);
+  }
+  figure.code figcaption .path { color: var(--ink); font-weight: 500; }
+  figure.code figcaption .diff-add { color: var(--ok); margin-left: auto; }
+  button.copy {
+    margin-left: auto; font-family: var(--mono); font-size: 11px; letter-spacing: .04em;
+    color: var(--muted); background: transparent; border: 1px solid var(--border-strong);
+    border-radius: 6px; padding: 3px 9px; cursor: pointer;
+  }
+  figcaption .diff-add + button.copy { margin-left: 12px; }
+  button.copy:hover { color: var(--accent); border-color: var(--accent); }
+  button.copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  pre { margin: 0; padding: 15px 16px; overflow-x: auto; }
+  pre code { font-family: var(--mono); font-size: 13.5px; line-height: 1.62; color: var(--code-ink); white-space: pre; }
+  .cm { color: var(--faint); font-style: italic; }
+  .ad { color: var(--ok); }
+  .em { color: var(--bug); }
+
+  /* labeled field list (issue form) */
+  .fields { display: flex; flex-direction: column; gap: 2px; }
+  .field { display: grid; grid-template-columns: 190px 1fr; gap: 6px 20px; padding: 12px 0; border-top: 1px solid var(--border); }
+  .field .lab { font-family: var(--mono); font-size: 12px; letter-spacing: .04em; color: var(--faint); text-transform: uppercase; padding-top: 2px; }
+  .field .val { font-size: 15.5px; }
+  .field .val .mono { font-family: var(--mono); }
+
+  /* checklist */
+  ul.check { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  ul.check li { display: flex; gap: 11px; align-items: flex-start; font-size: 15px; }
+  ul.check .box { flex: none; width: 18px; height: 18px; border-radius: 5px; border: 1.5px solid var(--border-strong); display: grid; place-items: center; margin-top: 2px; font-size: 12px; color: var(--surface); }
+  ul.check .box.on { background: var(--ok); border-color: var(--ok); }
+  ul.check .na { color: var(--faint); font-family: var(--mono); font-size: 12px; }
+
+  .callout { border-left: 3px solid var(--accent); background: var(--surface); border-radius: 0 10px 10px 0; padding: 14px 18px; margin: 16px 0; box-shadow: var(--shadow); }
+  .callout .h { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+  .callout.warn { border-left-color: var(--bug); }
+
+  /* validation stats */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 8px 0; }
+  .stat { border: 1px solid var(--border); border-radius: 12px; padding: 16px; background: var(--surface); box-shadow: var(--shadow); }
+  .stat .big { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.02em; color: var(--ok); }
+  .stat .cap { font-size: 13px; color: var(--muted); margin-top: 3px; }
+  .stat .sub { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-top: 6px; }
+
+  .rule { height: 1px; background: var(--border); border: 0; margin: 40px 0; }
+  footer { color: var(--faint); font-size: 13px; font-family: var(--mono); padding: 8px 0 20px; }
+  footer a { color: var(--muted); }
+
+  @media (max-width: 560px) {
+    .contrast { grid-template-columns: 1fr; }
+    .field { grid-template-columns: 1fr; gap: 3px; }
+    .field .lab { padding-top: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+  html { scroll-behavior: smooth; }
+</style>
+
+<nav>
+  <div class="inner">
+    <span class="brand">halide/Halide</span>
+    <a href="#bug">Bug</a>
+    <a href="#issue">Issue</a>
+    <a href="#pr">Pull request</a>
+    <a href="#validation">Validation</a>
+  </div>
+</nav>
+
+<div class="wrap">
+  <header class="hero">
+    <div class="eyebrow">Compiler correctness · loop lowering</div>
+    <h1><code class="mono">solve_for_interval</code> mishandles min/max of booleans</h1>
+    <p class="lede">A missing De&nbsp;Morgan case in <code class="inl">SolveForInterval</code> makes <code class="inl">trim_no_ops</code> shrink a serial loop to a single iteration — a silent wrong-output miscompile. One localized fix; full local suite green.</p>
+    <div class="chips">
+      <span class="chip bug">bug</span>
+      <span class="chip">Halide::Internal</span>
+      <span class="chip">main @ d33fd254f</span>
+      <span class="chip">LLVM 21</span>
+      <span class="chip">arm-64-osx</span>
+    </div>
+  </header>
+
+  <section id="bug">
+    <h2><span class="n">01</span> The defect</h2>
+    <div class="sec-title">A negated boolean <code class="inl">min</code> solves to the wrong interval</div>
+    <p><code class="inl">SolveForInterval</code> (<code class="inl">src/Solve.cpp</code>) implements <code class="inl">visit(And)</code>, <code class="inl">visit(Or)</code>, <code class="inl">visit(Not)</code> and <code class="inl">visit(Select)</code>, but not <code class="inl">visit(Min)</code>&nbsp;/&nbsp;<code class="inl">visit(Max)</code>. Boolean <code class="inl">min</code>/<code class="inl">max</code> — the <code class="inl">&amp;&amp;</code>/<code class="inl">||</code> encodings that <code class="inl">and_condition_over_domain</code> and the simplifier both emit — aren&rsquo;t recognized as connectives, so <code class="inl">Not</code> fails to distribute over them.</p>
+    <p class="tight">Since <code class="inl">min(x&lt;0, x&lt;2)</code> ≡ <code class="inl">x&lt;0</code>, the negation ≡ <code class="inl">x&gt;=0</code>, so it must solve to <code class="inl">[0,&nbsp;+∞)</code>:</p>
+    <div class="contrast">
+      <div class="cell good">
+        <div class="k">Expected</div>
+        <div class="v">[0, +∞)</div>
+      </div>
+      <div class="cell bad">
+        <div class="k">Actual</div>
+        <div class="v">[2, +∞)</div>
+      </div>
+    </div>
+    <p>It behaves as if <code class="inl">!min(a,b)</code> were <code class="inl">!a &amp;&amp; !b</code> instead of <code class="inl">!a || !b</code>. Downstream, <code class="inl">trim_no_ops</code> builds a loop&rsquo;s no-op condition by relaxing over inner loops with <code class="inl">and_condition_over_domain</code> (producing exactly such a <code class="inl">min</code>), then trims via <code class="inl">solve_for_outer_interval</code> — so a <strong>serial</strong> loop gets trimmed to a single iteration and real work is dropped. A wavefront/diamond-tiled recurrence with a <code class="inl">GuardWithIf</code> (<code class="inl">likely</code>) split tail over a non-tile-multiple extent then produces wrong output under parallelism.</p>
+  </section>
+
+  <hr class="rule">
+
+  <section id="issue">
+    <h2><span class="n">02</span> Issue &middot; bug report</h2>
+    <div class="sec-title">Filed against the <code class="inl">bug-report</code> template</div>
+
+    <figure class="code">
+      <figcaption><span class="path">Reproducing case</span><span>C++</span><button class="copy" type="button">Copy</button></figcaption>
+<pre><code>#include "Halide.h"
+#include "Solve.h"  <span class="cm">// Halide::Internal</span>
+#include &lt;iostream&gt;
+
+using namespace Halide;
+using namespace Halide::Internal;
+
+int main() {
+    Expr x = Variable::make(Int(32), "x");
+
+    <span class="cm">// min(x&lt;0, x&lt;2) == (x&lt;0), so !min(...) == (x&gt;=0) =&gt; must be [0, +inf)</span>
+    Interval i = solve_for_outer_interval(!min(x &lt; 0, x &lt; 2), "x");
+    std::cout &lt;&lt; "[" &lt;&lt; simplify(i.min) &lt;&lt; ", " &lt;&lt; simplify(i.max) &lt;&lt; "]\n";
+    <span class="cm">// Expected: [0, +inf)</span>
+    <span class="em">// Actual:   [2, +inf)</span>
+
+    <span class="cm">// Equivalent forms both solve correctly, confirming the discrepancy:</span>
+    solve_for_outer_interval(x &gt;= 0, "x");     <span class="cm">// [0, +inf)</span>
+    solve_for_outer_interval(!(x &lt; 0), "x");   <span class="cm">// [0, +inf)</span>
+    return 0;
+}</code></pre>
+    </figure>
+
+    <div class="fields">
+      <div class="field"><div class="lab">Description</div><div class="val"><code class="inl">solve_for_outer_interval</code>/<code class="inl">solve_for_inner_interval</code> return a wrong interval for a negated boolean <code class="inl">min</code>/<code class="inl">max</code>; surfaces as a silent miscompile through <code class="inl">trim_no_ops</code>.</div></div>
+      <div class="field"><div class="lab">How obtained</div><div class="val">Built from source</div></div>
+      <div class="field"><div class="lab">Halide version</div><div class="val"><span class="mono">22.0.0</span></div></div>
+      <div class="field"><div class="lab">Halide commit</div><div class="val"><span class="mono">d33fd254f</span></div></div>
+      <div class="field"><div class="lab">Target</div><div class="val"><span class="mono">arm-64-osx</span> — target-independent</div></div>
+      <div class="field"><div class="lab">Operating system</div><div class="val">macOS (arm64)</div></div>
+      <div class="field"><div class="lab">Additional context</div><div class="val"><code class="inl">simplify(min(x&lt;0, x&lt;2))</code> also does not fold to <code class="inl">x&lt;0</code>. End-to-end it is wrong output, not a crash; the parallel schedule that triggers it is provably race-free, so it is a miscompile rather than a race.</div></div>
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <section id="pr">
+    <h2><span class="n">03</span> Pull request &middot; the fix</h2>
+    <div class="sec-title">Treat boolean <code class="inl">min</code>/<code class="inl">max</code> as <code class="inl">And</code>/<code class="inl">Or</code></div>
+    <p>Add <code class="inl">visit(Min)</code>/<code class="inl">visit(Max)</code> to <code class="inl">SolveForInterval</code>, rewriting a boolean <code class="inl">min</code>&nbsp;→&nbsp;<code class="inl">And</code> and <code class="inl">max</code>&nbsp;→&nbsp;<code class="inl">Or</code> and re-solving — exactly as the existing <code class="inl">visit(Select)</code> already does — so <code class="inl">Not</code> distributes correctly.</p>
+
+    <figure class="code">
+      <figcaption><span class="path">src/Solve.cpp</span><span class="diff-add">+16</span><button class="copy" type="button">Copy</button></figcaption>
+<pre><code><span class="ad">void visit(const Min *op) override {
+    // min of bools is a logical And. These arise from
+    // and_condition_over_domain and the simplifier. Treat it as such so
+    // that Not distributes correctly (otherwise !min(a, b) is mis-solved).
+    internal_assert(op-&gt;type.is_bool());
+    Expr equiv = op-&gt;a &amp;&amp; op-&gt;b;
+    equiv.accept(this);
+}
+
+void visit(const Max *op) override {
+    // max of bools is a logical Or.
+    internal_assert(op-&gt;type.is_bool());
+    Expr equiv = op-&gt;a || op-&gt;b;
+    equiv.accept(this);
+}</span></code></pre>
+    </figure>
+
+    <figure class="code">
+      <figcaption><span class="path">test/correctness/solve.cpp</span><span class="diff-add">+14</span><button class="copy" type="button">Copy</button></figcaption>
+<pre><code><span class="cm">// min(x&lt;0, x&lt;2) == (x&lt;0), so !min(...) == (x&gt;=0):</span>
+<span class="ad">check_outer_interval(!min(x &lt; 0, x &lt; 2), 0, Interval::pos_inf());</span>
+<span class="ad">check_inner_interval(!min(x &lt; 0, x &lt; 2), 0, Interval::pos_inf());</span>
+<span class="cm">// max(x&lt;0, x&lt;2) == (x&lt;2), so !max(...) == (x&gt;=2):</span>
+<span class="ad">check_outer_interval(!max(x &lt; 0, x &lt; 2), 2, Interval::pos_inf());</span>
+<span class="ad">check_outer_interval(min(x &lt; 5, x &lt; 9), Interval::neg_inf(), 4);</span>
+<span class="ad">check_outer_interval(max(x &lt; 5, x &lt; 9), Interval::neg_inf(), 8);</span></code></pre>
+    </figure>
+
+    <p style="margin-top:18px"><span style="font-family:var(--mono);font-size:13px;color:var(--faint)">BREAKING CHANGES</span><br>None — confined to <code class="inl">Halide::Internal</code>; no <code class="inl">Halide::</code> public API change.</p>
+
+    <ul class="check">
+      <li><span class="box on">✓</span><span>Tests added or updated <span class="na">— test/correctness/solve.cpp</span></span></li>
+      <li><span class="box on">✓</span><span>Commits include AI attribution <span class="na">— Co-authored-by trailer</span></span></li>
+      <li><span class="box">&nbsp;</span><span>Documentation updated <span class="na">— N/A, Internal only</span></span></li>
+      <li><span class="box">&nbsp;</span><span>Python bindings updated <span class="na">— N/A, Internal only</span></span></li>
+      <li><span class="box">&nbsp;</span><span>Benchmarks included <span class="na">— N/A, correctness fix</span></span></li>
+    </ul>
+  </section>
+
+  <hr class="rule">
+
+  <section id="validation">
+    <h2><span class="n">04</span> Validation</h2>
+    <div class="sec-title">On pristine <code class="inl">main</code> + the fix</div>
+    <p>Confirmed the bug is present on unmodified <code class="inl">main</code> (<code class="inl">!min(x&lt;0,x&lt;2)</code> → <code class="inl">[2,+∞)</code>) and fixed afterward, then ran the suites locally (LLVM&nbsp;21, macOS&nbsp;arm64).</p>
+    <div class="stats">
+      <div class="stat"><div class="big">471 / 471</div><div class="cap">correctness</div><div class="sub">GPU tests skipped — no device</div></div>
+      <div class="stat"><div class="big">168 / 168</div><div class="cap">error + warning</div><div class="sub">ctest, all pass</div></div>
+      <div class="stat"><div class="big">clean</div><div class="cap">solve fuzzer</div><div class="sub">8s, many seeds</div></div>
+      <div class="stat"><div class="big">0 diff</div><div class="cap">clang-format</div><div class="sub">21.1.8, both files</div></div>
+    </div>
+    <div class="callout warn">
+      <div class="h">Before filing publicly</div>
+      The fix commit carries a <code class="inl">Co-authored-by</code> trailer (satisfies Halide&rsquo;s AI-attribution rule) and an extra <code class="inl">Claude-Session:</code> trailer with a private session URL — recommend stripping the session line from the upstream commit.
+    </div>
+  </section>
+
+  <footer>
+    Prepared for <span style="color:var(--muted)">halide/Halide</span> · issue → PR (Fixes&nbsp;#) · branch <span style="color:var(--muted)">fix/solve-min-max-bool</span>
+  </footer>
+</div>
+
+<script>
+  document.querySelectorAll("button.copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var pre = btn.closest("figure").querySelector("pre code");
+      var text = pre ? pre.innerText : "";
+      try {
+        navigator.clipboard.writeText(text).then(function () {
+          var old = btn.textContent;
+          btn.textContent = "Copied";
+          setTimeout(function () { btn.textContent = old; }, 1400);
+        }).catch(function () { btn.textContent = "Copy failed"; });
+      } catch (e) {
+        btn.textContent = "Copy failed";
+      }
+    });
+  });
+</script>

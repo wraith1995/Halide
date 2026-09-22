@@ -1,3 +1,52 @@
+# ===================== RESUME / CURRENT STATE (2026-09-22) =====================
+# Two parallel tracks. Read this block first after a compaction.
+#
+# TRACK A — Upstream Halide bug fix (DONE except user-side filing):
+#   Bug: SolveForInterval (src/Solve.cpp) lacked visit(Min)/visit(Max); boolean
+#   min/max (which and_condition_over_domain + simplifier emit as &&/||) weren't
+#   De-Morgan'd, so solve_for_outer_interval(!min(x<0,x<2)) gave [2,+inf) not
+#   [0,+inf). Surfaced as a silent miscompile via trim_no_ops (trims a serial loop
+#   to 1 iteration). Fix = add visit(Min)->And, visit(Max)->Or (mirror visit(Select)).
+#   - Tested on PRISTINE main worktree /Users/teoc/projects/halides-mainfix
+#     (branch fix/solve-min-max-bool, commit 43ff34a69, build build/fix):
+#     bug present on stock main -> fixed; ctest correctness 471/471, error+warning
+#     168/168, fuzz_solve clean, clang-format 0-diff.
+#   - Commit 43ff34a69 has Co-authored-by (Claude Opus 4.8); Claude-Session trailer
+#     STRIPPED for upstream.
+#   - PUSHED to fork wraith1995/Halide (isFork of halide/Halide), branch
+#     fix/solve-min-max-bool. Nothing posted to halide/Halide yet.
+#   - USER FILES: issue -> https://github.com/halide/Halide/issues/new?template=bug-report.yml
+#     PR   -> https://github.com/halide/Halide/compare/main...wraith1995:Halide:fix/solve-min-max-bool?expand=1
+#     (base MUST be halide/Halide:main; fork default is master.) Put issue # in pr "Fixes #".
+#   - Texts (durable): .claude/halide-solve-bug/{issue.md, pr.md, BUG_REPORT.md is .claude/BUG_REPORT.md},
+#     repros solve_probe.cpp (minimal), bug_repro.cpp (e2e), race_free_proof.py,
+#     artifact halide_bug.html (published: https://claude.ai/artifact/KZawHihuoxbJCthyNjNudT).
+#
+# TRACK B — reindex/rfactor experiment (branch experiment/rfactor-two-phase, this
+#   repo; origin=wraith1995/halide-experiments PR #1; upstream=halide/Halide):
+#   12 commits: two-phase rfactor materialization -> Phase A default + dead-code del
+#   -> isolate helpers (partition_reduction_splits, select_subdomain, build_reduced_dims,
+#   set_loop_structure/make_sub_schedule, promote_preserved_dims) -> pure core
+#   reindex_reduction_domain -> Stage::reindex (affine iteration-space bijection) with
+#   ReindexResult{vars,parallel_safe} + dependence check + loop_order -> wavefront_skew
+#   + diamond_tile tests -> the SAME Solve.cpp fix (commit 55969e95f) which made the
+#   diamond parallel work for arbitrary (non-tile-multiple) sizes.
+#   NOTE: the Track A fix makes the earlier "strip likely / tile-multiple restriction"
+#   reindex workaround MOOT — diamond parallel is correct for any size now.
+#
+# HOW TO CONTINUE (options, user picks):
+#   1. (after user files) respond to Halide maintainer review on the PR.
+#   2. reindex redesign: "valid Halide by construction" -> rfactor-shaped parallel
+#      axis (pure Var via factoring, not race-asserted rvar) and/or exact-partition
+#      geometry; the parallel/serial framing was wrong, aim = emit normally-composable
+#      Halide. (See design discussion in this file / history.)
+#   3. storage bijection (deferred) = layout analogue of reindex; the real tool for
+#      Toeplitz reuse (reduction-domain reindex can't express it: pure-var-dependent
+#      rvar bounds don't lower).
+#   4. build/test the reindex branch broadly; consider upstreaming reindex separately.
+# Build cmd (either tree): ninja -C build/<exp|fix> -j6 <target>; LLVM @ /opt/homebrew/opt/llvm@21; WASM off.
+# ==============================================================================
+
 # PLAN — Two-phase rfactor experiment (branch: experiment/rfactor-two-phase)
 
 ## Repo / PR
@@ -169,6 +218,18 @@ Tried: out(x) += wt(r)*in(x+r); reindex r -> k = x+r (inverse r = k-x) so in(x+r
 
 ## Branch state for review: 12 commits. Halide solve bug FIXED; diamond parallel
 ## works for arbitrary sizes; all reindex/rfactor/hoist tests + regressions pass.
+
+## UPSTREAM PREP (in progress): test on pristine main + issue + PR
+- Worktree: /Users/teoc/projects/halides-mainfix, branch fix/solve-min-max-bool off
+  upstream/main (d33fd254f). build dir build/fix (Debug, LLVM21, WASM off).
+- CONFIRMED bug on STOCK main: solve_outer(!min(bv<0,bv<2)) = [2,+inf).
+- Applied fix (src/Solve.cpp visit(Min)/visit(Max) bool->And/Or) + regression checks
+  in test/correctness/solve.cpp. After fix: probe [0,+inf); correctness_solve Success.
+- Full build (runjob hmain-all) -> then ctest correctness (+error+warning).
+- Drafts: scratchpad/issue.md (minimal, solve repro), scratchpad/pr.md.
+- Fix branch will be commit for the PR (fix + solve.cpp test only; NO reindex).
+- Outward actions (push fix branch to fork / open issue+PR on halide/Halide) held
+  for explicit user go-ahead.
 Goal (user): "index bijection command" = given a stage + forward map (new = phi(old))
 and its inverse (old = phi^{-1}(new)) on the iteration space, rewrite the loop nest to
 iterate the IMAGE of phi and access via the inverse. Prototype affine SKEW on a
