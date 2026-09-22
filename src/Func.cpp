@@ -895,7 +895,8 @@ pair<vector<Split>, vector<Split>> Stage::rfactor_validate_args(const std::vecto
 }
 
 // ============================================================================
-// reindex(): affine iteration-space bijection on a reduction domain.
+// reindex(): iteration-space bijection on a reduction domain (any invertible
+// map, not necessarily affine; validity is the caller's responsibility).
 // Ported onto the inductive-function substrate. Helpers below reuse this TU's
 // existing rfactor internals (project_rdom, add_let, substitute_self_reference,
 // promise_clamped).

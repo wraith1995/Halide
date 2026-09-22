@@ -199,20 +199,26 @@ public:
     Func rfactor(const RVar &r, const Var &v);
     // @}
 
-    /** Reindex an update's reduction domain by an affine iteration-space
-     * bijection phi. 'new_vars' names the new reduction dimensions, 'forward'
-     * gives each new var as an Expr of the old rvars (new = phi(old)), and
-     * 'inverse' gives each old rvar as an Expr of the new vars (old =
-     * phi^{-1}(new)). The loop nest is rewritten to iterate the image of phi and
-     * access via the inverse; the image is carved to exactly the original points
-     * by a predicate, so it remains a bijection. This is the schedule-side
-     * transform behind skew / wavefront / diamond tiling.
+    /** Reindex an update's reduction domain by an iteration-space bijection phi.
+     * 'new_vars' names the new reduction dimensions, 'forward' gives each new var
+     * as an Expr of the old rvars (new = phi(old)), and 'inverse' gives each old
+     * rvar as an Expr of the new vars (old = phi^{-1}(new)). The loop nest is
+     * rewritten to iterate the image of phi and access via the inverse; the image
+     * is carved to exactly the original points by a predicate, so it remains a
+     * bijection. This is the schedule-side transform behind skew / wavefront /
+     * diamond tiling.
+     *
+     * phi may be any invertible map, not just an affine one; the only requirement
+     * is that the image of 'forward' over the current domain be bounded. That
+     * 'forward' and 'inverse' are genuinely inverse and phi is a bijection is the
+     * caller's responsibility -- it is not checked.
      *
      * Returns the new reduction variables and, for each, whether it is safe to
-     * parallelize under the resulting loop order. Safety is decided by a
-     * dependence analysis of the update's self-references; when the analysis
-     * cannot prove a uniform affine dependence structure it conservatively
-     * reports every dimension as unsafe.
+     * parallelize under the resulting loop order. Safety is decided by Halide's
+     * own race analysis (see can_parallelize_rvar); when it cannot prove an axis
+     * race-free -- as happens for maps it cannot reason about, e.g. non-affine
+     * ones -- that axis is conservatively reported unsafe and left an ImpureRVar,
+     * so parallelizing it still requires allow_race_conditions().
      *
      * 'loop_order', if non-empty, sets the loop order of the new reduction dims
      * directly (innermost first), bypassing the associativity/commutativity
@@ -2300,8 +2306,8 @@ public:
     }
     // @}
 
-    /** Change the storage layout of this Func by an affine bijection phi on its
-     * pure (storage) dimensions -- the storage analogue of Stage::reindex().
+    /** Change the storage layout of this Func by a bijection phi on its pure
+     * (storage) dimensions -- the storage analogue of Stage::reindex().
      * 'new_vars' names the new storage coordinates, 'forward' gives each new
      * coordinate as an Expr of the old pure vars (new = phi(old)), and 'inverse'
      * gives each old pure var as an Expr of the new coordinates (old =
@@ -2312,8 +2318,11 @@ public:
      * trivial wrapper `f(x) = f_storage(phi(x))`, so existing consumers are
      * unaffected -- they read f as before and inline through to the reindexed
      * store. Schedule the returned Func (e.g. compute_root()) to materialize the
-     * reindexed layout. Unlike reorder_storage(), phi may be any affine
-     * bijection (reflection, skew, ...), not just a permutation of dimensions.
+     * reindexed layout. Unlike reorder_storage(), phi may be any bijection
+     * (reflection, skew, a modular shift, ...), not just a permutation of
+     * dimensions, and need not be affine. That 'forward' and 'inverse' are
+     * genuinely inverse and phi is a bijection is the caller's responsibility --
+     * it is not checked.
      *
      * Currently supports pure Funcs (no update definitions). For maps whose image
      * of the storage box is not itself a box (e.g. a skew), the wrapped store is
