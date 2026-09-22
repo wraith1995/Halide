@@ -312,8 +312,10 @@ tests(
     reduction_predicate_racing.cpp
     reduction_schedule.cpp
     register_shuffle.cpp
+    reindex_predicated.cpp
     reindex_skew.cpp
     reindex_storage.cpp
+    reindex_tuple.cpp
     reorder_storage.cpp
     require.cpp
     reschedule.cpp

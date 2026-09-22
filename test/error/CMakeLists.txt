@@ -140,6 +140,9 @@ tests(
     require_fail.cpp
     reuse_var_in_schedule.cpp
     reused_args.cpp
+    reindex_bad_loop_order.cpp
+    reindex_size_mismatch.cpp
+    reindex_storage_on_update.cpp
     reorder_inductive_split.cpp
     rfactor_after_var_and_rvar_fusion.cpp
     rfactor_fused_var_and_rvar.cpp
