@@ -3879,6 +3879,62 @@ Func &Func::reorder_storage(const std::vector<Var> &dims) {
     return reorder_storage(dims, 0);
 }
 
+Func Func::reindex_storage(const std::vector<Var> &new_vars,
+                           const std::vector<Expr> &forward,
+                           const std::vector<Expr> &inverse) {
+    invalidate_cache();
+    user_assert(func.has_pure_definition())
+        << "reindex_storage() called on undefined Func " << name() << "\n";
+    user_assert(func.updates().empty())
+        << "reindex_storage() currently supports pure Funcs only, but " << name()
+        << " has update definitions.\n";
+
+    const vector<string> old_names = func.args();
+    const size_t n = old_names.size();
+    user_assert(new_vars.size() == n && forward.size() == n && inverse.size() == n)
+        << "reindex_storage() expects a square bijection: " << n << " new vars, "
+        << "forward, and inverse expressions to match the " << n << " pure "
+        << "dimensions of " << name() << ".\n";
+
+    // old pure var i = phi^{-1}(new), for rewriting the value into new coords.
+    std::map<std::string, Expr> to_old;
+    for (size_t i = 0; i < n; i++) {
+        to_old[old_names[i]] = inverse[i];
+    }
+
+    // The reindexed store: f_storage(new) holds this Func's value at phi^{-1}(new).
+    const size_t arity = func.values().size();
+    Func fs(name() + "_storage");
+    {
+        vector<Expr> vals = func.values();
+        for (Expr &v : vals) {
+            v = substitute(to_old, v);
+        }
+        vector<Var> fs_args(new_vars);
+        if (arity == 1) {
+            fs(fs_args) = vals[0];
+        } else {
+            fs(fs_args) = Tuple(vals);
+        }
+    }
+
+    // Rewrite this Func into a trivial wrapper reading the reindexed store:
+    // f(x) = f_storage(phi(x)). Consumers are untouched and inline through it.
+    {
+        vector<Expr> new_values;
+        if (arity == 1) {
+            new_values.push_back(fs(forward));
+        } else {
+            for (size_t i = 0; i < arity; i++) {
+                new_values.push_back(fs(forward)[i]);
+            }
+        }
+        func.definition().values() = new_values;
+    }
+
+    return fs;
+}
+
 Func &Func::align_storage(const Var &dim, const Expr &alignment) {
     invalidate_cache();
 

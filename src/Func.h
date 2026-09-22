@@ -2300,6 +2300,29 @@ public:
     }
     // @}
 
+    /** Change the storage layout of this Func by an affine bijection phi on its
+     * pure (storage) dimensions -- the storage analogue of Stage::reindex().
+     * 'new_vars' names the new storage coordinates, 'forward' gives each new
+     * coordinate as an Expr of the old pure vars (new = phi(old)), and 'inverse'
+     * gives each old pure var as an Expr of the new coordinates (old =
+     * phi^{-1}(new)).
+     *
+     * A new Func (this one's name + "_storage") is created that holds the data
+     * laid out in the new coordinate system, and this Func is rewritten into a
+     * trivial wrapper `f(x) = f_storage(phi(x))`, so existing consumers are
+     * unaffected -- they read f as before and inline through to the reindexed
+     * store. Schedule the returned Func (e.g. compute_root()) to materialize the
+     * reindexed layout. Unlike reorder_storage(), phi may be any affine
+     * bijection (reflection, skew, ...), not just a permutation of dimensions.
+     *
+     * Currently supports pure Funcs (no update definitions). For maps whose image
+     * of the storage box is not itself a box (e.g. a skew), the wrapped store is
+     * computed over the bounding box, so the producer must be safe to evaluate
+     * outside the original domain (e.g. reads a boundary-conditioned input). */
+    Func reindex_storage(const std::vector<Var> &new_vars,
+                         const std::vector<Expr> &forward,
+                         const std::vector<Expr> &inverse);
+
     /** Pad the storage extent of a particular dimension of
      * realizations of this function up to be a multiple of the
      * specified alignment. This guarantees that the strides for the

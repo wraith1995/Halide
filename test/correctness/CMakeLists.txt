@@ -313,6 +313,7 @@ tests(
     reduction_schedule.cpp
     register_shuffle.cpp
     reindex_skew.cpp
+    reindex_storage.cpp
     reorder_storage.cpp
     require.cpp
     reschedule.cpp
