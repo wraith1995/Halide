@@ -313,8 +313,10 @@ tests(
     reduction_schedule.cpp
     register_shuffle.cpp
     reindex_compose.cpp
+    reindex_inductive.cpp
     reindex_parallel.cpp
     reindex_predicated.cpp
+    reindex_pure_dim.cpp
     reindex_skew.cpp
     reindex_storage.cpp
     reindex_tuple.cpp
