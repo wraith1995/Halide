@@ -101,6 +101,66 @@ bool test_modular_shift() {
     return true;
 }
 
+// A tuple-valued Func: reindex_storage must rewrite every component and rebuild
+// the wrapper per component. Reflect along x and read both components back.
+bool test_tuple() {
+    const int W = 10, H = 8;
+    Var x("x"), y("y"), u("u"), v("v");
+
+    Func f("ft");
+    f(x, y) = Tuple(x + 100 * y, x - y);
+
+    Func fs = f.reindex_storage({u, v}, {W - 1 - x, y}, {W - 1 - u, v});
+    fs.compute_root();
+
+    Func g("gt");
+    g(x, y) = f(x, y)[0] * 2 + f(x, y)[1];
+
+    Buffer<int> out = g.realize({W, H});
+    for (int yy = 0; yy < H; yy++) {
+        for (int xx = 0; xx < W; xx++) {
+            const int expected = (xx + 100 * yy) * 2 + (xx - yy);
+            if (out(xx, yy) != expected) {
+                printf("tuple consumer mismatch at (%d,%d): %d vs %d\n", xx, yy,
+                       out(xx, yy), expected);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Two independent consumers read the reindexed Func; both must see the unchanged
+// logical values (each inlines through the wrapper to the reindexed store).
+bool test_multi_consumer() {
+    const int W = 10, H = 8;
+    Var x("x"), y("y"), u("u"), v("v");
+
+    Func f("fm");
+    f(x, y) = x + 100 * y;
+
+    Func fs = f.reindex_storage({u, v}, {W - 1 - x, y}, {W - 1 - u, v});
+    fs.compute_root();
+
+    Func g1("g1"), g2("g2");
+    g1(x, y) = f(x, y) + 1;
+    g2(x, y) = f(x, y) * 3;
+
+    Buffer<int> o1 = g1.realize({W, H});
+    Buffer<int> o2 = g2.realize({W, H});
+    for (int yy = 0; yy < H; yy++) {
+        for (int xx = 0; xx < W; xx++) {
+            if (o1(xx, yy) != (xx + 100 * yy) + 1 ||
+                o2(xx, yy) != (xx + 100 * yy) * 3) {
+                printf("multi-consumer mismatch at (%d,%d): %d, %d\n", xx, yy,
+                       o1(xx, yy), o2(xx, yy));
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -108,6 +168,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (!test_modular_shift()) {
+        return 1;
+    }
+    if (!test_tuple()) {
+        return 1;
+    }
+    if (!test_multi_consumer()) {
         return 1;
     }
     printf("Success!\n");
