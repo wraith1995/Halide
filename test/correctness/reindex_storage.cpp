@@ -161,6 +161,42 @@ bool test_multi_consumer() {
     return true;
 }
 
+// A skew (u = x, v = x+y) maps the storage box to a parallelogram, so the store
+// is computed over a bounding box whose corners fall outside the original domain.
+// Reading through a boundary condition makes those corner evaluations well
+// defined; the values consumers actually read are unchanged.
+bool test_skew_boundary_clamped() {
+    const int W = 12, H = 10;
+    Var x("x"), y("y"), u("u"), v("v");
+
+    Func in("in");
+    in(x, y) = x + 100 * y;
+    Func inb = BoundaryConditions::repeat_edge(in, {{0, W}, {0, H}});
+
+    Func f("fk");
+    f(x, y) = inb(x, y) + 1;
+
+    // u = x, v = x + y ; inverse x = u, y = v - u.
+    Func fs = f.reindex_storage({u, v}, {x, x + y}, {u, v - u});
+    fs.compute_root();
+
+    Func g("gk");
+    g(x, y) = f(x, y) * 2;
+
+    Buffer<int> out = g.realize({W, H});
+    for (int yy = 0; yy < H; yy++) {
+        for (int xx = 0; xx < W; xx++) {
+            const int expected = ((xx + 100 * yy) + 1) * 2;
+            if (out(xx, yy) != expected) {
+                printf("skew-bc mismatch at (%d,%d): %d vs %d\n", xx, yy,
+                       out(xx, yy), expected);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -174,6 +210,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (!test_multi_consumer()) {
+        return 1;
+    }
+    if (!test_skew_boundary_clamped()) {
         return 1;
     }
     printf("Success!\n");

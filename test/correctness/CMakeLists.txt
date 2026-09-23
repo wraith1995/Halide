@@ -315,6 +315,7 @@ tests(
     reindex_compose.cpp
     reindex_inductive.cpp
     reindex_maps.cpp
+    reindex_ops.cpp
     reindex_parallel.cpp
     reindex_predicated.cpp
     reindex_pure_dim.cpp
