@@ -266,7 +266,9 @@ class FindSimplifications : public IRVisitor {
         IRVisitor::visit(op);
     }
 
-    void new_simplification(Expr condition, Expr old, Expr likely_val, Expr unlikely_val) {
+    // A simplification that isn't tight is only applied where the condition
+    // is known to hold, never reversed where it's known not to.
+    void new_simplification(Expr condition, Expr old, Expr likely_val, Expr unlikely_val, bool tight = true) {
         if (!expr_uses_vars(condition, depends_on_loop_var)) {
             return;
         }
@@ -288,7 +290,7 @@ class FindSimplifications : public IRVisitor {
             return;
         }
         condition = remove_likelies(condition);
-        Simplification s = {condition, std::move(old), std::move(likely_val), std::move(unlikely_val), true};
+        Simplification s = {condition, std::move(old), std::move(likely_val), std::move(unlikely_val), tight};
         simplifications.push_back(s);
     }
 
@@ -354,8 +356,114 @@ class FindSimplifications : public IRVisitor {
         }
     }
 
+    // Push negations down to comparisons, and turn a comparison against a
+    // min or max whose operands differ in whether they depend on the loop
+    // var into an And or Or of comparisons, so that the parts that depend on
+    // the loop var come apart from the parts that don't. The simplifier
+    // merges independent guards this way, e.g. t <= 0 || x <= 0 into
+    // min(t, x) <= 0.
+    Expr separate_conditions(const Expr &c, bool negate = false) {
+        auto varies = [&](const Expr &e) { return expr_uses_vars(e, depends_on_loop_var); };
+        if (const Not *n = c.as<Not>()) {
+            return separate_conditions(n->a, !negate);
+        } else if (const And *a = c.as<And>()) {
+            Expr l = separate_conditions(a->a, negate), r = separate_conditions(a->b, negate);
+            return negate ? (l || r) : (l && r);
+        } else if (const Or *o = c.as<Or>()) {
+            Expr l = separate_conditions(o->a, negate), r = separate_conditions(o->b, negate);
+            return negate ? (l && r) : (l || r);
+        }
+        Expr a, b;
+        bool strict;
+        if (const LE *le = c.as<LE>()) {
+            a = le->a, b = le->b, strict = false;
+        } else if (const LT *lt = c.as<LT>()) {
+            a = lt->a, b = lt->b, strict = true;
+        } else {
+            return negate ? !c : c;
+        }
+        if (negate) {
+            // !(a <= b) is b < a, and !(a < b) is b <= a.
+            std::swap(a, b);
+            strict = !strict;
+        }
+        auto cmp = [&](const Expr &x, const Expr &y) { return strict ? x < y : x <= y; };
+        // min(p, q) <= b is p <= b || q <= b, and a <= min(p, q) is
+        // a <= p && a <= q. max is the other way around.
+        if (const Min *m = a.as<Min>(); m && varies(m->a) != varies(m->b)) {
+            return separate_conditions(cmp(m->a, b)) || separate_conditions(cmp(m->b, b));
+        } else if (const Max *m = a.as<Max>(); m && varies(m->a) != varies(m->b)) {
+            return separate_conditions(cmp(m->a, b)) && separate_conditions(cmp(m->b, b));
+        } else if (const Min *m = b.as<Min>(); m && varies(m->a) != varies(m->b)) {
+            return separate_conditions(cmp(a, m->a)) && separate_conditions(cmp(a, m->b));
+        } else if (const Max *m = b.as<Max>(); m && varies(m->a) != varies(m->b)) {
+            return separate_conditions(cmp(a, m->a)) || separate_conditions(cmp(a, m->b));
+        }
+        return cmp(a, b);
+    }
+
+    // The value is likely_val when condition holds. Partition this loop on
+    // only the part of the condition that depends on its var, leaving the
+    // rest for a loop further out that it does depend on.
+    void new_select_simplification(const Expr &condition, const Expr &old,
+                                   const Expr &likely_val, const Expr &unlikely_val) {
+        auto varies = [&](const Expr &e) { return expr_uses_vars(e, depends_on_loop_var); };
+        Expr c = separate_conditions(condition);
+        vector<Expr> terms, dependent, rest;
+        bool is_and = c.as<And>() != nullptr;
+        vector<Expr> pending = {c};
+        while (!pending.empty()) {
+            Expr e = pending.back();
+            pending.pop_back();
+            const And *a = e.as<And>();
+            const Or *o = e.as<Or>();
+            if (is_and && a) {
+                pending.push_back(a->a);
+                pending.push_back(a->b);
+            } else if (!is_and && o) {
+                pending.push_back(o->a);
+                pending.push_back(o->b);
+            } else {
+                (varies(e) ? dependent : rest).push_back(e);
+            }
+        }
+        if (dependent.empty() || rest.empty()) {
+            new_simplification(condition, old, likely_val, unlikely_val);
+            return;
+        }
+        auto combine = [&](const vector<Expr> &v) {
+            Expr r = v[0];
+            for (size_t i = 1; i < v.size(); i++) {
+                r = is_and ? (r && v[i]) : (r || v[i]);
+            }
+            return r;
+        };
+        if (!is_and) {
+            // Any of the dependent disjuncts alone implies the condition,
+            // but where they're all false the rest may still hold, so
+            // this can't be reversed outside of where they hold.
+            new_simplification(combine(dependent), old, likely_val, unlikely_val, false);
+            return;
+        }
+        // Where the dependent conjuncts hold, the value still depends on the
+        // rest, which a loop further out can partition on in turn.
+        Expr remaining = combine(rest);
+        Expr steady;
+        if (old.as<Select>()) {
+            steady = Select::make(remaining, likely_val, unlikely_val);
+        } else {
+            steady = Call::make(old.type(), Call::if_then_else,
+                                {remaining, likely_val, unlikely_val}, Call::PureIntrinsic);
+        }
+        new_simplification(combine(dependent), old, steady, unlikely_val);
+    }
+
     void visit_select(const Expr &condition, const Expr &old, const Expr &true_value, const Expr &false_value) {
-        condition.accept(this);
+        // Look for simplifications within the condition after separating it,
+        // so that a min or max it compares against, which separating turns
+        // into comparisons, isn't also taken for a likely clamp to
+        // partition on.
+        separate_conditions(condition).accept(this);
 
         bool likely_t = has_uncaptured_likely(true_value);
         bool likely_f = has_uncaptured_likely(false_value);
@@ -373,9 +481,9 @@ class FindSimplifications : public IRVisitor {
         }
 
         if (likely_t && !likely_f) {
-            new_simplification(condition, old, true_value, false_value);
+            new_select_simplification(condition, old, true_value, false_value);
         } else if (likely_f && !likely_t) {
-            new_simplification(!condition, old, false_value, true_value);
+            new_select_simplification(!condition, old, false_value, true_value);
         }
     }
 
