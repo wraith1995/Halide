@@ -325,6 +325,7 @@ tests(
     reindex_skew.cpp
     reindex_slide.cpp
     reindex_storage.cpp
+    reindex_temporal_tile.cpp
     reindex_tuple.cpp
     reorder_storage.cpp
     require.cpp

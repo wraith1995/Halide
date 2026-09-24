@@ -634,6 +634,21 @@ void test_solve_far_side_min_max() {
                          Interval::neg_inf(), 11);
 }
 
+void test_solve_bool_min_max() {
+    // and_condition_over_domain and the simplifier represent a logical And/Or
+    // of booleans as min/max. A Not above one has to distribute over it.
+
+    // min(x < 0, x < 2) is x < 0, so its negation is x >= 0.
+    Expr bool_min = Min::make(x < 0, x < 2);
+    check_outer_interval(!bool_min, 0, Interval::pos_inf());
+    check_inner_interval(!bool_min, 0, Interval::pos_inf());
+
+    // max(x < 0, x > 10) is x outside [0, 10], so its negation is x in [0, 10].
+    Expr bool_max = Max::make(x < 0, x > 10);
+    check_outer_interval(!bool_max, 0, 10);
+    check_inner_interval(!bool_max, 0, 10);
+}
+
 void test_solve_no_var_polarity() {
     // A condition that doesn't mention the variable being solved for still has
     // to respect the polarity we're solving for. Under a negation we want the
@@ -691,6 +706,7 @@ int main(int argc, char **argv) {
     test_float_select_condition_not_simplified();
     test_outer_interval_max_min();
     test_solve_far_side_min_max();
+    test_solve_bool_min_max();
     test_solve_no_var_polarity();
     std::printf("Success!\n");
     return 0;
