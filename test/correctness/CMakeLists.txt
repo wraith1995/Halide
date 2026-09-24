@@ -323,6 +323,7 @@ tests(
     reindex_predicated.cpp
     reindex_pure_dim.cpp
     reindex_skew.cpp
+    reindex_slide.cpp
     reindex_storage.cpp
     reindex_tuple.cpp
     reorder_storage.cpp
