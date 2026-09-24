@@ -45,6 +45,7 @@ tests(
     parallel_performance.cpp
     parallel_scenarios.cpp
     profiler.cpp
+    reindex_alignment.cpp
     reindex_diamond.cpp
     rfactor.cpp
     sort.cpp
