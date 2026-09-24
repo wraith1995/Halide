@@ -14,6 +14,7 @@
 #include "ParallelRVar.h"
 #include "Random.h"
 #include "Scope.h"
+#include "Simplify.h"
 #include "Var.h"
 
 namespace Halide {
@@ -1252,7 +1253,11 @@ namespace {
 
 // Whether var, a pure variable of the Func named fname, is inductive
 // across the given definitions: some definition writes at var and reads
-// the Func at some other position along it.
+// the Func at some other position along it, and no read is provably
+// ahead of var. A var that is also read ahead, as in a stencil
+// f(x - 1, t - 1) + f(x + 1, t - 1), is a neighbourhood within a slice
+// that some other var steps back through, not a dimension to recurse
+// along.
 bool inductive_in(const std::vector<Definition> &defs, const string &var, const string &fname) {
     // Only pure vars can be inductive
     for (const Definition &def : defs) {
@@ -1263,7 +1268,7 @@ bool inductive_in(const std::vector<Definition> &defs, const string &var, const 
         }
     }
 
-    bool inductive_in_var = false;
+    bool inductive_in_var = false, read_ahead = false;
     for (const Definition &def : defs) {
         std::vector<int> positions;
         for (size_t i = 0; i < def.args().size(); i++) {
@@ -1277,16 +1282,18 @@ bool inductive_in(const std::vector<Definition> &defs, const string &var, const 
             continue;
         }
 
+        const Expr var_expr = Variable::make(Int(32), var);
         for (const Expr &e : def.values()) {
             visit_with(e, [&](auto *self, const Call *op) {
                 if (op->call_type == Call::Halide && op->name == fname) {
                     for (int pos : positions) {
-                        if (const auto &v = op->args[pos].as<Variable>()) {
-                            if (v->name != var) {
-                                inductive_in_var = true;
-                            }
-                        } else {
-                            inductive_in_var = true;
+                        const Expr &arg = op->args[pos];
+                        if (const auto &v = arg.as<Variable>(); v && v->name == var) {
+                            continue;
+                        }
+                        inductive_in_var = true;
+                        if (arg.type() == var_expr.type() && can_prove(arg > var_expr)) {
+                            read_ahead = true;
                         }
                     }
                 }
@@ -1295,7 +1302,7 @@ bool inductive_in(const std::vector<Definition> &defs, const string &var, const 
         }
     }
 
-    return inductive_in_var;
+    return inductive_in_var && !read_ahead;
 }
 
 }  // namespace

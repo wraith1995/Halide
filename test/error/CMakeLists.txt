@@ -100,6 +100,7 @@ tests(
     inductive_reorder.cpp
     inductive_rvar_rhs.cpp
     inductive_small_fold.cpp
+    inductive_stencil_reorder.cpp
     inductive_tuple_fold.cpp
     inductive_tuple_to_expr.cpp
     inductive_two_defs.cpp

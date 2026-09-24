@@ -1046,11 +1046,159 @@ public:
     }
 };
 
+// Find, inside the realization of an inductive Func, the loop its produce
+// node runs outermost and the body of its consume node, along with the lets
+// in scope at each.
+class FindInPlaceFoldSite : public IRVisitor {
+    const string &func;
+    vector<std::pair<string, Expr>> lets;
+
+    using IRVisitor::visit;
+
+    void visit(const LetStmt *op) override {
+        op->value.accept(this);
+        lets.emplace_back(op->name, op->value);
+        op->body.accept(this);
+        lets.pop_back();
+    }
+
+    void visit(const ProducerConsumer *op) override {
+        if (op->name != func) {
+            IRVisitor::visit(op);
+        } else if (op->is_producer) {
+            // Look through the lets at the top of the produce node for the
+            // loop it runs outermost.
+            Stmt s = op->body;
+            size_t num_lets = lets.size();
+            while (const LetStmt *l = s.as<LetStmt>()) {
+                lets.emplace_back(l->name, l->value);
+                s = l->body;
+            }
+            loop = s.as<For>();
+            loop_lets = lets;
+            lets.resize(num_lets);
+        } else {
+            consume = op->body;
+            consume_lets = lets;
+        }
+    }
+
+public:
+    const For *loop = nullptr;
+    Stmt consume;
+    vector<std::pair<string, Expr>> loop_lets, consume_lets;
+
+    FindInPlaceFoldSite(const string &f)
+        : func(f) {
+    }
+};
+
+// An inductive Func computed in a serial loop over its one inductive var
+// reads only the last few steps of that loop while it runs. If its consumers
+// also only read the last few, which is typical when they want the final
+// state of a recurrence, the storage can fold down to those steps in place,
+// over the Func's own loop rather than a loop outside it. Returns the
+// dimension and fold factor, or a dimension of -1 if the storage can't fold.
+std::pair<int, Expr> fold_inductive_in_place(const Function &func, const Stmt &body,
+                                             const vector<std::pair<string, Expr>> &outer_lets) {
+    const std::pair<int, Expr> no_fold = {-1, Expr()};
+    if (!func.is_inductive() || !func.is_pure() || func.schedule().async() ||
+        func.schedule().memoized() || func.has_extern_definition()) {
+        return no_fold;
+    }
+
+    int dim = -1;
+    for (int i = 0; i < func.dimensions(); i++) {
+        if (func.is_inductive(func.args()[i])) {
+            if (dim >= 0) {
+                return no_fold;
+            }
+            dim = i;
+        }
+    }
+    if (dim < 0) {
+        return no_fold;
+    }
+    for (const StorageDim &sd : func.schedule().storage_dims()) {
+        if (sd.var == func.args()[dim] && sd.fold_factor.defined()) {
+            return no_fold;
+        }
+    }
+
+    // How many steps back the recurrence reaches.
+    const Expr var = Variable::make(Int(32), func.args()[dim]);
+    int64_t reach = 0;
+    bool constant_reach = true;
+    for (const Expr &value : func.values()) {
+        visit_with(value, [&](auto *self, const Call *op) {
+            if (op->call_type == Call::Halide && op->name == func.name()) {
+                auto r = as_const_int(simplify(var - op->args[dim]));
+                if (r && *r >= 0) {
+                    reach = std::max(reach, *r);
+                } else {
+                    constant_reach = false;
+                }
+            }
+            self->visit_base(op);
+        });
+    }
+    if (!constant_reach || reach < 1) {
+        return no_fold;
+    }
+
+    FindInPlaceFoldSite site(func.name());
+    body.accept(&site);
+    const string loop_name = func.name() + ".s0." + func.args()[dim];
+    if (!site.loop || site.loop->name != loop_name ||
+        site.loop->for_type != ForType::Serial || !site.consume.defined()) {
+        return no_fold;
+    }
+
+    // The consumers have to read nothing older than the steps the fold
+    // keeps, and nothing past the last step the loop computes.
+    Box b = box_required(site.consume, func.name());
+    if (b.maybe_unused() || dim >= (int)b.size() || !b[dim].is_bounded()) {
+        return no_fold;
+    }
+    // Try the smallest window that holds what the step reads, then wider
+    // ones in case the consumers read further back than the step does.
+    const Expr last = site.loop->max;
+    for (int64_t factor = (int64_t)next_power_of_two((uint64_t)(reach + 1)); factor <= 64; factor *= 2) {
+        Expr fits = b[dim].min >= last - (int)(factor - 1) && b[dim].max <= last;
+        auto wrap = [&](const vector<std::pair<string, Expr>> &lets) {
+            for (auto it = lets.rbegin(); it != lets.rend(); it++) {
+                if (expr_uses_var(fits, it->first)) {
+                    fits = Let::make(it->first, it->second, fits);
+                }
+            }
+        };
+        wrap(site.consume_lets);
+        wrap(site.loop_lets);
+        wrap(outer_lets);
+        if (can_prove(fits)) {
+            return {dim, (int)factor};
+        }
+        debug(3) << "Not folding " << func.name() << " in place by " << factor
+                 << ": can't prove " << fits << "\n";
+    }
+    return no_fold;
+}
+
 // Look for opportunities for storage folding in a statement
 class StorageFolding : public IRMutator {
     const map<string, Function> &env;
 
+    // The lets enclosing the statement being mutated, outermost first.
+    vector<std::pair<string, Expr>> lets;
+
     using IRMutator::visit;
+
+    Stmt visit(const LetStmt *op) override {
+        lets.emplace_back(op->name, op->value);
+        Stmt body = mutate(op->body);
+        lets.pop_back();
+        return body.same_as(op->body) ? op : LetStmt::make(op->name, op->value, body);
+    }
 
     Stmt visit(const Realize *op) override {
         Stmt body = mutate(op->body);
@@ -1097,6 +1245,20 @@ class StorageFolding : public IRMutator {
             folder.dims_folded.push_back({folder.slid_dim, factor});
             debug(3) << "Folding " << op->name << " dimension " << folder.slid_dim
                      << " by " << factor << ", as sliding window requested\n";
+        }
+
+        if (func.get_contents().defined() && !explicit_only) {
+            auto [dim, factor] = fold_inductive_in_place(func, body, lets);
+            bool already_folded = std::any_of(folder.dims_folded.begin(), folder.dims_folded.end(),
+                                              [&](const AttemptStorageFoldingOfFunction::Fold &f) {
+                                                  return f.dim == dim;
+                                              });
+            if (dim >= 0 && !already_folded) {
+                body = FoldStorageOfFunction(op->name, dim, factor, "")(body);
+                folder.dims_folded.push_back({dim, factor});
+                debug(3) << "Folding " << op->name << " dimension " << dim
+                         << " by " << factor << " in place over its own loop\n";
+            }
         }
 
         // If the user explicitly requested storage folding via Func::fold_storage,

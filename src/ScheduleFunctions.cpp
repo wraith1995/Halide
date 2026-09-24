@@ -2286,6 +2286,62 @@ bool validate_schedule(Function f, const Stmt &s, const Target &target, bool is_
                 }
             }
         }
+
+        // A non-inductive var that the pure definition reads itself at an
+        // offset along, as a stencil does, reads the previous slice's
+        // neighbours. Those have to be complete before the slice is, so
+        // every loop over such a var must be nested inside every loop over
+        // an inductive var.
+        set<string> neighbour_vars;
+        for (const Expr &value : f.values()) {
+            visit_with(value, [&](auto *self, const Call *op) {
+                if (op->call_type == Call::Halide && op->name == f.name()) {
+                    for (size_t i = 0; i < op->args.size() && i < f.args().size(); i++) {
+                        const Variable *v = op->args[i].as<Variable>();
+                        if (!f.is_inductive(f.args()[i]) && !(v && v->name == f.args()[i])) {
+                            neighbour_vars.insert(f.args()[i]);
+                        }
+                    }
+                }
+                self->visit_base(op);
+            });
+        }
+        if (!neighbour_vars.empty()) {
+            // The pure vars each loop of the pure definition iterates over.
+            map<string, set<string>> origins;
+            for (const string &arg : f.args()) {
+                origins[arg] = {arg};
+            }
+            for (const Split &s : f.definition().schedule().splits()) {
+                if (s.split_type == Split::FuseVars) {
+                    origins[s.old_var] = origins[s.outer];
+                    origins[s.old_var].insert(origins[s.inner].begin(), origins[s.inner].end());
+                } else {
+                    origins[s.outer] = origins[s.old_var];
+                    if (s.split_type == Split::SplitVar) {
+                        origins[s.inner] = origins[s.old_var];
+                    }
+                }
+            }
+            const vector<Dim> &dims = f.definition().schedule().dims();
+            for (size_t inner = 0; inner < dims.size(); inner++) {
+                for (const string &n : origins[dims[inner].var]) {
+                    if (!neighbour_vars.count(n)) {
+                        continue;
+                    }
+                    for (size_t outer = 0; outer <= inner; outer++) {
+                        for (const string &o : origins[dims[outer].var]) {
+                            user_assert(!f.is_inductive(o))
+                                << "Inductive Func " << f.name() << " reads itself at other values of "
+                                << n << " in the previous step along " << o << ", so every loop over "
+                                << n << " must be nested inside every loop over " << o
+                                << ", but loop " << dims[inner].var << " is not inside loop "
+                                << dims[outer].var << ".\n";
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Emit a warning if only some of the steps have been scheduled.

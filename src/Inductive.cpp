@@ -30,6 +30,10 @@ class BaseCaseSolver : public IRVisitor {
 
     vector<Interval> condition_intervals;
 
+    // The region of each var over which the recursive branch being visited
+    // is taken.
+    vector<Interval> branch_intervals;
+
     Scope<Interval> bounds;
 
     Scope<> inductive_vars;
@@ -85,6 +89,7 @@ class BaseCaseSolver : public IRVisitor {
                 for (size_t i = 0; i < vars.size(); i++) {
                     Interval inter = Interval::make_intersection(old_intervals[i], solve_for_outer_interval(simplify(op->args[0]), vars[i]));
                     condition_intervals[i] = Interval(inter.min, Interval::pos_inf());
+                    branch_intervals[i] = inter;
                     bounds.push(vars[i], condition_intervals[i]);
                 }
                 op->args[1].accept(this);
@@ -96,6 +101,7 @@ class BaseCaseSolver : public IRVisitor {
                 for (size_t i = 0; i < vars.size(); i++) {
                     Interval inter = Interval::make_intersection(old_intervals[i], solve_for_outer_interval(simplify(!op->args[0]), vars[i]));
                     condition_intervals[i] = Interval(inter.min, Interval::pos_inf());
+                    branch_intervals[i] = inter;
                     bounds.push(vars[i], condition_intervals[i]);
                 }
                 op->args[2].accept(this);
@@ -104,6 +110,7 @@ class BaseCaseSolver : public IRVisitor {
                 }
             }
             condition_intervals = old_intervals;
+            branch_intervals = vector<Interval>(vars.size(), Interval::everything());
             nested_select -= 1;
         } else if (op->name == func) {
             // An update definition's self-reference whose inductive args match the
@@ -152,6 +159,27 @@ class BaseCaseSolver : public IRVisitor {
             }
             user_assert(found_inductive) << "Unable to prove in inductive function " << func << " that the inductive step is monotonically decreasing.\n";
 
+            // A non-inductive var the step reads at an offset (a stencil over
+            // the previous slice) widens by that offset at every step back.
+            // Record how far each step reaches, and where the reads can land
+            // given the region the recursive branch is taken over.
+            for (size_t position = 0; position < vars.size() && !is_update; position++) {
+                const Expr &arg = op->args[position];
+                const Expr v = Variable::make(arg.type(), vars[position]);
+                if (is_inductive_var[position] || equal(arg, v)) {
+                    continue;
+                }
+                Interval offset = bounds_of_expr_in_scope(simplify(arg - v), bounds);
+                user_assert(offset.is_bounded())
+                    << "Unable to bound how far inductive function " << func
+                    << " reads itself along " << vars[position] << ".\n";
+                neighbour_reach[position] = Interval::make_union(neighbour_reach[position], offset);
+                const Interval &branch = branch_intervals[position];
+                Interval lands(branch.has_lower_bound() ? branch.min + offset.min : Interval::neg_inf(),
+                               branch.has_upper_bound() ? branch.max + offset.max : Interval::pos_inf());
+                neighbour_lands[position] = Interval::make_union(neighbour_lands[position], lands);
+            }
+
             IRVisitor::visit(op);
 
         } else {
@@ -162,10 +190,17 @@ class BaseCaseSolver : public IRVisitor {
 public:
     vector<Interval> result_intervals;
 
+    // For each non-inductive var, the offsets at which the recursive steps
+    // read it, and the region those reads land in.
+    vector<Interval> neighbour_reach, neighbour_lands;
+
     BaseCaseSolver(const vector<string> &v, const vector<bool> &is_inductive_var, const string &func, const vector<Interval> &con, bool is_update)
         : vars(v), func(func), start_box(con), is_inductive_var(is_inductive_var), is_update(is_update) {
         condition_intervals = vector<Interval>(start_box.size());
+        branch_intervals = vector<Interval>(start_box.size(), Interval::everything());
         result_intervals = vector<Interval>(start_box.size(), Interval::nothing());
+        neighbour_reach = vector<Interval>(start_box.size(), Interval::nothing());
+        neighbour_lands = vector<Interval>(start_box.size(), Interval::nothing());
         for (size_t i = 0; i < vars.size(); i++) {
             if (is_inductive_var[i]) {
                 inductive_vars.push(vars[i]);
@@ -191,6 +226,10 @@ Box expand_to_include_base_case(const vector<string> &vars, const vector<bool> &
         }
     }
 
+    // Each step back along an inductive var moves at least one down it, so
+    // the number of steps from the region required down to the base case
+    // is at most the sum of how far each inductive var falls.
+    Expr steps = 0;
     for (size_t i = 0; i < vars.size(); i++) {
         user_assert(b.result_intervals[i].is_bounded() || b.result_intervals[i].is_empty()) << "Unable to prove that the inductive function " << func << " uses a bounded interval";
         if (!b.result_intervals[i].is_empty()) {
@@ -198,7 +237,36 @@ Box expand_to_include_base_case(const vector<string> &vars, const vector<bool> &
 
             new_interval.min = bounds_of_expr_in_scope(new_interval.min, non_inductive_scope).min;
             box2[i] = new_interval;
+            steps += box_required[i].max - new_interval.min;
         }
+    }
+    steps = simplify(max(steps, 0));
+
+    Scope<> all_vars;
+    for (const auto &v : vars) {
+        all_vars.push(v);
+    }
+
+    // A non-inductive var read at an offset widens by that offset at every
+    // step, but never past where the recursive branch's reads can land.
+    for (size_t i = 0; i < vars.size(); i++) {
+        const Interval &reach = b.neighbour_reach[i];
+        if (is_inductive_var[i] || reach.is_empty() || !box_required[i].is_bounded()) {
+            continue;
+        }
+        Expr lo = bounds_of_expr_in_scope(min(reach.min, 0), non_inductive_scope).min;
+        Expr hi = bounds_of_expr_in_scope(max(reach.max, 0), non_inductive_scope).max;
+        Expr new_min = box_required[i].min + steps * lo;
+        Expr new_max = box_required[i].max + steps * hi;
+        const Interval &lands = b.neighbour_lands[i];
+        if (lands.has_lower_bound() && !expr_uses_vars(lands.min, all_vars)) {
+            new_min = max(new_min, lands.min);
+        }
+        if (lands.has_upper_bound() && !expr_uses_vars(lands.max, all_vars)) {
+            new_max = min(new_max, lands.max);
+        }
+        box2[i] = Interval(simplify(min(box_required[i].min, new_min)),
+                           simplify(max(box_required[i].max, new_max)));
     }
 
     return box2;

@@ -213,6 +213,7 @@ tests(
     fold_inductive_keeps_step.cpp
     inductive_folding.cpp
     inductive_ring_buffer.cpp
+    inductive_stencil.cpp
     inductive_var_race.cpp
     infer_arguments.cpp
     inline_reduction.cpp

@@ -38,6 +38,7 @@ tests(
     GROUPS performance multithreaded
     SOURCES
     fan_in.cpp
+    inductive_temporal_tile.cpp
     inner_loop_parallel.cpp
     lots_of_small_allocations.cpp
     matrix_multiplication.cpp
