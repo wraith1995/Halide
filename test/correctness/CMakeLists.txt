@@ -313,7 +313,10 @@ tests(
     reduction_schedule.cpp
     register_shuffle.cpp
     reindex_compose.cpp
+    reindex_compute_at.cpp
+    reindex_gpu.cpp
     reindex_inductive.cpp
+    reindex_inductive_2d.cpp
     reindex_maps.cpp
     reindex_ops.cpp
     reindex_parallel.cpp
