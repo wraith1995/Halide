@@ -69,8 +69,8 @@ struct StorageDim;
 }  // namespace Internal
 
 /** Result of Stage::reindex(): the new reduction variables produced by an
- * iteration-space bijection, and whether each is safe to parallelize under the
- * resulting loop order (carries no loop-carried dependence). */
+ * iteration-space bijection, and whether each is safe to parallelize where it
+ * is in the resulting loop order (carries no dependence of the update). */
 struct ReindexResult {
     std::vector<RVar> vars;
     std::vector<bool> parallel_safe;
@@ -214,32 +214,39 @@ public:
      * RVars (used to bound the image), and 'inverse[i]' gives the i-th current
      * RVar as an Expr over 'new_vars' (used to rewrite accesses). The new domain
      * is the bounding box of the image with a predicate carving out exactly the
-     * original points, so for an associative/commutative reduction the result is
-     * unchanged.
+     * original points.
      *
      * For example, skewing a 2D reduction with new_vars {u, v},
      * forward {r.x, r.y + r.x}, inverse {u, v - u} rewrites
      *   f() += g(r.x, r.y);
      * to iterate (u, v) over the skewed (parallelogram) domain and accumulate
-     * g(u, v - u). Any reduction-domain splits are materialized first.
+     * g(u, v - u). Any reduction-domain splits are lowered first.
      *
-     * Built on the pure reduction-rewrite core; primarily a testbed for that API
-     * (e.g. skewing to expose wavefront parallelism).
+     * If 'forward' and 'inverse' provably aren't inverses of each other, this is
+     * an error; if the simplifier can't show either way (as for some non-affine
+     * maps), it is a warning, and it is up to the caller.
+     *
+     * Reindexing changes the order the update's iterations run in. That is
+     * always fine for an associative and commutative update, as for reorder().
+     * Otherwise every dependence of the update must keep pointing forward: an
+     * iteration that reads the Func where another one writes it must still run
+     * after it, or before it if it ran before. This is checked for updates
+     * whose self-references are at constant distances from where they write
+     * (which covers skews, wavefronts, and diamond tiles of stencil-like
+     * recurrences, including through constant-factor splits): an order that
+     * breaks a dependence is an error. When it can't be checked, it is a
+     * warning, and it is up to the caller.
      *
      * Returns the new reduction variables (positionally, in 'new_vars' order) so
      * they can be scheduled directly, together with a per-variable flag saying
-     * whether that dimension is safe to parallelize under the produced loop
-     * order (it carries no loop-carried dependence). The flags are computed by a
-     * dependence analysis of the update's self-references; when the analysis
-     * cannot prove a uniform affine dependence structure it conservatively
-     * reports every dimension as unsafe.
+     * whether that dimension is safe to parallelize where it is in the new loop
+     * order: whether no dependence of the update is carried by it. When the
+     * dependences can't be analyzed, every dimension is reported unsafe.
+     * Parallelizing a reduction dimension still requires allow_race_conditions().
      *
      * 'loop_order', if non-empty, sets the loop order of the new reduction dims
-     * directly (innermost first), bypassing the associativity/commutativity
-     * check reorder() applies to RVars -- reindex may legally produce loop orders
-     * (e.g. a diamond-tiled wavefront) that reorder() would refuse. The caller is
-     * responsible for the order being dependence-legal. New rvars omitted from
-     * loop_order keep their relative order, placed outermost. */
+     * directly (innermost first). It may name each new var at most once; new
+     * vars omitted from it keep their relative order, placed outermost. */
     ReindexResult reindex(const std::vector<Var> &new_vars,
                           const std::vector<Expr> &forward,
                           const std::vector<Expr> &inverse,

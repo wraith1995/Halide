@@ -588,6 +588,86 @@ int hoist_invariants_nothing_to_hoist_rejected_test() {
     return 0;
 }
 
+// Hoisting from a reduction whose RVar was split by a factor that doesn't
+// divide its extent, so the split leaves a predicate on the lowered domain.
+int hoist_invariants_after_split_test(bool with_where) {
+    RDom r(0, 15, "r");
+    if (with_where) {
+        r.where(r % 3 != 0);
+    }
+    Func f{with_where ? "f_split_where" : "f_split"};
+    f() = 0;
+    f() += 2 * (r + 1) + 3 * (2 * r + 1);
+    RVar ro("ro"), ri("ri");
+    f.update().split(r, ro, ri, 4);
+    f.update().hoist_invariants();
+    Buffer<int> result = f.realize();
+    int expected = 0;
+    for (int i = 0; i < 15; i++) {
+        if (!with_where || i % 3 != 0) {
+            expected += 2 * (i + 1) + 3 * (2 * i + 1);
+        }
+    }
+    if (result() != expected) {
+        printf("hoist_invariants after a split%s: %d instead of %d\n",
+               with_where ? " with where()" : "", result(), expected);
+        return 1;
+    }
+    return 0;
+}
+
+// rfactor() and hoist_invariants() lower a split reduction domain before
+// factoring it. A call that is rejected leaves the stage as it was.
+int rejected_call_leaves_stage_test() {
+    if (!Halide::exceptions_enabled()) {
+        return 0;
+    }
+    ImageParam data_p{Int(32), 2, "data_p"};
+    Var i{"i"}, u{"u"};
+    RDom k(0, 8, "k");
+    Func f{"f_rejected"};
+    f(i) = 0;
+    // Nothing to hoist, and not associative either.
+    f(i) = f(i) * 2 + data_p(i, k);
+    RVar ko("ko"), ki("ki");
+    f.update().split(k, ko, ki, 4);
+
+    const size_t splits = f.update().get_schedule().splits().size();
+    const size_t rvars = f.update().get_schedule().rvars().size();
+    const string loops = f.update().dump_argument_list();
+    auto unchanged = [&](const char *what) {
+        if (f.update().get_schedule().splits().size() != splits ||
+            f.update().get_schedule().rvars().size() != rvars ||
+            f.update().dump_argument_list() != loops) {
+            printf("a rejected %s changed the stage\n", what);
+            return false;
+        }
+        return true;
+    };
+
+    bool rejected = false;
+    try {
+        f.update().hoist_invariants();
+    } catch (const Halide::CompileError &e) {
+        rejected = true;
+    }
+    if (!rejected || !unchanged("hoist_invariants()")) {
+        printf("hoist_invariants() should have been rejected without changing anything\n");
+        return 1;
+    }
+    rejected = false;
+    try {
+        f.update().rfactor(ko, u);
+    } catch (const Halide::CompileError &e) {
+        rejected = true;
+    }
+    if (!rejected || !unchanged("rfactor()")) {
+        printf("rfactor() should have been rejected without changing anything\n");
+        return 1;
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -610,6 +690,9 @@ int main(int argc, char **argv) {
         {"hoist_invariants test (after rfactor)", hoist_invariants_after_rfactor_test},
         {"hoist_invariants test (invalid law rejected)", hoist_invariants_invalid_law_rejected_test},
         {"hoist_invariants test (nothing to hoist rejected)", hoist_invariants_nothing_to_hoist_rejected_test},
+        {"hoist_invariants test (after a split)", [] { return hoist_invariants_after_split_test(false); }},
+        {"hoist_invariants test (after a split, with where)", [] { return hoist_invariants_after_split_test(true); }},
+        {"rejected rfactor/hoist_invariants leave the stage", rejected_call_leaves_stage_test},
     };
 
     using Sharder = Halide::Internal::Test::Sharder;

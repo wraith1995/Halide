@@ -73,9 +73,7 @@ bool run(int W, int H, int T) {
 
 int main() {
     // Both tile-multiple and non-tile-multiple interior extents. The latter make
-    // the split emit a `likely` tail guard on the (parallel) block index; these
-    // used to miscompile via trim_no_ops / solve_for_outer_interval mishandling
-    // min/max of booleans (fixed in src/Solve.cpp).
+    // the split emit a `likely` tail guard on the (parallel) block index.
     struct Case {
         int W, H, T;
     };

@@ -106,12 +106,12 @@ tests(
     device_copy_at_inner_loop.cpp
     device_crop.cpp
     device_slice.cpp
+    diamond_tile.cpp
     dilate3x3.cpp
     div_by_zero.cpp
     div_round_to_zero.cpp
     downsampling_reduce.cpp
     dynamic_allocation_in_gpu_kernel.cpp
-    diamond_tile.cpp
     dynamic_reduction_bounds.cpp
     eager_inline.cpp
     early_out.cpp
@@ -309,10 +309,13 @@ tests(
     realize_over_shifted_domain.cpp
     recursive_box_filters.cpp
     reduction_chain.cpp
-    reindex_skew.cpp
     reduction_non_rectangular.cpp
     reduction_predicate_racing.cpp
     reduction_schedule.cpp
+    reindex_legality.cpp
+    reindex_predicated.cpp
+    reindex_rejected.cpp
+    reindex_skew.cpp
     register_shuffle.cpp
     reorder_storage.cpp
     require.cpp

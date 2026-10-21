@@ -116,6 +116,11 @@ tests(
     realize_constantly_larger_than_two_gigs.cpp
     reduction_bounds.cpp
     reduction_type_mismatch.cpp
+    reindex_duplicate_name.cpp
+    reindex_loop_order_twice.cpp
+    reindex_name_clash.cpp
+    reindex_not_inverse.cpp
+    reindex_reversed_dependence.cpp
     require_fail.cpp
     reuse_var_in_schedule.cpp
     reused_args.cpp
