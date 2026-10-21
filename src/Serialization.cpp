@@ -358,6 +358,8 @@ Serialize::DimType Serializer::serialize_dim_type(const DimType &dim_type) {
         return Serialize::DimType::ImpureRVar;
     case DimType::InductiveVar:
         return Serialize::DimType::InductiveVar;
+    case DimType::NestedPureRVar:
+        return Serialize::DimType::NestedPureRVar;
     default:
         user_error << "Unsupported dim type\n";
         return Serialize::DimType::PureVar;

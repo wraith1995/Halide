@@ -2209,6 +2209,27 @@ public:
 // Check a schedule is legal, throwing an error if it is not. Returns whether or
 // not a realization of the Func should be injected. Unused intermediate Funcs
 // that somehow made it into the Func DAG can be discarded.
+// The variables, among `roots`, that each loop of a stage iterates over, after
+// the stage's splits.
+map<string, set<string>> loop_origins(const vector<string> &roots, const vector<Split> &splits) {
+    map<string, set<string>> origins;
+    for (const string &r : roots) {
+        origins[r] = {r};
+    }
+    for (const Split &s : splits) {
+        if (s.split_type == Split::FuseVars) {
+            origins[s.old_var] = origins[s.outer];
+            origins[s.old_var].insert(origins[s.inner].begin(), origins[s.inner].end());
+        } else {
+            origins[s.outer] = origins[s.old_var];
+            if (s.split_type == Split::SplitVar) {
+                origins[s.inner] = origins[s.old_var];
+            }
+        }
+    }
+    return origins;
+}
+
 bool validate_schedule(Function f, const Stmt &s, const Target &target, bool is_output, const map<string, Function> &env) {
 
     // If f is extern, check that none of its inputs are scheduled inline.
@@ -2253,6 +2274,15 @@ bool validate_schedule(Function f, const Stmt &s, const Target &target, bool is_
         }
     }
 
+    set<string> inductive_args;
+    if (f.is_inductive()) {
+        for (const string &arg : f.args()) {
+            if (f.is_inductive(arg)) {
+                inductive_args.insert(arg);
+            }
+        }
+    }
+
     if (f.is_inductive()) {
         // Check that any RDom used in an inductive Func's update
         // has its loop nested inside every inductive dimension.
@@ -2268,7 +2298,7 @@ bool validate_schedule(Function f, const Stmt &s, const Target &target, bool is_
                 continue;
             }
             for (size_t i = 0; i < upd.args().size() && i < f.args().size(); i++) {
-                if (!f.is_inductive(f.args()[i])) {
+                if (!inductive_args.count(f.args()[i])) {
                     continue;
                 }
                 const Variable *v = upd.args()[i].as<Variable>();
@@ -2292,37 +2322,11 @@ bool validate_schedule(Function f, const Stmt &s, const Target &target, bool is_
         // neighbours. Those have to be complete before the slice is, so
         // every loop over such a var must be nested inside every loop over
         // an inductive var.
-        set<string> neighbour_vars;
-        for (const Expr &value : f.values()) {
-            visit_with(value, [&](auto *self, const Call *op) {
-                if (op->call_type == Call::Halide && op->name == f.name()) {
-                    for (size_t i = 0; i < op->args.size() && i < f.args().size(); i++) {
-                        const Variable *v = op->args[i].as<Variable>();
-                        if (!f.is_inductive(f.args()[i]) && !(v && v->name == f.args()[i])) {
-                            neighbour_vars.insert(f.args()[i]);
-                        }
-                    }
-                }
-                self->visit_base(op);
-            });
-        }
+        const vector<string> neighbours = f.neighbour_args();
+        const set<string> neighbour_vars(neighbours.begin(), neighbours.end());
         if (!neighbour_vars.empty()) {
             // The pure vars each loop of the pure definition iterates over.
-            map<string, set<string>> origins;
-            for (const string &arg : f.args()) {
-                origins[arg] = {arg};
-            }
-            for (const Split &s : f.definition().schedule().splits()) {
-                if (s.split_type == Split::FuseVars) {
-                    origins[s.old_var] = origins[s.outer];
-                    origins[s.old_var].insert(origins[s.inner].begin(), origins[s.inner].end());
-                } else {
-                    origins[s.outer] = origins[s.old_var];
-                    if (s.split_type == Split::SplitVar) {
-                        origins[s.inner] = origins[s.old_var];
-                    }
-                }
-            }
+            map<string, set<string>> origins = loop_origins(f.args(), f.definition().schedule().splits());
             const vector<Dim> &dims = f.definition().schedule().dims();
             for (size_t inner = 0; inner < dims.size(); inner++) {
                 for (const string &n : origins[dims[inner].var]) {
@@ -2331,7 +2335,7 @@ bool validate_schedule(Function f, const Stmt &s, const Target &target, bool is_
                     }
                     for (size_t outer = 0; outer <= inner; outer++) {
                         for (const string &o : origins[dims[outer].var]) {
-                            user_assert(!f.is_inductive(o))
+                            user_assert(!inductive_args.count(o))
                                 << "Inductive Func " << f.name() << " reads itself at other values of "
                                 << n << " in the previous step along " << o << ", so every loop over "
                                 << n << " must be nested inside every loop over " << o

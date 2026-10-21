@@ -209,23 +209,37 @@ public:
      * diamond tiling.
      *
      * phi may be any invertible map, not just an affine one; the only requirement
-     * is that the image of 'forward' over the current domain be bounded. That
-     * 'forward' and 'inverse' are genuinely inverse and phi is a bijection is the
-     * caller's responsibility -- it is not checked.
+     * is that the image of 'forward' over the current domain be bounded. If
+     * 'forward' and 'inverse' provably aren't inverses of each other, this is an
+     * error; if the simplifier can't show either way (as for some non-affine
+     * maps), it is a warning, and it is up to the caller.
+     *
+     * Reindexing changes the order the update's iterations run in. That is
+     * always fine for an associative and commutative update, as for reorder().
+     * Otherwise every dependence of the update must keep pointing forward: an
+     * iteration that reads the Func where another one writes it must still run
+     * after it, or before it if it ran before. This is checked for updates
+     * whose self-references are at constant distances from where they write
+     * (which covers skews, wavefronts, and diamond tiles of stencil-like
+     * recurrences, including through constant-factor splits): an order that
+     * breaks a dependence is an error. When it can't be checked, it is a
+     * warning, and it is up to the caller.
      *
      * Returns the new reduction variables and, for each, whether it is safe to
-     * parallelize under the resulting loop order. Safety is decided by Halide's
-     * own race analysis (see can_parallelize_rvar); when it cannot prove an axis
-     * race-free -- as happens for maps it cannot reason about, e.g. non-affine
-     * ones -- that axis is conservatively reported unsafe and left an ImpureRVar,
-     * so parallelizing it still requires allow_race_conditions().
+     * parallelize given the loops outside it in the resulting loop order. Safety
+     * is decided by Halide's own race analysis (see can_parallelize_rvar); when
+     * it cannot prove an axis race-free -- as happens for maps it cannot reason
+     * about, e.g. non-affine ones -- that axis is reported unsafe and left an
+     * ImpureRVar, so parallelizing it still requires allow_race_conditions().
+     * An axis that is safe whatever the other loops do becomes a PureRVar. One
+     * that is only safe given the loops outside it -- a position on a wavefront
+     * is only independent of the others on the same wavefront -- becomes a
+     * NestedPureRVar, which can be parallelized where it is but is reordered
+     * like an ImpureRVar, so the loops it relies on stay outside it.
      *
      * 'loop_order', if non-empty, sets the loop order of the new reduction dims
-     * directly (innermost first), bypassing the associativity/commutativity
-     * check reorder() applies to RVars -- reindex may legally produce loop orders
-     * (e.g. a diamond-tiled wavefront) that reorder() would refuse. The caller is
-     * responsible for the order being dependence-legal. New rvars omitted from
-     * loop_order keep their relative order, placed outermost. */
+     * directly (innermost first). It may name each new var at most once; new
+     * vars omitted from it keep their relative order, placed outermost. */
     ReindexResult reindex(const std::vector<Var> &new_vars,
                           const std::vector<Expr> &forward,
                           const std::vector<Expr> &inverse,
@@ -2320,9 +2334,11 @@ public:
      * store. Schedule the returned Func (e.g. compute_root()) to materialize the
      * reindexed layout. Unlike reorder_storage(), phi may be any bijection
      * (reflection, skew, a modular shift, ...), not just a permutation of
-     * dimensions, and need not be affine. That 'forward' and 'inverse' are
-     * genuinely inverse and phi is a bijection is the caller's responsibility --
-     * it is not checked.
+     * dimensions, and need not be affine. If 'forward' and 'inverse' provably
+     * aren't inverses of each other, this is an error. The storage dimensions
+     * have no bounds at this point, so a map that is only invertible within
+     * them (such as a modular shift) can't be checked, and it is up to the
+     * caller that phi is a bijection.
      *
      * Currently supports pure Funcs (no update definitions). For maps whose image
      * of the storage box is not itself a box (e.g. a skew), the wrapped store is

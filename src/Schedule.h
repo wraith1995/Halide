@@ -446,6 +446,16 @@ enum class DimType {
      * introduced by data hazards (e.g. in the algorithm HOGWILD!).
      */
     ImpureRVar,
+
+    /** The dim originated from an RVar, and evaluating the Func at
+     * distinct values of it has no data hazards given the values of the
+     * loops it is currently nested inside, but it may have some
+     * otherwise. A position on a wavefront is like this: positions on one
+     * wavefront are independent, but depend on earlier wavefronts.
+     * NestedPureRVars may be parallelized or vectorized where they are,
+     * like PureRVars, but are reordered like ImpureRVars, so that the loops
+     * they rely on stay outside them. reindex() produces them. */
+    NestedPureRVar,
 };
 
 /** The Dim struct represents one loop in the schedule's
@@ -477,7 +487,14 @@ struct Dim {
     /** Did this loop originate from an RVar (in which case the bounds
      * of the loops are algorithmically meaningful)? */
     bool is_rvar() const {
-        return (dim_type == DimType::PureRVar) || (dim_type == DimType::ImpureRVar);
+        return (dim_type == DimType::PureRVar) || (dim_type == DimType::ImpureRVar) ||
+               (dim_type == DimType::NestedPureRVar);
+    }
+
+    /** Can this dim be parallelized or vectorized where it is in the loop
+     * nest, without races? */
+    bool is_parallel_safe() const {
+        return is_pure() || dim_type == DimType::NestedPureRVar;
     }
 
     bool is_inductive() const {

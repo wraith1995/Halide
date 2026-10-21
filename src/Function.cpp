@@ -1317,6 +1317,34 @@ bool Function::is_inductive(const string &var) const {
     return inductive_in(defs, var, name());
 }
 
+std::vector<std::string> Function::neighbour_args() const {
+    std::vector<std::string> result;
+    if (!is_inductive()) {
+        return result;
+    }
+    const std::vector<std::string> &pure_args = args();
+    std::vector<bool> neighbour(pure_args.size(), false);
+    for (const Expr &value : values()) {
+        visit_with(value, [&](auto *self, const Call *op) {
+            if (op->call_type == Call::Halide && op->name == name()) {
+                for (size_t i = 0; i < op->args.size() && i < pure_args.size(); i++) {
+                    const Variable *v = op->args[i].as<Variable>();
+                    if (!(v && v->name == pure_args[i])) {
+                        neighbour[i] = true;
+                    }
+                }
+            }
+            self->visit_base(op);
+        });
+    }
+    for (size_t i = 0; i < pure_args.size(); i++) {
+        if (neighbour[i] && !is_inductive(pure_args[i])) {
+            result.push_back(pure_args[i]);
+        }
+    }
+    return result;
+}
+
 bool Function::can_be_inlined() const {
     return is_pure() && definition().specializations().empty() && !is_inductive();
 }

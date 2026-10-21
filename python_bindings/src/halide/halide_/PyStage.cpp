@@ -6,6 +6,10 @@ namespace Halide {
 namespace PythonBindings {
 
 void define_stage(py::module &m) {
+    py::class_<ReindexResult>(m, "ReindexResult")
+        .def_readonly("vars", &ReindexResult::vars)
+        .def_readonly("parallel_safe", &ReindexResult::parallel_safe);
+
     auto stage_class =
         py::class_<Stage>(m, "Stage")
             // for implicitly_convertible
@@ -23,6 +27,10 @@ void define_stage(py::module &m) {
                  py::arg("preserved"))
             .def("rfactor", static_cast<Func (Stage::*)(const RVar &, const Var &)>(&Stage::rfactor),
                  py::arg("r"), py::arg("v"))
+
+            .def("reindex", &Stage::reindex,
+                 py::arg("new_vars"), py::arg("forward"), py::arg("inverse"),
+                 py::arg("loop_order") = std::vector<Var>{})
 
             .def("eager_inline", (Stage & (Stage::*)(const std::vector<Func> &)) & Stage::eager_inline, py::arg("fs"))
             .def("eager_inline", [](Stage &stage, const py::args &args) -> Stage & {

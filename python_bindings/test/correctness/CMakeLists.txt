@@ -27,6 +27,7 @@ set(tests
     pystub.py
     rdom.py
     realize_warnings.py
+    reindex.py
     runtime_prefixes.py
     serialization.py
     target.py

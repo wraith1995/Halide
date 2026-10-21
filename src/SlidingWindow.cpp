@@ -1566,6 +1566,16 @@ class SlidingWindow : public IRMutator {
             return IRMutator::visit(op);
         }
 
+        // An inductive Func that reads its neighbours in the previous step,
+        // as a stencil over time does, is computed over the bounding box of
+        // the cone of earlier steps each point needs. The points at the edges
+        // of that box read neighbours that weren't computed, so they are only
+        // right inside the cone, which moves with the region required.
+        // Sliding would reuse them as if they were right everywhere.
+        if (!iter->second.neighbour_args().empty()) {
+            return IRMutator::visit(op);
+        }
+
         // We want to slide innermost first, so put it on the front of
         // the list.
         sliding.push_front(iter->second);

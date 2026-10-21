@@ -1052,8 +1052,15 @@ public:
 class FindInPlaceFoldSite : public IRVisitor {
     const string &func;
     vector<std::pair<string, Expr>> lets;
+    int loop_depth = 0;
 
     using IRVisitor::visit;
+
+    void visit(const For *op) override {
+        loop_depth++;
+        IRVisitor::visit(op);
+        loop_depth--;
+    }
 
     void visit(const LetStmt *op) override {
         op->value.accept(this);
@@ -1066,6 +1073,7 @@ class FindInPlaceFoldSite : public IRVisitor {
         if (op->name != func) {
             IRVisitor::visit(op);
         } else if (op->is_producer) {
+            produce_in_loop = loop_depth > 0;
             // Look through the lets at the top of the produce node for the
             // loop it runs outermost.
             Stmt s = op->body;
@@ -1085,6 +1093,9 @@ class FindInPlaceFoldSite : public IRVisitor {
 
 public:
     const For *loop = nullptr;
+    // Whether the produce node is inside a loop within the realization, so
+    // it runs more than once into the same storage.
+    bool produce_in_loop = false;
     Stmt consume;
     vector<std::pair<string, Expr>> loop_lets, consume_lets;
 
@@ -1146,10 +1157,14 @@ std::pair<int, Expr> fold_inductive_in_place(const Function &func, const Stmt &b
         return no_fold;
     }
 
+    // The produce must run once per realization. If it runs again into the
+    // same storage, each run may compute only part of the slices and rely on
+    // the rest from earlier runs, as a sliding window does, and those may be
+    // slices the fold has already overwritten.
     FindInPlaceFoldSite site(func.name());
     body.accept(&site);
     const string loop_name = func.name() + ".s0." + func.args()[dim];
-    if (!site.loop || site.loop->name != loop_name ||
+    if (site.produce_in_loop || !site.loop || site.loop->name != loop_name ||
         site.loop->for_type != ForType::Serial || !site.consume.defined()) {
         return no_fold;
     }

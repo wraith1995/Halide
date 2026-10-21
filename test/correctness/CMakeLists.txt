@@ -319,11 +319,14 @@ tests(
     reindex_gpu.cpp
     reindex_inductive.cpp
     reindex_inductive_2d.cpp
+    reindex_legality.cpp
     reindex_maps.cpp
     reindex_ops.cpp
     reindex_parallel.cpp
+    reindex_parallel_order.cpp
     reindex_predicated.cpp
     reindex_pure_dim.cpp
+    reindex_rejected.cpp
     reindex_skew.cpp
     reindex_slide.cpp
     reindex_storage.cpp

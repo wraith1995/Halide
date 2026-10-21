@@ -142,7 +142,14 @@ tests(
     reuse_var_in_schedule.cpp
     reused_args.cpp
     reindex_bad_loop_order.cpp
+    reindex_duplicate_name.cpp
+    reindex_loop_order_twice.cpp
+    reindex_name_clash.cpp
+    reindex_not_inverse.cpp
+    reindex_parallel_reordered.cpp
+    reindex_reversed_dependence.cpp
     reindex_size_mismatch.cpp
+    reindex_storage_not_inverse.cpp
     reindex_storage_on_update.cpp
     reorder_inductive_split.cpp
     rfactor_after_var_and_rvar_fusion.cpp

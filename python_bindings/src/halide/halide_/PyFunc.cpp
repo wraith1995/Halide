@@ -201,6 +201,8 @@ void define_func(py::module &m) {
 
             .def("bound", &Func::bound, py::arg("var"), py::arg("min"), py::arg("extent"))
 
+            .def("reindex_storage", &Func::reindex_storage, py::arg("new_vars"), py::arg("forward"), py::arg("inverse"))
+
             .def("reorder_storage", (Func & (Func::*)(const std::vector<Var> &)) & Func::reorder_storage, py::arg("dims"))
             .def("reorder_storage", [](Func &func, const py::args &args) -> Func & {
                 return func.reorder_storage(args_to_vector<Var>(args));

@@ -31,11 +31,16 @@
  *
  * Only t is inductive here, since f reads ahead along x as well as behind it. Computing
  * a region of f widens it along x by the stencil's reach at every step back, so the loop
- * over x must be inside the loop over t. When f is computed in its own loop over t and
- * its consumers read only its last few slices, as g does, f's storage folds down to the
- * slices the step reads, in place, with nothing in the schedule asking for it. Computing
+ * over x must be inside the loop over t. When f is computed in its own loop over t, once
+ * for each time it is stored (not slid along by a loop outside it), and its consumers read
+ * only its last few slices, as g does, f's storage folds down to the slices the step
+ * reads, in place, with nothing in the schedule asking for it. Computing
  * f per tile of g (f.compute_at(g, xo)) then tiles the whole computation in time: each
  * tile computes the cone of earlier slices it depends on, in a two-slice window.
+ *
+ * The region computed of each slice is the bounding box of that cone, so the points at
+ * its edges read neighbours that are allocated but never computed. Their values are
+ * meaningless, but they only reach points outside the cone, which nothing reads.
  *
  * In inductive functions, any recursive references must be inside a select statement,
  * and cannot be inside nested select statements. The inductive arguments in the

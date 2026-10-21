@@ -459,6 +459,9 @@ std::ostream &operator<<(std::ostream &out, const DimType &t) {
     case DimType::ImpureRVar:
         out << "ImpureRVar";
         break;
+    case DimType::NestedPureRVar:
+        out << "NestedPureRVar";
+        break;
     }
     return out;
 }

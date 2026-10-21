@@ -980,10 +980,15 @@ public:
                 is_inductive_var.push_back(s.func.is_inductive(arg));
             }
             for (const auto &b1 : s.bounds) {
-                // const Box &b = b1.second;
+                // Expand the box each consumer requires for every value of the
+                // Func separately, and take the union, rather than expanding
+                // the result for one value again for the next.
+                const Box required = b1.second;
+                Box expanded = required;
                 for (const auto &cval : s.exprs) {
-                    s.bounds[b1.first] = expand_to_include_base_case(s.func.args(), is_inductive_var, cval.value, s.func.name(), s.bounds[b1.first], s.stage != 0);
+                    merge_boxes(expanded, expand_to_include_base_case(s.func.args(), is_inductive_var, cval.value, s.func.name(), required, s.stage != 0));
                 }
+                s.bounds[b1.first] = expanded;
             }
         }
 

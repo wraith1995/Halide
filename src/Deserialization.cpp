@@ -388,6 +388,8 @@ DimType Deserializer::deserialize_dim_type(Serialize::DimType dim_type) {
         return DimType::ImpureRVar;
     case Serialize::DimType::InductiveVar:
         return DimType::InductiveVar;
+    case Serialize::DimType::NestedPureRVar:
+        return DimType::NestedPureRVar;
     default:
         user_error << "unknown dim type " << (int)dim_type << "\n";
         return DimType::PureVar;

@@ -202,6 +202,12 @@ public:
     /** Is this function inductive in the given variable? */
     bool is_inductive(const std::string &var) const;
 
+    /** The pure args, other than inductive ones, at which the pure
+     * definition of an inductive function reads itself somewhere other
+     * than where it writes, as a stencil does along x in
+     * f(x, t) = f(x - 1, t - 1) + f(x + 1, t - 1). */
+    std::vector<std::string> neighbour_args() const;
+
     /** Is it legal to inline this function? */
     bool can_be_inlined() const;
 

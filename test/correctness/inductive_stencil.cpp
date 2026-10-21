@@ -82,6 +82,12 @@ int run(int schedule, int last) {
             out.parallel(xo);
             f.vectorize(x, 8);
         }
+        if (schedule == 3) {
+            // Store f once for all tiles, so sliding window computes only the
+            // new part of f for each tile, using what earlier tiles computed.
+            // Those parts of earlier slices have to survive.
+            f.store_root();
+        }
     }
 
     int slices = -1;
@@ -98,6 +104,58 @@ int run(int schedule, int last) {
         }
     }
     return slices;
+}
+
+// Records the extent along x of the allocations of a Func (each of its values,
+// if it has several).
+class RecordWidth : public IRMutator {
+    using IRMutator::visit;
+    Stmt visit(const Allocate *op) override {
+        if (op->name == func || starts_with(op->name, func + ".")) {
+            auto e = as_const_int(op->extents[0]);
+            *width = e ? (int)*e : -1;
+        }
+        return IRMutator::visit(op);
+    }
+
+public:
+    std::string func;
+    int *width;
+    RecordWidth(std::string f, int *w)
+        : func(std::move(f)), width(w) {
+    }
+};
+
+// A stencil with no boundary along x widens by its reach at every step back.
+// With two values, each widens it from the region required, not one after the
+// other. Returns the widths allocated for one value and for two, or -2 on a
+// wrong answer.
+std::pair<int, int> widths_for_one_and_two_values() {
+    Var x("x"), t("t");
+    Func one(Int(32), "f_one");
+    one(x, t) = select(t <= 0, x, likely(one(x - 1, t - 1) + one(x + 1, t - 1)));
+    Func two({Int(32), Int(32)}, "f_two");
+    two(x, t) = Tuple(select(t <= 0, x, likely(two(x - 1, t - 1)[0] + two(x + 1, t - 1)[0])),
+                      select(t <= 0, 2 * x, likely(two(x - 1, t - 1)[1] + two(x + 1, t - 1)[1])));
+    Func out_one("out_one"), out_two("out_two");
+    out_one(x) = one(x, 6);
+    out_two(x) = two(x, 6)[0] + two(x, 6)[1];
+    out_one.bound(x, 0, 16);
+    out_two.bound(x, 0, 16);
+    one.compute_root();
+    two.compute_root();
+    int w1 = -1, w2 = -1;
+    out_one.add_custom_lowering_pass(new RecordWidth("f_one", &w1));
+    out_two.add_custom_lowering_pass(new RecordWidth("f_two", &w2));
+    Buffer<int> r1 = out_one.realize({16});
+    Buffer<int> r2 = out_two.realize({16});
+    for (int i = 0; i < 16; i++) {
+        if (r2(i) != 3 * r1(i)) {
+            printf("two values: out(%d) = %d instead of %d\n", i, r2(i), 3 * r1(i));
+            return {-2, -2};
+        }
+    }
+    return {w1, w2};
 }
 
 // Every slice is read, so nothing can fold.
@@ -131,24 +189,35 @@ int main(int argc, char **argv) {
     };
     // The step reaches one slice back, so the window keeps two. A consumer
     // reading the last two slices fits in that window; one reading the last
-    // three needs a window of four.
+    // three needs a window of four. A Func slid along by a loop outside it
+    // (schedule 3) doesn't fold in place: 0 means every slice is kept.
     const Case cases[] = {
         {0, 1, 2},
         {1, 1, 2},
         {2, 1, 2},
         {0, 2, 2},
         {1, 3, 4},
+        {3, 1, 0},
     };
     for (const Case &c : cases) {
         int slices = run(c.schedule, c.last);
         if (slices == -2) {
             return 1;
         }
-        if (slices != c.slices) {
+        if (c.slices == 0 ? (slices >= 0 && slices < T) : slices != c.slices) {
             printf("schedule %d, last %d: expected %d slices allocated, got %d\n",
                    c.schedule, c.last, c.slices, slices);
             return 1;
         }
+    }
+
+    auto [w1, w2] = widths_for_one_and_two_values();
+    if (w1 == -2) {
+        return 1;
+    }
+    if (w2 != w1) {
+        printf("one value allocates %d along x, but two allocate %d\n", w1, w2);
+        return 1;
     }
 
     int slices = run_all_slices();

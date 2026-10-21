@@ -46,6 +46,27 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // The RVars reindex() returns carry the predicate too, in their own
+    // terms, so a new definition over them visits the same points.
+    {
+        const int K = 10;
+        Func f("f_pred"), count("count");
+        RDom r(0, W, 0, H, "r");
+        r.where(r.x + r.y < K);
+        f() = 0;
+        f() += in(r.x, r.y);
+        Var u("u"), v("v");
+        ReindexResult res = f.update().reindex({u, v}, {r.x + 2 * r.y, r.y}, {u - 2 * v, v});
+        count() = 0;
+        count() += select(res.vars[0] >= 0, 1, 0);
+        Buffer<int> c = count.realize();
+        const int points = K * (K + 1) / 2;
+        if (c() != points) {
+            printf("a new definition over the returned RVars visits %d points, not %d\n", c(), points);
+            return 1;
+        }
+    }
+
     printf("Success!\n");
     return 0;
 }
