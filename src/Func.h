@@ -235,7 +235,8 @@ public:
      * that is only safe given the loops outside it -- a position on a wavefront
      * is only independent of the others on the same wavefront -- becomes a
      * NestedPureRVar, which can be parallelized where it is but is reordered
-     * like an ImpureRVar, so the loops it relies on stay outside it.
+     * like an ImpureRVar; a reorder that moves a loop it relies on inside it
+     * makes it an ImpureRVar.
      *
      * 'loop_order', if non-empty, sets the loop order of the new reduction dims
      * directly (innermost first). It may name each new var at most once; new

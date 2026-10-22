@@ -332,6 +332,7 @@ tests(
     reindex_storage.cpp
     reindex_temporal_tile.cpp
     reindex_tuple.cpp
+    reorder_dependences.cpp
     reorder_storage.cpp
     require.cpp
     reschedule.cpp

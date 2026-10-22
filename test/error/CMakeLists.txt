@@ -152,6 +152,8 @@ tests(
     reindex_storage_not_inverse.cpp
     reindex_storage_on_update.cpp
     reorder_inductive_split.cpp
+    reorder_parallel_nested.cpp
+    reorder_reversed_dependence.cpp
     rfactor_after_var_and_rvar_fusion.cpp
     rfactor_fused_var_and_rvar.cpp
     rfactor_inner_dim_non_commutative.cpp

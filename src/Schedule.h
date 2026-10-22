@@ -435,7 +435,10 @@ enum class DimType {
      * 1) In the case of an update definition that has been proven to be
      * an associative and commutative reduction, reordering of
      * ImpureRVars is allowed, and parallelizing them is allowed if
-     * the update has been made atomic.
+     * the update has been made atomic. Otherwise, reordering them is
+     * allowed if it provably keeps every iteration after the
+     * iterations it depends on (which can be shown for updates whose
+     * self-references are at constant distances from where they write).
      *
      * 2) ImpureRVars can also be reordered and parallelized if
      * Func::allow_race_conditions() has been set. This is the escape
@@ -453,8 +456,10 @@ enum class DimType {
      * otherwise. A position on a wavefront is like this: positions on one
      * wavefront are independent, but depend on earlier wavefronts.
      * NestedPureRVars may be parallelized or vectorized where they are,
-     * like PureRVars, but are reordered like ImpureRVars, so that the loops
-     * they rely on stay outside them. reindex() produces them. */
+     * like PureRVars, but are reordered like ImpureRVars. A reorder that
+     * moves a loop from outside one to inside it checks again whether it
+     * is safe, and makes it an ImpureRVar if it can't show that.
+     * reindex() produces them. */
     NestedPureRVar,
 };
 

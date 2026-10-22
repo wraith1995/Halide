@@ -1615,6 +1615,102 @@ vector<bool> classify_reduction_parallelism(Definition &def,
     return parallel_safe;
 }
 
+// Whether any of a stage's splits fuses a pure Var with an RVar, which
+// materialize_reduction_domain() can't lower.
+bool fuses_var_with_rvar(const StageSchedule &sched) {
+    std::set<string> rdims;
+    for (const ReductionVariable &rv : sched.rvars()) {
+        rdims.insert(rv.var);
+    }
+    for (const Split &split : sched.splits()) {
+        switch (split.split_type) {
+        case Split::SplitVar:
+            if (rdims.erase(split.old_var)) {
+                rdims.insert(split.outer);
+                rdims.insert(split.inner);
+            }
+            break;
+        case Split::FuseVars:
+            if (rdims.count(split.outer) != rdims.count(split.inner)) {
+                return true;
+            }
+            if (rdims.erase(split.outer) + rdims.erase(split.inner)) {
+                rdims.insert(split.old_var);
+            }
+            break;
+        case Split::RenameVar:
+            if (rdims.erase(split.old_var)) {
+                rdims.insert(split.outer);
+            }
+            break;
+        }
+    }
+    return false;
+}
+
+struct LoopOrderDependences {
+    ReindexDependences deps;
+    // The definition with its reduction-domain splits lowered and its loops in
+    // the new order, and the name of the leaf each reduction dim became.
+    Definition leaves;
+    std::map<string, string> leaf_of_dim;
+    std::set<string> inductive_args;
+};
+
+// The dependences of an update when its loops run in the order `new_dims`
+// instead of the order `def` has now, which orients them (see
+// check_reindex_order). Nullopt if the reduction domain's splits can't be
+// lowered.
+optional<LoopOrderDependences> check_loop_order(const Function &function,
+                                                const Definition &def,
+                                                const vector<Dim> &new_dims) {
+    if (fuses_var_with_rvar(def.schedule())) {
+        return std::nullopt;
+    }
+    LoopOrderDependences result;
+    result.leaves = def.get_copy();
+    result.leaves.schedule().dims() = new_dims;
+    const SubstitutionMap leaves_of =
+        materialize_reduction_domain(result.leaves, function.name(), "reorder", "");
+
+    // Lowering the splits renames each reduction dim in place.
+    vector<string> leaves;
+    for (const Dim &d : result.leaves.schedule().dims()) {
+        if (d.is_rvar()) {
+            leaves.push_back(d.var);
+        }
+    }
+    size_t k = 0;
+    for (const Dim &d : new_dims) {
+        if (d.is_rvar()) {
+            result.leaf_of_dim[d.var] = leaves[k++];
+        }
+    }
+
+    vector<string> leaf_order;
+    for (auto it = def.schedule().dims().rbegin(); it != def.schedule().dims().rend(); ++it) {
+        if (it->is_rvar()) {
+            leaf_order.push_back(result.leaf_of_dim.at(it->var));
+        }
+    }
+    vector<Expr> forward;
+    for (const string &leaf : leaves) {
+        forward.push_back(Variable::make(Int(32), leaf));
+    }
+    vector<int> new_order;
+    for (int j = (int)leaves.size() - 1; j >= 0; j--) {
+        new_order.push_back(j);
+    }
+    for (const string &pure_arg : function.args()) {
+        if (function.is_inductive(pure_arg)) {
+            result.inductive_args.insert(pure_arg);
+        }
+    }
+    result.deps = check_reindex_order(read_reduction_stage(def), function.name(), function.args(),
+                                      result.inductive_args, leaves_of, leaf_order, forward, new_order);
+    return result;
+}
+
 }  // namespace
 Func Stage::rfactor(const vector<pair<RVar, Var>> &preserved) {
     user_assert(!definition.is_init()) << "rfactor() must be called on an update definition\n";
@@ -2945,10 +3041,12 @@ Stage &Stage::reorder(const std::vector<VarOrRVar> &vars) {
         }
     }
 
-    // It is illegal to reorder RVars if the stage is not associative
-    // or not commutative. Look for RVar reorderings and try to do the
-    // necessary proof if any are found.
+    // Reordering RVars is fine if the stage is associative and commutative,
+    // or if the new order keeps every dependence pointing forward. Look for
+    // RVar reorderings and try to do the necessary proof if any are found.
     bool safe_to_reorder = is_const_assignment(func_name, args, values);
+    optional<pair<string, string>> swapped;
+    bool swaps_only_rvars = true;
     for (size_t i = 0; !safe_to_reorder && i < idx.size(); i++) {
         if (!dims[idx[i]].is_pure()) {
             for (size_t j = i + 1; !safe_to_reorder && j < idx.size(); j++) {
@@ -2980,18 +3078,14 @@ Stage &Stage::reorder(const std::vector<VarOrRVar> &vars) {
                             << "inductive variable, whose loops must keep their "
                             << "nesting order.\n";
                     }
-                    // Generate an error if the operator is not both associative and commutative.
-                    const auto &prover_result = prove_associativity(func_name, args, values);
-                    safe_to_reorder = prover_result.associative() &&
-                                      prover_result.commutative();
-                    if (!safe_to_reorder) {
-                        user_error
-                            << "In schedule for " << name()
-                            << ", can't reorder RVars " << vars[i].name()
-                            << " and " << vars[j].name()
-                            << " because it may change the meaning of the "
-                            << "algorithm.\n";
+                    // Fine if the operator is both associative and commutative.
+                    if (!swapped) {
+                        const auto &prover_result = prove_associativity(func_name, args, values);
+                        safe_to_reorder = prover_result.associative() &&
+                                          prover_result.commutative();
+                        swapped = {vars[i].name(), vars[j].name()};
                     }
+                    swaps_only_rvars = swaps_only_rvars && dims[idx[i]].is_rvar() && dims[idx[j]].is_rvar();
                 }
             }
         }
@@ -3005,7 +3099,91 @@ Stage &Stage::reorder(const std::vector<VarOrRVar> &vars) {
         dims[sorted[i]] = dims_old[idx[i]];
     }
 
+    // Otherwise the new order must keep every dependence of the update
+    // pointing forward. Which dependences each loop carries is also needed
+    // below if a NestedPureRVar loses a loop outside it.
+    std::map<string, size_t> new_pos;
+    for (size_t i = 0; i < dims.size(); i++) {
+        new_pos[dims[i].var] = i;
+    }
+    std::set<string> rechecked;
+    for (size_t i = 0; i < dims_old.size(); i++) {
+        for (size_t j = i + 1; j < dims_old.size(); j++) {
+            if (dims_old[i].dim_type == DimType::NestedPureRVar &&
+                new_pos[dims_old[j].var] < new_pos[dims_old[i].var]) {
+                rechecked.insert(dims_old[i].var);
+            }
+        }
+    }
+    if (safe_to_reorder) {
+        swapped = std::nullopt;
+    }
+    optional<LoopOrderDependences> deps;
+    if ((swapped && swaps_only_rvars) || !rechecked.empty()) {
+        deps = check_loop_order(function, definition, dims);
+    }
+    if (swapped) {
+        const OrderCheck order = (deps && swaps_only_rvars) ? deps->deps.order : OrderCheck::Unknown;
+        user_assert(order != OrderCheck::Illegal)
+            << "In schedule for " << name()
+            << ", can't reorder RVars " << swapped->first
+            << " and " << swapped->second
+            << " because it would run some iteration of the update before an "
+            << "iteration it depends on, which changes the result.\n";
+        user_assert(order == OrderCheck::Legal)
+            << "In schedule for " << name()
+            << ", can't reorder RVars " << swapped->first
+            << " and " << swapped->second
+            << " because it may change the meaning of the "
+            << "algorithm.\n";
+    }
+
+    // A NestedPureRVar is safe to parallelize given the loops outside it, so
+    // check it again if one of them moved inside it.
+    if (!rechecked.empty()) {
+        vector<string> axes;
+        vector<bool> carries;
+        for (const string &d : rechecked) {
+            axes.push_back(deps ? deps->leaf_of_dim.at(d) : d);
+            if (deps && deps->deps.order == OrderCheck::Legal) {
+                // The analysis numbers the reduction loops innermost first.
+                size_t k = 0;
+                for (const Dim &l : deps->leaves.schedule().dims()) {
+                    if (l.var == axes.back()) {
+                        carries.push_back(deps->deps.carries[k]);
+                    }
+                    k += l.is_rvar();
+                }
+            }
+        }
+        if (deps) {
+            classify_reduction_parallelism(deps->leaves, func_name, axes,
+                                           deps->inductive_args, carries);
+        }
+        for (Dim &d : dims) {
+            if (!rechecked.count(d.var)) {
+                continue;
+            }
+            DimType type = DimType::ImpureRVar;
+            if (deps) {
+                for (const Dim &l : deps->leaves.schedule().dims()) {
+                    if (l.var == deps->leaf_of_dim.at(d.var)) {
+                        type = l.dim_type;
+                    }
+                }
+            }
+            d.dim_type = type;
+        }
+    }
+
     dims_old.swap(dims);
+
+    // Check again that the parallel loops whose types changed are safe.
+    for (const Dim &d : dims_old) {
+        if (rechecked.count(d.var) && is_parallel(d.for_type)) {
+            set_dim_type(VarOrRVar(d.var, true), d.for_type);
+        }
+    }
 
     // We're not allowed to reorder Var::outermost inwards (rfactor assumes it's
     // the last one).
