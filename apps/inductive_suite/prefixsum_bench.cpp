@@ -21,6 +21,21 @@
 // the run serial, so one binary covers both the 1-core and the all-cores
 // cells. UNFOLD=1 pins the fold to W, materializing the full prefix
 // trajectory with the fusion unchanged.
+//
+// The per-optimization ablation adds rows for the same schedule with the
+// optimizations taken away, cumulatively:
+//
+//   ablation fusion        prefix_sum computed at output's loop and stored
+//                          there too, so nothing slides: each group (or
+//                          element) recomputes the row's prefix from x = 0,
+//                          O(W^2). Run only when HB_FUSION is set.
+//   ablation slide         stored per row and slid along x, the storage
+//                          pinned to the whole row (fold_storage(x, W)), and
+//                          the scan not unrolled.
+//   ablation slide+unroll  the slide, with the scan unrolled by 8 (default
+//                          schedule only; SCALAR=1 does not unroll).
+//
+// The FOLDED row is the last level, every optimization on.
 #include "Halide.h"
 
 #include "../support/bench_harness.h"
@@ -28,6 +43,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 using namespace Halide;
 
@@ -53,21 +70,43 @@ int main(int argc, char **argv) {
             for (int xx = 0; xx < W; xx++)
                 input(xx, yy) = (xx + yy) & 255;
 
-        Func prefix_sum(Int(32), "prefix_sum"), output("output");
-        prefix_sum(x, y) = select(x <= 0, input(0, y), likely(prefix_sum(x - 1, y) + input(x, y)));
-        // The running mean, in single precision: the sum stays exact in int32.
-        output(x, y) = cast<float>(prefix_sum(x, y)) / cast<float>(x + 1);
+        enum Level { Fusion,
+                     Slide,
+                     SlideUnroll,
+                     SlideFold,
+                     Shipped };
+        int fold = scalar ? hb::fold_factor(2, W) : hb::fold_factor(2 * group, W);
+        auto build = [&](Level level, const std::string &suffix) {
+            Func prefix_sum(Int(32), "prefix_sum" + suffix), output("output" + suffix);
+            prefix_sum(x, y) = select(x <= 0, input(0, y), likely(prefix_sum(x - 1, y) + input(x, y)));
+            // The running mean, in single precision: the sum stays exact in int32.
+            output(x, y) = cast<float>(prefix_sum(x, y)) / cast<float>(x + 1);
 
-        output.bound(x, 0, W).bound(y, 0, H).parallel(y);
-        int fold;
-        if (scalar) {
-            fold = hb::fold_factor(2, W);
-            prefix_sum.compute_at(output, x).store_at(output, y).fold_storage(x, fold);
-        } else {
-            fold = hb::fold_factor(2 * group, W);
-            output.split(x, xo, xi, group).vectorize(xi);
-            prefix_sum.compute_at(output, xo).store_at(output, y).fold_storage(x, fold).unroll(x, 8);
-        }
+            output.bound(x, 0, W).bound(y, 0, H).parallel(y);
+            if (!scalar) output.split(x, xo, xi, group).vectorize(xi);
+            const Var at = scalar ? x : xo;
+            if (level == Fusion) {
+                // Recomputed from x = 0 for every group, into storage as long
+                // as the recomputation. The in-place fold of an inductive
+                // Func over its own loop (which an explicit fold_storage
+                // cannot turn off) recognizes that loop by the name of its
+                // dimension, so renaming it keeps the storage unfolded.
+                Var xs("x_steps");
+                prefix_sum.compute_at(output, at).rename(x, xs);
+            } else if (level == Shipped || level == SlideFold) {
+                prefix_sum.compute_at(output, at).store_at(output, y).fold_storage(x, fold);
+                if (!scalar && level == Shipped) prefix_sum.unroll(x, 8);
+            } else {
+                prefix_sum.compute_at(output, at).store_at(output, y).fold_storage(x, W);
+                if (level == SlideUnroll) prefix_sum.unroll(x, 8);
+            }
+            if (const char *dir = getenv("HB_STMT")) {
+                output.compile_to_lowered_stmt(std::string(dir) + "/prefixsum_bench_" + output.name() + ".stmt",
+                                               output.infer_arguments());
+            }
+            return output;
+        };
+        Func output = build(Shipped, "");
 
         Buffer<float> result(W, H);
         output.realize(result);  // warm-up / JIT compile.
@@ -85,16 +124,40 @@ int main(int argc, char **argv) {
         // Correctness against a serial reference: the same running int32 sum
         // and float divide. The divide may go by a reciprocal in either form,
         // so the comparison is relative, to 1e-6.
-        double max_rel = 0;
-        for (int yy = 0; yy < H; yy++) {
-            int32_t run = 0;
-            for (int xx = 0; xx < W; xx++) {
-                run += input(xx, yy);
-                float expect = (float)run / (float)(xx + 1);
-                double rel = std::abs((double)result(xx, yy) - expect) / std::abs((double)expect);
-                if (rel > max_rel) max_rel = rel;
+        auto check = [&](const Buffer<float> &res) {
+            double max_rel = 0;
+            for (int yy = 0; yy < H; yy++) {
+                int32_t run = 0;
+                for (int xx = 0; xx < W; xx++) {
+                    run += input(xx, yy);
+                    float expect = (float)run / (float)(xx + 1);
+                    double rel = std::abs((double)res(xx, yy) - expect) / std::abs((double)expect);
+                    if (rel > max_rel) max_rel = rel;
+                }
             }
-        }
+            return max_rel;
+        };
+        const double max_rel = check(result);
+
+        // The ablation forms, each on its own output buffer.
+        struct Ablation {
+            const char *label;
+            hb::Stats stats;
+            double bytes, max_rel;
+        };
+        std::vector<Ablation> ablations;
+        auto ablate = [&](Level level, const char *label, const char *suffix) {
+            Func out = build(level, suffix);
+            Buffer<float> res(W, H);
+            out.realize(res);
+            hb::Stats st = hb::bench([&] { out.realize(res); });
+            const double bytes = hb::profiled_peak_bytes(out, res);
+            ablations.push_back({label, st, bytes, check(res)});
+        };
+        if (getenv("HB_FUSION")) ablate(Fusion, "ablation fusion", "_fusion");
+        ablate(Slide, "ablation slide", "_slide");
+        if (!scalar) ablate(SlideUnroll, "ablation slide+unroll", "_slide_unroll");
+        if (!scalar) ablate(SlideFold, "ablation slide+fold", "_slide_fold");
 
         char note[160];
         snprintf(note, sizeof(note),
@@ -112,6 +175,11 @@ int main(int argc, char **argv) {
         hb::print_row(label, s_bench,
                       (W * (double)H) / (s_bench.min * 1e3), "Mpix/s",
                       meas_bytes, max_rel, max_rel <= 1e-6, "", fp_unfold);
+        for (const Ablation &a : ablations) {
+            hb::print_row(a.label, a.stats,
+                          (W * (double)H) / (a.stats.min * 1e3), "Mpix/s",
+                          a.bytes, a.max_rel, a.max_rel <= 1e-6, "", fp_unfold);
+        }
 
         return 0;
     } catch (const Halide::Error &e) {

@@ -47,7 +47,27 @@ $(BIN)/%/mamba2.a: $(GENERATOR_BIN)/mamba2.generator
 	$^ -g mamba2 -f mamba2 -e $(GENERATOR_OUTPUTS),conceptual_stmt_html -o $(@D) \
 	    target=$* $(SHAPE_FWD)
 
-$(BIN)/%/runner: runner.cpp $(BIN)/%/mamba2.a
+# The ablation forms of the inductive state (scan=fusion and scan=slide in
+# the generators), built into the runners beside the SCAN form when WMMA=true,
+# whose schedule they take apart. Fusion recomputes the state from the first
+# chunk at every chunk, quadratic in SEQ/CHUNK, so it is only built and timed
+# with ABLATE_FUSION=1.
+ABLATE_FUSION ?= 0
+ABLATION = $(if $(filter true,$(WMMA)),1,0)
+ABLATION_FORMS = $(if $(filter 1,$(ABLATION)),sld $(if $(filter 1,$(ABLATE_FUSION)),fus))
+CXXFLAGS += -DABLATION=$(ABLATION) -DABLATE_FUSION=$(if $(filter 1,$(ABLATE_FUSION)),1,0)
+
+$(BIN)/%/mamba2_sld.a: $(GENERATOR_BIN)/mamba2.generator
+	@mkdir -p $(@D)
+	$^ -g mamba2 -f mamba2_sld -e $(GENERATOR_OUTPUTS) -o $(@D) \
+	    target=$* $(SHAPE) scan=slide
+
+$(BIN)/%/mamba2_fus.a: $(GENERATOR_BIN)/mamba2.generator
+	@mkdir -p $(@D)
+	$^ -g mamba2 -f mamba2_fus -e $(GENERATOR_OUTPUTS) -o $(@D) \
+	    target=$* $(SHAPE) scan=fusion
+
+$(BIN)/%/runner: runner.cpp $(BIN)/%/mamba2.a $(foreach f,$(ABLATION_FORMS),$(BIN)/%/mamba2_$(f).a)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -I$(BIN)/$* -Wall $^ -o $@ $(LDFLAGS) -L $(HALIDE_DISTRIB_PATH)/lib -lHalide -Wl,-rpath,$(HALIDE_DISTRIB_PATH)/lib -lcuda -lcudart -ldl -lpthread -lz
 
@@ -63,7 +83,17 @@ $(BIN)/%/mamba2_bwd.a: $(GENERATOR_BIN)/mamba2_bwd.generator
 	$^ -g mamba2_bwd -f mamba2_bwd -e $(GENERATOR_OUTPUTS),conceptual_stmt_html -o $(@D) \
 	    target=$* $(SHAPE) scan=$(SCAN)
 
-$(BIN)/%/runner_bwd: runner_bwd.cpp $(BIN)/%/mamba2_bwd.a
+$(BIN)/%/mamba2_bwd_sld.a: $(GENERATOR_BIN)/mamba2_bwd.generator
+	@mkdir -p $(@D)
+	$^ -g mamba2_bwd -f mamba2_bwd_sld -e $(GENERATOR_OUTPUTS) -o $(@D) \
+	    target=$* $(SHAPE) scan=slide
+
+$(BIN)/%/mamba2_bwd_fus.a: $(GENERATOR_BIN)/mamba2_bwd.generator
+	@mkdir -p $(@D)
+	$^ -g mamba2_bwd -f mamba2_bwd_fus -e $(GENERATOR_OUTPUTS) -o $(@D) \
+	    target=$* $(SHAPE) scan=fusion
+
+$(BIN)/%/runner_bwd: runner_bwd.cpp $(BIN)/%/mamba2_bwd.a $(foreach f,$(ABLATION_FORMS),$(BIN)/%/mamba2_bwd_$(f).a)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -I$(BIN)/$* -Wall $^ -o $@ $(LDFLAGS) -L $(HALIDE_DISTRIB_PATH)/lib -lHalide -Wl,-rpath,$(HALIDE_DISTRIB_PATH)/lib -lcuda -lcudart -ldl -lpthread -lz
 

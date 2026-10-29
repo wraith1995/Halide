@@ -14,6 +14,19 @@ from one generator, bit-exact against a scalar reference:
   the state trajectory must be materialized before the projection reads
   it.
 
+An ablation adds the inductive form's optimizations one at a time, as rows
+`ablation fusion`, `ablation slide`, `ablation slide+unroll` and
+`ablation slide+fold`, with the inductive form (both) as the last level:
+
+- scan=fusion: the state computed and stored inside the walk, so every
+  step recomputes it from the seeds. Quadratic in STEPS, so it is only
+  built with `make ABLATE_FUSION=1`, at a small STEPS.
+- scan=slide: the walk slides the state's window along with it, the
+  storage as wide as the walk (an explicit fold_storage that wide).
+- scan=slide_unroll: slide plus the inductive form's two-step unroll,
+  still unfolded.
+- scan=slide_fold: slide plus the fold to two slices, without the unroll.
+
 Baselines, all the same generator: the canonical scalar loop, Julia's
 rand! (Random.XoshiroSimd: eight SIMD-interleaved substreams of the same
 generator, the same technique), and that kernel ported to AVX-512

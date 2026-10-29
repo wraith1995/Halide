@@ -23,9 +23,31 @@ from pathlib import Path
 APPS = Path(__file__).resolve().parent
 LOGS = APPS / "inductive_benchmarks_logs"
 SCRATCH = Path(os.environ.get("HB_SCRATCH", "/tmp")) / "hb_peak"
-VENV = Path.home() / ".claude/jobs/6e7f4185/tmp/venv/bin/python"
-JULIA = Path.home() / ".juliaup/bin/julia"
-NCORES = os.cpu_count() // 2 or 1  # physical cores: parallel configs use one thread per core
+# Where the baselines live; each can be overridden from the environment for
+# a machine laid out differently.
+VENV = Path(os.environ.get("HB_VENV_PYTHON", Path.home() / ".claude/jobs/6e7f4185/tmp/venv/bin/python"))
+JULIA = Path(os.environ.get("HB_JULIA", Path.home() / ".juliaup/bin/julia"))
+# The CPUs this process may run on (a batch job's allocation, or the whole
+# machine). Parallel configs use one thread per physical core: the first
+# hardware thread of each core in the allocation.
+ALLOWED = sorted(os.sched_getaffinity(0))
+
+
+def first_thread_per_core(cpus):
+    seen, out = set(), []
+    for c in cpus:
+        try:
+            sib = Path(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list").read_text().strip()
+        except OSError:
+            sib = str(c)
+        if sib not in seen:
+            seen.add(sib)
+            out.append(c)
+    return out
+
+
+CORES = first_thread_per_core(ALLOWED)
+NCORES = int(os.environ.get("HB_NCORES", len(CORES)))
 
 
 # Every process the driver runs, Halide runners and baselines alike, gets
@@ -36,7 +58,7 @@ NCORES = os.cpu_count() // 2 or 1  # physical cores: parallel configs use one th
 # otherwise pay a first-touch page fault per 4 KB of it; retaining is what
 # any application that reuses its work buffers gets. Without the library the
 # numbers change materially, so its absence is an error, not a fallback.
-JEMALLOC = "/lib/x86_64-linux-gnu/libjemalloc.so.2"
+JEMALLOC = os.environ.get("HB_JEMALLOC", "/lib/x86_64-linux-gnu/libjemalloc.so.2")
 # thp:always backs every allocation with transparent huge pages where the
 # kernel allows (this box has them in madvise mode): the serial forms that
 # stream gigabyte signals otherwise vary by 30% run to run with where the
@@ -45,7 +67,7 @@ MALLOC_CONF = "oversize_threshold:0,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:alwa
 # Single-threaded rows run pinned to one core, so that which chiplet the
 # thread lands on, and any migration during the run, is not part of the
 # measurement. The machine is one NUMA node, so there is no memory to place.
-PIN_CORE = 4
+PIN_CORE = int(os.environ.get("HB_PIN_CORE", CORES[min(4, len(CORES) - 1)]))
 # The alignment rows compare at parasail's instruction set.
 ALIGN_TARGET = "x86-64-linux-sse41-avx-avx2"
 # All-cores rows run one thread per physical core, on the first hardware
@@ -53,7 +75,7 @@ ALIGN_TARGET = "x86-64-linux-sse41-avx-avx2"
 # are bound by each chiplet's link to the memory controller, so where the
 # scheduler lands their threads otherwise moves them by up to 1.7x. Halide
 # forms and baselines get the same mask and the same thread count.
-CORES_MASK = f"0-{NCORES - 1}"
+CORES_MASK = ",".join(str(c) for c in CORES[:NCORES])
 
 
 def sh(cmd, cwd, env=None, log=None, check=True, pin=False, cores=False):
@@ -194,7 +216,7 @@ TRIED = {
     "cpu_rng": ["Julia rand!", "numpy PCG64 (a different generator)", "scalar C++ loop"],
     "cpu_alignment": ["parasail", "ksw2 (minimap2 kernel)", "ksw2 scalar"],
     "viterbi": [],
-    "ode": ["Boost.odeint", "fused C++ loop"],
+    "ode": ["Boost.odeint", "fused C++ loop", "SUNDIALS ARKODE Heun", "SUNDIALS N_Vector AB2"],
     "prefixsum": ["oneTBB parallel_for rows", "oneTBB parallel_scan"],
     "chebyshev": ["hand-written mod-3 ring"],
     "cuda_mamba2": ["Triton (mamba_ssm)"],
@@ -334,7 +356,9 @@ def ode(D, B, T, par=False):
     r, bts = hb_rows(out), hb_bytes(out)
     threaded = " (threaded)" if par else ""
     bn, bt = best([("Boost.odeint" + threaded, r.get("Boost.odeint (rk4 init + observer)")),
-                           ("fused C++ loop" + threaded, r.get("fused C++ loop"))])
+                           ("fused C++ loop" + threaded, r.get("fused C++ loop")),
+                           ("SUNDIALS ARKODE Heun" + threaded, r.get("SUNDIALS ARKODE Heun (fixed h)")),
+                           ("SUNDIALS N_Vector AB2" + threaded, r.get("SUNDIALS N_Vector AB2"))])
     return dict(params=f"Allen-Cahn D={D}, batch {B}, T={T}, {'all cores' if par else '1 thread'}",
                 ind=r.get("inductive FOLDED (fold n -> 2)"), rdom=r.get("non-inductive (materialize)"),
                 ind_mb=mb(bts.get("inductive FOLDED (fold n -> 2)")),

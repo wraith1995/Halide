@@ -4,10 +4,25 @@
 #include "../support/bench_harness.h"
 #include "mamba2_bwd.h"
 
+// The ablation forms, built with the tensor core schedule.
+#ifndef ABLATION
+#define ABLATION 0
+#endif
+#ifndef ABLATE_FUSION
+#define ABLATE_FUSION 0
+#endif
+#if ABLATION
+#include "mamba2_bwd_sld.h"
+#if ABLATE_FUSION
+#include "mamba2_bwd_fus.h"
+#endif
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -317,9 +332,27 @@ int main(int argc, char **argv) {
         }
     };
 
-    auto run = [&]() {
-        if (mamba2_bwd(X, Bm, Cm, Delta, A, Y, dY, dX, dB, dC, dDT, dA) != 0) {
-            printf("mamba2_bwd returned an error\n");
+    // Every form is checked and timed the same way. The first is the one
+    // SCAN chose; the rest are the ablation of the inductive form: fusion
+    // alone, then sliding over storage for every chunk. The inductive form
+    // adds the fold.
+    struct Form {
+        const char *label;
+        decltype(&mamba2_bwd) fn;
+        const char *what;
+    };
+    std::vector<Form> forms = {{"Halide mamba2 bwd", mamba2_bwd, ""}};
+#if ABLATION && ABLATE_FUSION
+    forms.push_back({"ablation fusion", mamba2_bwd_fus,
+                     "fused, stored per chunk, recomputed from the first chunk"});
+#endif
+#if ABLATION
+    forms.push_back({"ablation slide", mamba2_bwd_sld, "fused, sliding, storage for every chunk"});
+#endif
+
+    auto run = [&](const Form &f) {
+        if (f.fn(X, Bm, Cm, Delta, A, Y, dY, dX, dB, dC, dDT, dA) != 0) {
+            printf("%s returned an error\n", f.label);
             exit(1);
         }
         dX.copy_to_host();
@@ -358,12 +391,15 @@ int main(int argc, char **argv) {
             }
         }
         forward_y();
-        run();
-        printf("sparse whole numbers:\n");
         Refs r = run_reference(X, Bm, Cm, Delta, A, dY);
-        // dA is a large sum of whole numbers that can pass what f32 holds
-        // exactly, so it gets a tolerance even here.
-        ok &= check_all(r, dX, dB, dC, dDT, dA, 0.0, 1e-5, 1e-5);
+        for (const Form &f : forms) {
+            run(f);
+            printf("%s:\n", &f == &forms[0] ? "sparse whole numbers" :
+                                               (std::string(f.label) + ": sparse whole numbers").c_str());
+            // dA is a large sum of whole numbers that can pass what f32 holds
+            // exactly, so it gets a tolerance even here.
+            ok &= check_all(r, dX, dB, dC, dDT, dA, 0.0, 1e-5, 1e-5);
+        }
     }
 
     // The arithmetic, with decay, at the precision the pass is for.
@@ -388,15 +424,18 @@ int main(int argc, char **argv) {
             }
         }
         forward_y();
-        run();
-        printf("random:\n");
         Refs r = run_reference(X, Bm, Cm, Delta, A, dY);
-        // ddt and dA carry the half-precision rounding of the operands the
-        // tensor cores see (the carried gradient among them) through sums
-        // whose length grows with the sequence.
-        double len = std::max(1.0, seq / 4096.0);
-        ok &= check_all(r, dX, dB, dC, dDT, dA, 4e-3, 1e-3 * sqrt(len),
-                        1e-3 * len);
+        for (const Form &f : forms) {
+            run(f);
+            printf("%s:\n", &f == &forms[0] ? "random" :
+                                               (std::string(f.label) + ": random").c_str());
+            // ddt and dA carry the half-precision rounding of the operands the
+            // tensor cores see (the carried gradient among them) through sums
+            // whose length grows with the sequence.
+            double len = std::max(1.0, seq / 4096.0);
+            ok &= check_all(r, dX, dB, dC, dDT, dA, 4e-3, 1e-3 * sqrt(len),
+                            1e-3 * len);
+        }
     }
 
     // Matrix multiply flops only: the two recomputed forward multiplies and
@@ -409,9 +448,18 @@ int main(int argc, char **argv) {
          (double)heads * (3.0 * chunk * chunk * channels +
                           2.0 * chunk * chunk * state +
                           5.0 * chunk * state * channels));
-    double tm = hb::bench_s([&]() { mamba2_bwd(X, Bm, Cm, Delta, A, Y, dY, dX, dB, dC, dDT, dA); },
-                            10, [&]() { dA.device_sync(); });
-    printf("  Halide mamba2 bwd %26.0f GFlop/s %10.1f us\n", flops / tm / 1e9, tm * 1e6);
+    std::vector<double> times;
+    for (const Form &f : forms) {
+        times.push_back(hb::bench_s([&]() { f.fn(X, Bm, Cm, Delta, A, Y, dY, dX, dB, dC, dDT, dA); },
+                                    10, [&]() { dA.device_sync(); }));
+        hb::print_mem(f.label, hb::last_stats());
+    }
+    printf("  Halide mamba2 bwd %26.0f GFlop/s %10.1f us\n", flops / times[0] / 1e9, times[0] * 1e6);
+    for (size_t i = 1; i < forms.size(); i++) {
+        printf("  %s %10.1f us  (%.0f GFlop/s, %.2fx the Halide mamba2 bwd row: %s)\n",
+               forms[i].label, times[i] * 1e6, flops / times[i] / 1e9, times[i] / times[0],
+               forms[i].what);
+    }
 
     printf("%s\n", ok ? "Success!" : "FAILED");
     return ok ? 0 : 1;

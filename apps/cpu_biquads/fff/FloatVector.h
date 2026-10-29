@@ -679,6 +679,43 @@ __attribute__((always_inline)) uint64_t generate_mask_64(int first, int last) {
 
 #include <immintrin.h>
 
+#ifndef __AVX512F__
+// AVX2 stand-ins for the AVX-512 masked loads and stores below. A 16-lane
+// access is two 8-lane vmaskmovps, each lane enabled by its bit of the mask,
+// and the mask registers are plain integers.
+__attribute__((always_inline)) inline __m256i fff_lane_mask8(uint32_t bits) {
+    const __m256i lane_bit = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+    __m256i b = _mm256_and_si256(_mm256_set1_epi32((int)bits), lane_bit);
+    return _mm256_cmpeq_epi32(b, lane_bit);
+}
+
+__attribute__((always_inline)) inline float_vec fff_maskz_loadu_ps(uint64_t mask, const float *ptr) {
+    __m256 lo = _mm256_maskload_ps(ptr, fff_lane_mask8(mask & 0xff));
+    __m256 hi = _mm256_maskload_ps(ptr + 8, fff_lane_mask8((mask >> 8) & 0xff));
+    float_vec v;
+    std::memcpy(&v, &lo, sizeof(lo));
+    std::memcpy((char *)&v + sizeof(lo), &hi, sizeof(hi));
+    return v;
+}
+
+__attribute__((always_inline)) inline void fff_mask_storeu_ps(float *ptr, uint64_t mask, float_vec v) {
+    __m256 lo, hi;
+    std::memcpy(&lo, &v, sizeof(lo));
+    std::memcpy(&hi, (const char *)&v + sizeof(lo), sizeof(hi));
+    _mm256_maskstore_ps(ptr, fff_lane_mask8(mask & 0xff), lo);
+    _mm256_maskstore_ps(ptr + 8, fff_lane_mask8((mask >> 8) & 0xff), hi);
+}
+
+#define _mm512_maskz_loadu_ps(m, p) fff_maskz_loadu_ps((uint64_t)(m), (p))
+#define _mm512_mask_storeu_ps(p, m, v) fff_mask_storeu_ps((p), (uint64_t)(m), (v))
+#define _cvtu32_mask32(m) ((uint64_t)(m))
+#define _cvtu64_mask64(m) ((uint64_t)(m))
+#undef _kshiftri_mask32
+#undef _kshiftri_mask64
+#define _kshiftri_mask32(m, n) ((m) >> (n))
+#define _kshiftri_mask64(m, n) ((m) >> (n))
+#endif
+
 // TODO: Is there a generic LLVM IR way to express these?
 
 template<typename V = float_vec>

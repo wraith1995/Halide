@@ -17,6 +17,7 @@
 #include "attention.h"
 #include "attention_flash.h"
 #include "attention_flash_rdom.h"
+#include "attention_flash_slu.h"
 #include "attention_softmax.h"
 
 using Halide::float16_t;
@@ -273,6 +274,7 @@ int main(int argc, char **argv) {
     // Its own output buffer, so that a filter that failed to write cannot be
     // checked against what the one before it left behind.
     Buffer<float16_t, 2> OF(out_depth, queries);
+    double t_flash = 0;
     if (attention_flash(Q.raw_buffer(), KP.raw_buffer(), VP.raw_buffer(),
                         OF.raw_buffer()) != 0) {
         printf("flash filter returned an error\n");
@@ -286,8 +288,37 @@ int main(int argc, char **argv) {
                                     VP.raw_buffer(), OF.raw_buffer());
                 },
                 [&]() { OF.device_sync(); });
+            hb::print_mem("Halide flash attention", hb::last_stats());
             printf("  Halide flash attention        %9.0f GFlop/s %8.1f us\n",
                    gflops(t), t * 1e6);
+            t_flash = t;
+        } else {
+            failures++;
+        }
+    }
+
+    // The ablation of the flash filter's carried state: slid but not folded,
+    // a fragment slot per key step, which takes the whole walk unrolled for
+    // every slot index to be a constant. The other levels cannot hold the
+    // state in fragments; see the generator.
+    Buffer<float16_t, 2> OA(out_depth, queries);
+    if (attention_flash_slu(Q.raw_buffer(), KP.raw_buffer(), VP.raw_buffer(),
+                            OA.raw_buffer()) != 0) {
+        printf("flash slide+unroll filter returned an error\n");
+        failures++;
+    } else {
+        OA.copy_to_host();
+        if (check(Q, K, V, OA, "attention_flash_slu")) {
+            double t = bench(
+                [&]() {
+                    attention_flash_slu(Q.raw_buffer(), KP.raw_buffer(),
+                                        VP.raw_buffer(), OA.raw_buffer());
+                },
+                [&]() { OA.device_sync(); });
+            hb::print_mem("ablation slide+unroll", hb::last_stats());
+            printf("  ablation slide+unroll %8.1f us  (%.0f GFlop/s, %.2fx the flash row: "
+                   "sliding, unfolded, the whole walk unrolled)\n",
+                   t * 1e6, gflops(t), t_flash > 0 ? t / t_flash : 0.0);
         } else {
             failures++;
         }
@@ -311,6 +342,7 @@ int main(int argc, char **argv) {
                                          V.raw_buffer(), OR.raw_buffer());
                 },
                 [&]() { OR.device_sync(); });
+            hb::print_mem("Halide flash attention (rdom)", hb::last_stats());
             printf("  Halide flash attention (rdom) %9.0f GFlop/s %8.1f us\n",
                    gflops(t), t * 1e6);
         } else {
@@ -323,6 +355,13 @@ int main(int argc, char **argv) {
     // normalises it there, and cublas multiplies again into a half precision
     // output. Same arithmetic, same answer - the only difference is that the
     // scores are written out and read back rather than staying in registers.
+    // Its device memory beyond the inputs: the scores in single and half
+    // precision, which it allocates here, the output, and whatever workspace
+    // cublas takes for itself. The free memory the driver reports before and
+    // after counts all of it, at the driver's allocation granularity.
+    size_t free_before = 0, free_after = 0, total_mem = 0;
+    cudaDeviceSynchronize();
+    cudaMemGetInfo(&free_before, &total_mem);
     cublasCreate(&handle);
     Buffer<float, 2> S(keys, queries);
     Buffer<float16_t, 2> P(keys, queries);
@@ -376,6 +415,11 @@ int main(int argc, char **argv) {
         failures++;
     } else {
         double t = bench(unfused, []() { cudaDeviceSynchronize(); });
+        cudaMemGetInfo(&free_after, &total_mem);
+        hb::print_mem("cublas + softmax + cublas", hb::last_stats());
+        const long scratch_kb = (long)queries * keys * (sizeof(float) + sizeof(float16_t)) / 1024;
+        printf("  mem cublas + softmax + cublas: device_scratch_kb=%ld device_growth_kb=%ld\n",
+               scratch_kb, ((long)free_before - (long)free_after) / 1024);
         printf("  cublas + softmax + cublas     %9.0f GFlop/s %8.1f us\n",
                gflops(t), t * 1e6);
         // Where the time goes, measured between the kernels of one pass

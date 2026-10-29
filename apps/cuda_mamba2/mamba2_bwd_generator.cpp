@@ -60,12 +60,23 @@ public:
     // that consume them, or as update definitions over RDoms, which own
     // their walks and must be computed whole, at the precision they are
     // carried at, before anything reads them.
+    //
+    // Two more forms take the inductive one apart for an ablation of the
+    // two state walks, with the tensor core schedule only: fusion (each
+    // walk's state computed and stored inside the walk over chunks, so
+    // every chunk recomputes it from the first one) and slide (the state
+    // slid along the walk, with storage for every chunk rather than folded
+    // to the live ones).
     enum class ScanForm { Inductive,
-                          RDom };
+                          RDom,
+                          Fusion,
+                          Slide };
     GeneratorParam<ScanForm> scan{"scan",
                                   ScanForm::Inductive,
                                   {{"inductive", ScanForm::Inductive},
-                                   {"rdom", ScanForm::RDom}}};
+                                   {"rdom", ScanForm::RDom},
+                                   {"fusion", ScanForm::Fusion},
+                                   {"slide", ScanForm::Slide}}};
 
     Input<Buffer<float16_t, 3>> X{"X"};
     Input<Buffer<float16_t, 3>> Bm{"Bm"};
@@ -515,6 +526,10 @@ public:
         dA_out(b) = 0.f;
         dA_out(b) += pdA(rt, b);
 
+        _halide_user_assert(wmma || (scan != ScanForm::Fusion && scan != ScanForm::Slide))
+            << "The fusion and slide forms take the tensor core schedule apart, "
+            << "so they need wmma=true.\n";
+
         try {
             if (!using_autoscheduler()) {
                 if (wmma) {
@@ -541,8 +556,26 @@ public:
 private:
     static constexpr int tile = 16;
 
+    // The ablation forms are the inductive form, scheduled differently.
     bool inductive() const {
-        return scan == ScanForm::Inductive;
+        return scan != ScanForm::RDom;
+    }
+
+    // The fusion form of a state walk: the state computed and stored per
+    // chunk of the walk that narrows it, so every chunk walks the state up
+    // from the first one. The storage is bounded at a whole walk and the step
+    // before it, which is what a chunk's walk can need, and renaming the walk
+    // keeps storage folding from folding it in place over its own loop.
+    void schedule_fused_walk(Func state_f, Func narrowed, Var walk, Var walk_i,
+                             Var walk_renamed, Var hw, Var hp, Var d, Var p) {
+        state_f.compute_at(narrowed, walk_i)
+            .store_in(MemoryType::Stack)
+            .bound_storage(walk, (int)seq / (int)chunk + 1)
+            .split(p, hw, hp, tile)
+            .reorder(d, hp, hw)
+            .gpu_lanes(d)
+            .gpu_threads(hw)
+            .rename(walk, walk_renamed);
     }
 
     // The forward's tensor core structures, mirrored. The fused walks carry
@@ -614,11 +647,17 @@ private:
         // or a chunk-state kernel plus a flat stored walk when it is not ----
         Var hto("hto"), hti("hti"), hw("hw"), hp("hp"), ddo("ddo"), ddi("ddi");
         Var tb("tb"), po("po"), po3("po3"), pw3("pw3");
+        // In the fusion form each state's own walk recomputes every chunk
+        // before this one, so what each chunk contributes goes inside that
+        // walk instead, one chunk per step of it.
+        const bool fusion = scan == ScanForm::Fusion;
+        Var tw("tw"), ttw("ttw");
         if (inductive()) {
             Func cs = chunk_state.in();
-            chunk_state.compute_at(Hop, hti).unroll(t);
+            const LoopLevel cs_at = fusion ? LoopLevel(H, tw) : LoopLevel(Hop, hti);
+            chunk_state.compute_at(cs_at).unroll(t);
             chunk_state.update().unroll(t);
-            cs.compute_at(Hop, hti)
+            cs.compute_at(cs_at)
                 .store_in(MemoryType::GPUShared)
                 .unroll(cs.args()[2])
                 .tile(d, p, rxi, ryi, tile, tile)
@@ -705,23 +744,33 @@ private:
                 .gpu_blocks(ddo, b)
                 .gpu_lanes(ddi)
                 .gpu_threads(hw);
-            H.compute_at(Hop, hti)
-                .store_at(Hop, ddo)
-                .slide(Hop, t)
-                .store_in(MemoryType::Stack)
-                .split(p, hw, hp, tile)
-                .reorder(d, hp, hw)
-                .gpu_lanes(d)
-                .gpu_threads(hw);
+            if (fusion) {
+                schedule_fused_walk(H, Hop, t, hti, tw, hw, hp, d, p);
+            } else {
+                H.compute_at(Hop, hti)
+                    .store_at(Hop, ddo)
+                    .slide(Hop, t)
+                    .store_in(MemoryType::Stack)
+                    .split(p, hw, hp, tile)
+                    .reorder(d, hp, hw)
+                    .gpu_lanes(d)
+                    .gpu_threads(hw);
+                if (scan == ScanForm::Slide) {
+                    // Storage for every chunk: an explicit fold no narrower
+                    // than the walk.
+                    H.fold_storage(t, nt);
+                }
+            }
         }
 
         // ---- The gradient state walk, the mirror image ----
         Var gto("gto"), gti("gti");
         if (inductive()) {
             Func dgs = dG.in();
-            dG.compute_at(dHopr, gti).unroll(t);
+            const LoopLevel dgs_at = fusion ? LoopLevel(dHnr, ttw) : LoopLevel(dHopr, gti);
+            dG.compute_at(dgs_at).unroll(t);
             dG.update().unroll(t);
-            dgs.compute_at(dHopr, gti)
+            dgs.compute_at(dgs_at)
                 .store_in(MemoryType::GPUShared)
                 .unroll(dgs.args()[2])
                 .tile(d, p, rxi, ryi, tile, tile)
@@ -803,14 +852,21 @@ private:
                 .gpu_blocks(ddo, b)
                 .gpu_lanes(ddi)
                 .gpu_threads(hw);
-            dHnr.compute_at(dHopr, gti)
-                .store_at(dHopr, ddo)
-                .slide(dHopr, tt)
-                .store_in(MemoryType::Stack)
-                .split(p, hw, hp, tile)
-                .reorder(d, hp, hw)
-                .gpu_lanes(d)
-                .gpu_threads(hw);
+            if (fusion) {
+                schedule_fused_walk(dHnr, dHopr, tt, gti, ttw, hw, hp, d, p);
+            } else {
+                dHnr.compute_at(dHopr, gti)
+                    .store_at(dHopr, ddo)
+                    .slide(dHopr, tt)
+                    .store_in(MemoryType::Stack)
+                    .split(p, hw, hp, tile)
+                    .reorder(d, hp, hw)
+                    .gpu_lanes(d)
+                    .gpu_threads(hw);
+                if (scan == ScanForm::Slide) {
+                    dHnr.fold_storage(tt, nt);
+                }
+            }
         }
 
         // ---- dX: the forward's output kernel with the mask transposed ----

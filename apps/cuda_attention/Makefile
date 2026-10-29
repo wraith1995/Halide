@@ -72,12 +72,20 @@ $(BIN)/%/attention_flash_rdom.a: $(GENERATOR_BIN)/attention.generator
 	$^ -g attention_flash_rdom -f attention_flash_rdom -e $(GENERATOR_OUTPUTS),conceptual_stmt_html -o $(@D) \
 	    target=$* $(SHAPE_FLASH_RDOM)
 
+# The ablation of the flash filter's carried state: slid but not folded,
+# with the whole walk unrolled (form=slide_unroll in the generator, which says
+# why the other levels cannot hold the state in tensor core fragments).
+$(BIN)/%/attention_flash_slu.a: $(GENERATOR_BIN)/attention.generator
+	@mkdir -p $(@D)
+	$^ -g attention_flash -f attention_flash_slu -e $(GENERATOR_OUTPUTS) -o $(@D) \
+	    target=$* $(SHAPE_FLASH) form=slide_unroll
+
 $(BIN)/%/attention_softmax.a: $(GENERATOR_BIN)/attention.generator
 	@mkdir -p $(@D)
 	$^ -g attention_softmax -f attention_softmax -e $(GENERATOR_OUTPUTS) -o $(@D) \
 	    target=$* queries=$(QUERIES) keys=$(KEYS)
 
-$(BIN)/%/runner: runner.cpp $(BIN)/%/attention.a $(BIN)/%/attention_flash.a $(BIN)/%/attention_flash_rdom.a $(BIN)/%/attention_softmax.a
+$(BIN)/%/runner: runner.cpp $(BIN)/%/attention.a $(BIN)/%/attention_flash.a $(BIN)/%/attention_flash_rdom.a $(BIN)/%/attention_flash_slu.a $(BIN)/%/attention_softmax.a
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -I$(BIN)/$* -Wall $^ -o $@ $(LDFLAGS) $(LIBHALIDE_LDFLAGS) -lcuda -lcudart -lcublas
 

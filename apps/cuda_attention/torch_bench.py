@@ -8,7 +8,8 @@ and cuDNN backends is timed on its own.
 Usage: torch_bench.py QUERIES KEYS DEPTH
 Prints the torch version, then one row per backend:
 "  torch flash   <us> us", "  torch mem-efficient   <us> us",
-"  torch cudnn   <us> us".
+"  torch cudnn   <us> us", each followed by
+"  mem <row>: device_peak_kb=... device_growth_kb=...".
 """
 import os
 import time
@@ -55,8 +56,19 @@ for name, backend in (("flash", SDPBackend.FLASH_ATTENTION),
                       ("mem-efficient", SDPBackend.EFFICIENT_ATTENTION),
                       ("cudnn", SDPBackend.CUDNN_ATTENTION)):
     try:
+        # Device memory over the timed runs: the peak the caching allocator
+        # saw, and its growth over what was allocated before them (the
+        # inputs). The growth includes the output each call allocates, which
+        # the Halide profiler's figure leaves out with the other buffers the
+        # caller passes.
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        start = torch.cuda.memory_allocated()
         with sdpa_kernel(backend):
             t = timed(lambda: F.scaled_dot_product_attention(q, k, v))
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated()
         print(f"  torch {name:14s} {t:10.1f} us")
+        print(f"  mem torch {name}: device_peak_kb={peak // 1024} device_growth_kb={(peak - start) // 1024}")
     except RuntimeError as e:
         print(f"  torch {name:14s} unavailable: {str(e).splitlines()[0][:80]}")

@@ -38,6 +38,17 @@ stored from there. They differ in how the carried state is written:
   separately from the inductive form's, since the three-component state wants
   more registers than the two-component one.
 
+An ablation of the inductive form's carried state, row `ablation
+slide+unroll` (pipeline `attention_flash_slu`, `form=slide_unroll` in the
+generator): slid but not folded, a slot per key step. The state lives in
+tensor core fragments, which only a constant index can address, so with a
+slot per step the whole walk is unrolled rather than two steps of it. The
+other levels (fused but not slid, slid but neither folded nor unrolled,
+folded but not unrolled) all leave a slot index that varies with the walk,
+which fragments cannot take; the memory types that can take it cannot be
+stored outside the loop over warps and computed inside it, which is where
+the walk puts the state at this key count.
+
 The runner also builds **`attention`**, a fused form that holds every key's
 scores in registers at once with no walk. It only launches up to 128 keys, so
 at the benchmark shape the runner skips it and says so.
@@ -53,6 +64,14 @@ at the benchmark shape the runner skips it and says so.
   softmax scale as its alpha, the `attention_softmax` filter (also on tensor
   cores) normalises it into fp16, and cuBLAS multiplies again with an fp16
   store. The runner also prints where its time goes, phase by phase.
+
+Device memory: the Halide forms' is the profiler's `memory_peak` in a
+`-profile` build. Each baseline row is followed by a `mem` line: torch's
+caching allocator peak and its growth over the inputs, and for the cuBLAS
+path the scores it allocates (`device_scratch_kb`) and the drop in free
+device memory across it (`device_growth_kb`, which also counts its output
+and cuBLAS's workspace). The runner also prints host resident memory for
+each row it times.
 
 All rows use the shared timing protocol of `apps/support/bench_harness.h`
 (`HB_WARMUP`, `HB_TRIALS`, `HB_BATCH`; best trial reported), and

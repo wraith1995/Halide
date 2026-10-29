@@ -1,4 +1,4 @@
-// Checks the three forms bit-exactly against a scalar xoshiro256++
+// Checks the forms bit-exactly against a scalar xoshiro256++
 // reference and benchmarks them, plus the same scalar loop as a timing
 // baseline. The output buffer is sized well past the last level cache.
 
@@ -8,7 +8,17 @@
 
 #include "rng_ind.h"
 #include "rng_rdom.h"
+#include "rng_sld.h"
+#include "rng_slf.h"
+#include "rng_slu.h"
 #include "rng_unf.h"
+
+#ifndef ABLATE_FUSION
+#define ABLATE_FUSION 0
+#endif
+#if ABLATE_FUSION
+#include "rng_fus.h"
+#endif
 
 #include <immintrin.h>
 
@@ -94,6 +104,8 @@ constexpr int BLOCKS_PER_TASK = NB < 4 ? NB : 4;
 constexpr int NTASKS = NB / BLOCKS_PER_TASK;
 static_assert(NB % BLOCKS_PER_TASK == 0, "whole tasks");
 
+// The port needs AVX-512; without it the row is skipped.
+#ifdef __AVX512F__
 void simd_fill_task(const Buffer<uint64_t> &seeds, Buffer<float> &out, int task) {
     // Raw addressing: the Buffer accessor marks the shared buffer host-dirty
     // on every store, which is a cache line all the tasks would fight over.
@@ -150,6 +162,7 @@ void simd_fill(const Buffer<uint64_t> &seeds, Buffer<float> &out) {
     }
 #endif
 }
+#endif  // __AVX512F__
 
 bool check(const Buffer<float> &y, const Buffer<float> &ref, const char *what) {
     for (int l = 0; l < 2 * L; l++) {
@@ -201,6 +214,7 @@ int main(int argc, char **argv) {
 
     reference(seeds, ref);
     double t_ref = hb::bench_s([&]() { reference(seeds, ref); });
+    hb::print_mem("scalar C++", hb::last_stats());
 
     if (julia_ref) {
         FILE *f = fopen(julia_ref, "rb");
@@ -222,21 +236,51 @@ int main(int argc, char **argv) {
         printf("  julia      bit-exact ok (vs Random.rand! on Xoshiro(1234))\n");
     }
 
+#ifdef __AVX512F__
     simd_fill(seeds, y);
     if (!check(y, ref, "julia port")) return 1;
     double t_simd = hb::bench_s([&]() { simd_fill(seeds, y); });
+    hb::print_mem("julia port", hb::last_stats());
+#endif
 
     rng_ind(seeds, y);
     if (!check(y, ref, "inductive")) return 1;
     double t_ind = hb::bench_s([&]() { rng_ind(seeds, y); });
+    hb::print_mem("inductive", hb::last_stats());
 
     rng_unf(seeds, y);
     if (!check(y, ref, "unfolded")) return 1;
     double t_unf = hb::bench_s([&]() { rng_unf(seeds, y); });
+    hb::print_mem("unfolded", hb::last_stats());
 
     rng_rdom(seeds, y);
     if (!check(y, ref, "rdom")) return 1;
     double t_rdom = hb::bench_s([&]() { rng_rdom(seeds, y); });
+    hb::print_mem("rdom", hb::last_stats());
+
+    // The ablation: the inductive form's optimizations added one at a time:
+    // fusion, sliding, then the unroll and the fold in either order (both
+    // together are the inductive form).
+#if ABLATE_FUSION
+    rng_fus(seeds, y);
+    if (!check(y, ref, "ablation fusion")) return 1;
+    double t_fus = hb::bench_s([&]() { rng_fus(seeds, y); });
+    hb::print_mem("ablation fusion", hb::last_stats());
+#endif
+    rng_sld(seeds, y);
+    if (!check(y, ref, "ablation slide")) return 1;
+    double t_sld = hb::bench_s([&]() { rng_sld(seeds, y); });
+    hb::print_mem("ablation slide", hb::last_stats());
+
+    rng_slu(seeds, y);
+    if (!check(y, ref, "ablation slide+unroll")) return 1;
+    double t_slu = hb::bench_s([&]() { rng_slu(seeds, y); });
+    hb::print_mem("ablation slide+unroll", hb::last_stats());
+
+    rng_slf(seeds, y);
+    if (!check(y, ref, "ablation slide+fold")) return 1;
+    double t_slf = hb::bench_s([&]() { rng_slf(seeds, y); });
+    hb::print_mem("ablation slide+fold", hb::last_stats());
 
     const double gb = 2 * L * (double)T * 4 / 1e9;
     printf("  inductive  %10.1f us  (%.1f GB/s of output)\n",
@@ -245,8 +289,22 @@ int main(int argc, char **argv) {
            t_unf * 1e6, t_unf / t_ind);
     printf("  rdom       %10.1f us  (%.2fx the inductive time)\n",
            t_rdom * 1e6, t_rdom / t_ind);
+#if ABLATE_FUSION
+    printf("  ablation fusion %10.1f us  (%.2fx: fused, stored per step, recomputed from the seeds)\n",
+           t_fus * 1e6, t_fus / t_ind);
+#endif
+    printf("  ablation slide %10.1f us  (%.2fx: fused, sliding, unfolded, step not unrolled)\n",
+           t_sld * 1e6, t_sld / t_ind);
+    printf("  ablation slide+unroll %10.1f us  (%.2fx: fused, sliding, unfolded, step unrolled by two)\n",
+           t_slu * 1e6, t_slu / t_ind);
+    printf("  ablation slide+fold %10.1f us  (%.2fx: fused, sliding, folded to 2, step not unrolled)\n",
+           t_slf * 1e6, t_slf / t_ind);
+#ifdef __AVX512F__
     printf("  julia port %10.1f us  (%.2fx: Julia's XoshiroSimd kernel in AVX-512 intrinsics%s)\n",
            t_simd * 1e6, t_simd / t_ind, PARALLEL ? ", threaded" : "");
+#else
+    printf("  julia port skipped (needs AVX-512)\n");
+#endif
     printf("  scalar C++ %10.1f us  (%.2fx: same RNG, the reference loop)\n",
            t_ref * 1e6, t_ref / t_ind);
     printf("Success!\n");

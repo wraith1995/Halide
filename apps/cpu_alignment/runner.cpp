@@ -11,7 +11,11 @@
 #include "align16_unf.h"
 #include "align8_ind.h"
 #include "align8_rdom.h"
+#include "align8_sld.h"
 #include "align8_unf.h"
+#if ABLATE_FUSION
+#include "align8_fus.h"
+#endif
 
 extern "C" {
 #include "ksw2/ksw2.h"
@@ -40,6 +44,9 @@ int ksw_gg2_sse(void *km, int qlen, const uint8_t *query, int tlen, const uint8_
 #endif
 #ifndef BATCH
 #define BATCH 1024
+#endif
+#ifndef ABLATE_FUSION
+#define ABLATE_FUSION 0
 #endif
 
 namespace {
@@ -267,6 +274,7 @@ int main(int argc, char **argv) {
             });
         });
         printf("  parasail   %10.1f us\n", tp0 * 1e6);
+        hb::print_mem("parasail", hb::last_stats());
         return 0;
     }
 #endif
@@ -274,11 +282,19 @@ int main(int argc, char **argv) {
         const char *name;
         int (*fn)(struct halide_buffer_t *, struct halide_buffer_t *, struct halide_buffer_t *);  // (qseq, tseq, path)
     };
-    // Two generators x three forms. int8 inductive is the headline.
-    Form forms[] = {
+    // Two generators x three forms. int8 inductive is the headline. Then
+    // the optimization ablation of int8 inductive: the slide level, and
+    // with ABLATE_FUSION the fusion level (quadratic; small sizes only).
+    // The fold level is int8 ind itself.
+    std::vector<Form> forms = {
         {"int8 ind", align8_ind},   {"int8 unf", align8_unf},   {"int8 rdom", align8_rdom},
         {"int16 ind", align16_ind}, {"int16 unf", align16_unf}, {"int16 rdom", align16_rdom},
+        {"ablation slide", align8_sld},
+#if ABLATE_FUSION
+        {"ablation fusion", align8_fus},
+#endif
     };
+    const int nforms = (int)forms.size();
 
     // ONLY_FORM=<name> (or ONLY_A8 for "int8 ind"): benchmark one form
     // alone, re-verifying its output after every timed call, for A/B
@@ -290,22 +306,31 @@ int main(int argc, char **argv) {
         for (auto &f : forms) {
             if (std::string(f.name) != only) continue;
             double best = 1e30;
+            hb::Stats mem;
             for (int r = 0; r < 3; r++) {
                 double t = hb::bench_once_s([&]() { f.fn(query, target, path); });
                 if (!check(f.name)) return 1;
                 best = std::min(best, t);
+                // The largest growth of the three runs.
+                if (r == 0 || hb::rss_growth_kb(hb::last_stats()) > hb::rss_growth_kb(mem)) {
+                    mem = hb::last_stats();
+                }
             }
             printf("  %-10s %10.1f us  (best of 3, verified each)\n", f.name, best * 1e6);
+            hb::print_mem(f.name, mem);
             return 0;
         }
         printf("no such form: %s\n", only);
         return 1;
     }
-    double t[6];
-    for (int f = 0; f < 6; f++) {
+    // Each timed run's resident memory, printed after its row.
+    std::vector<double> t(nforms);
+    std::vector<hb::Stats> mem(nforms);
+    for (int f = 0; f < nforms; f++) {
         forms[f].fn(query, target, path);
         if (!check(forms[f].name)) return 1;
         t[f] = hb::bench_s([&]() { forms[f].fn(query, target, path); });
+        mem[f] = hb::last_stats();
     }
     double t_ind = t[0];  // int8 inductive is the reference for ratios
 
@@ -319,6 +344,7 @@ int main(int argc, char **argv) {
         });
     };
     double t_tb = hb::bench_s([&]() { compaction_sweep(); });
+    hb::Stats mem_tb = hb::last_stats();
 
 
     // ksw2 parallelizes across pairs the way aligners deploy it: when the
@@ -333,7 +359,9 @@ int main(int argc, char **argv) {
         });
     };
     double t_gg2 = hb::bench_s([&]() { ksw2_sweep(true); });
+    hb::Stats mem_gg2 = hb::last_stats();
     double t_gg = hb::bench_s([&]() { ksw2_sweep(false); });
+    hb::Stats mem_gg = hb::last_stats();
 
 #ifdef HAVE_PARASAIL
     auto parasail_sweep = [&]() {
@@ -343,34 +371,42 @@ int main(int argc, char **argv) {
         });
     };
     double t_ps = hb::bench_s([&]() { parasail_sweep(); });
+    hb::Stats mem_ps = hb::last_stats();
 #endif
 
     const double cells = (double)B * J * I;
     // int8 inductive (t[0]) is the reference. Each form prints its
     // Gcell/s and its ratio to that reference.
-    static const char *notes[6] = {
+    static const char *notes[] = {
         "int8 differences, folded window",
         "int8, fusion without folding",
         "int8, materialized (update definitions)",
         "int16 table, folded window",
         "int16, fusion without folding",
         "int16, materialized (update definitions)",
+        "int8, fused + sliding window, state and walk unfolded",
+        "int8, fused, stored per iteration: recomputes history",
     };
-    for (int f = 0; f < 6; f++) {
+    for (int f = 0; f < nforms; f++) {
         printf("  %-10s %10.1f us  (%.2f Gcell/s, %.2fx int8-ind: %s)\n",
                forms[f].name, t[f] * 1e6, cells / t[f] / 1e9, t[f] / t_ind, notes[f]);
+        hb::print_mem(forms[f].name, mem[f]);
     }
     printf("  compaction %10.1f us  (op stream -> run-length CIGAR, outside the pipeline)\n",
            t_tb * 1e6);
+    hb::print_mem("compaction", mem_tb);
     printf("  int8 ind + traceback %8.1f us  (fill+trace+cigar, the baselines' contract)\n",
            (t_ind + t_tb) * 1e6);
     printf("  ksw2 sse   %10.1f us  (%.2fx fill+cigar: same output, hand-vectorized)\n",
            t_gg2 * 1e6, t_gg2 / (t_ind + t_tb));
+    hb::print_mem("ksw2 sse", mem_gg2);
     printf("  ksw2 gg    %10.1f us  (%.2fx: same output, scalar)\n",
            t_gg * 1e6, t_gg / t_ind);
+    hb::print_mem("ksw2 gg", mem_gg);
 #ifdef HAVE_PARASAIL
     printf("  parasail   %10.1f us  (%.2fx fill+cigar: nw_trace_striped_16, avx2)\n",
            t_ps * 1e6, t_ps / (t_ind + t_tb));
+    hb::print_mem("parasail", mem_ps);
 #endif
     // INTERLEAVE=n: n alternating single-shot rounds of int8 inductive
     // and the ksw2 SSE sweep, so the two sides share the same thermal

@@ -39,6 +39,23 @@ The three scan forms (scan= on either generator):
   form cannot avoid is writing the full state at full extent, and at
   1kx1k that state never fits a cache.
 
+align8 has two more forms, an optimization ablation of the inductive
+form (rows `ablation slide` / `ablation fusion`, each with a `mem` line
+like every timed row):
+- slide (always built): the state and the walk computed inside their
+  consumers' loops with storage hoisted to the block, so each iteration
+  computes one new row or step, but neither folded - unlike unfolded,
+  which still folds the walk to two steps.
+- fusion (built only with `make ABLATE_FUSION=1`): each inductive Func
+  stored where it is computed, so every row of the direction plane
+  realizes the state from the border again, and every walk step walks
+  again from the start - cubic in the table size, so small sizes only.
+  The walk's loop is renamed, because storage folding otherwise folds a
+  one-dimensional inductive Func in place over its own loop, and no
+  fold_storage overrides that.
+The fold level is the inductive form itself. There is no recurrence
+unroll in this app, so there is no slide-plus-unroll level.
+
 The whole deliverable is Halide, including the traceback. The
 direction plane is an intermediate Func realized one block of 64 pairs
 at a time (dir.compute_at(path, bo)), and the traceback is an

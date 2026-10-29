@@ -595,6 +595,21 @@ public:
     // Extra elements per row of the staged panels, to spread consecutive rows
     // across banks.
     GeneratorParam<int> pad{"pad", 0};
+    // The ablation form slide_unroll keeps the carried state for the whole
+    // walk instead of folding it to the two live tiles. The state lives in
+    // tensor core fragments, which only a constant index can address, so
+    // with a slot per step the whole walk is unrolled rather than two steps
+    // of it. The other ablation levels - the state fused but not slid, slid
+    // but not unrolled, folded but not unrolled - all leave a slot index
+    // that varies with the walk, so they cannot be held in fragments, and no
+    // memory type that can be indexed that way may be stored outside the
+    // loop over warps and computed inside it.
+    enum class Form { Inductive,
+                      SlideUnroll };
+    GeneratorParam<Form> form{"form",
+                              Form::Inductive,
+                              {{"inductive", Form::Inductive},
+                               {"slide_unroll", Form::SlideUnroll}}};
 
     Input<Buffer<float16_t, 2>> Q{"Q"};
     Input<Buffer<float16_t, 2>> K{"K"};
@@ -779,11 +794,12 @@ public:
             .unroll(y)
             .tile_init(rxi, ryi);
         // Two steps at a time, so that which of the two live slots of the
-        // carried state a step reads is a constant here.
+        // carried state a step reads is a constant here. Unfolded, every step
+        // has a slot of its own, so the whole walk is unrolled instead.
         acc.update()
             .split(y, yw, y, rows)
             .tile(x, y, rxi, ryi, tile, tile)
-            .split(rt, rto, rti, 2)
+            .split(rt, rto, rti, form == Form::SlideUnroll ? num_tiles : 2)
             .always_partition(rto)
             .unroll(x)
             .unroll(y)
@@ -866,7 +882,9 @@ public:
                 .store_at(out, xo)
                 .compute_at(acc, yw)
                 .slide(acc, rt)
-                .fold_storage(t, 2)
+                // Unfolded, the storage covers the walk and the two steps it
+                // rewinds to warm up: an explicit fold that wide.
+                .fold_storage(t, form == Form::SlideUnroll ? num_tiles + 2 : 2)
                 .split(y, y, ryi, tile)
                 .unroll(y)
                 .vectorize(ryi);

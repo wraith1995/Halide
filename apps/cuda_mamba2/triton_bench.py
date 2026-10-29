@@ -3,7 +3,8 @@
 forward and backward, at the shape the Halide generator is built for.
 
 Usage: triton_bench.py SEQ STATE CHANNELS HEADS GROUPS CHUNK
-Prints "  triton fwd  <us> us" and "  triton bwd  <us> us" (the best sample, as the Halide runner reports).
+Prints "  triton fwd  <us> us" and "  triton bwd  <us> us" (the best sample, as the Halide runner reports),
+then a "  mem <row>: device_peak_kb=... device_growth_kb=..." line for each.
 
 The mamba_ssm package's __init__ imports its CUDA extension and several
 model-zoo dependencies that are not needed for the Triton path; the
@@ -75,7 +76,26 @@ def timed(fn):
     return min(ts)
 
 
+def mem_start():
+    # Device memory over the timed runs: the peak the caching allocator saw
+    # from here on, and its growth over what was allocated here (the inputs,
+    # and for the backward the forward's output and its saved tensors). The
+    # growth includes the outputs the library allocates, which the Halide
+    # profiler's figure leaves out with the other buffers the caller passes.
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    return torch.cuda.memory_allocated()
+
+
+def mem_line(label, start):
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    return f"  mem {label}: device_peak_kb={peak // 1024} device_growth_kb={(peak - start) // 1024}"
+
+
+start = mem_start()
 t_fwd = timed(fwd)
+mem_fwd = mem_line("triton fwd", start)
 out = fwd()
 dy = uniform(batch, nheads, seq, headdim).transpose(1, 2)
 inputs = (x, dt, A, B, C)
@@ -85,6 +105,10 @@ def bwd():
     torch.autograd.grad(out, inputs, grad_outputs=dy, retain_graph=True)
 
 
+start = mem_start()
 t_bwd = timed(bwd)
+mem_bwd = mem_line("triton bwd", start)
 print(f"  triton fwd {t_fwd:12.1f} us  (mamba_chunk_scan_combined, chunk {chunk})")
 print(f"  triton bwd {t_bwd:12.1f} us")
+print(mem_fwd)
+print(mem_bwd)
