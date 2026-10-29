@@ -20,6 +20,16 @@ generator:
   only way to avoid the fill; the inductive form needs nothing of the
   kind.
 
+An ablation adds the inductive form's optimizations one at a time, all
+unfolded, as rows `ablation fusion` and `ablation slide`. scan=fusion
+computes and stores each section inside the walk, so every sample
+recomputes the cascade from the first one; it is quadratic in SAMPLES,
+so it is only built with `make ABLATE_FUSION=1`, at a small SAMPLES.
+scan=slide slides every section's window along with the walk, over
+storage for the whole signal: the same schedule as scan=unfolded. The
+schedule never unrolls the recurrence (the unrolled loop is over channel
+blocks), so there is no unroll level.
+
 Neither form streams its output: a filter's output is consumed as it is
 produced, and the library baselines store theirs the ordinary way too.
 

@@ -21,14 +21,27 @@ namespace {
 class Rng : public Halide::Generator<Rng> {
 public:
     GeneratorParam<int> lanes{"lanes", 32};
+    // The ablation forms add the inductive form's optimizations one at a
+    // time: fusion alone (the state computed and stored inside the walk, so
+    // every step recomputes it from the seeds), then a sliding window over
+    // full-extent storage, then the unrolled step, all unfolded. The
+    // inductive form adds the fold.
     enum class ScanForm { Inductive,
                           Unfolded,
-                          RDom };
+                          RDom,
+                          Fusion,
+                          Slide,
+                          SlideUnroll,
+                          SlideFold };
     GeneratorParam<ScanForm> scan{"scan",
                                   ScanForm::Inductive,
                                   {{"inductive", ScanForm::Inductive},
                                    {"unfolded", ScanForm::Unfolded},
-                                   {"rdom", ScanForm::RDom}}};
+                                   {"rdom", ScanForm::RDom},
+                                   {"fusion", ScanForm::Fusion},
+                                   {"slide", ScanForm::Slide},
+                                   {"slide_unroll", ScanForm::SlideUnroll},
+                                   {"slide_fold", ScanForm::SlideFold}}};
     GeneratorParam<bool> par{"par", false};
 
     // Four words of seed per stream.
@@ -111,16 +124,30 @@ public:
                 y.split(co, coo, coi, 1)
                     .reorder(ci, coi, t, coo)
                     .parallel(coo);
-                S.store_at(y, coo)
-                    .compute_at(y, coi)
-                    .vectorize(l);
+                if (scan == ScanForm::Fusion) {
+                    // Renaming the walk's own loop keeps storage folding
+                    // from folding the state in place over it.
+                    Var tw("tw");
+                    S.compute_at(y, coi).vectorize(l).rename(t, tw);
+                } else {
+                    S.store_at(y, coo)
+                        .compute_at(y, coi)
+                        .vectorize(l);
+                }
                 r64.compute_at(y, coi).vectorize(l);
                 r32.compute_at(y, coi).vectorize(l);
             } else {
                 y.unroll(co);
-                S.store_root()
-                    .compute_at(y, co)
-                    .vectorize(l);
+                if (scan == ScanForm::Fusion) {
+                    // Renaming the walk's own loop keeps storage folding
+                    // from folding the state in place over it.
+                    Var tw("tw");
+                    S.compute_at(y, co).vectorize(l).rename(t, tw);
+                } else {
+                    S.store_root()
+                        .compute_at(y, co)
+                        .vectorize(l);
+                }
                 r64.compute_at(y, co).vectorize(l);
                 r32.compute_at(y, co).vectorize(l);
             }
@@ -128,6 +155,19 @@ public:
                 Var to("to"), ti("ti");
                 S.slide(y, t).fold_storage(t, 2);
                 y.split(t, to, ti, 2, TailStrategy::RoundUp).unroll(ti);
+            } else if (scan == ScanForm::Slide) {
+                // Storage for the whole walk: an explicit fold no narrower
+                // than it, which also keeps the automatic folding away.
+                S.fold_storage(t, y.dim(1).extent() + 2);
+            } else if (scan == ScanForm::SlideUnroll) {
+                // The inductive form's slide and unroll, with storage for
+                // the whole walk instead of its fold.
+                Var to("to"), ti("ti");
+                S.slide(y, t).fold_storage(t, y.dim(1).extent() + 2);
+                y.split(t, to, ti, 2, TailStrategy::RoundUp).unroll(ti);
+            } else if (scan == ScanForm::SlideFold) {
+                // The inductive form without its unroll.
+                S.slide(y, t).fold_storage(t, 2);
             }
         } else {
             // The materialized walk, at its best: everything nested inside

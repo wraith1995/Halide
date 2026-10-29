@@ -26,6 +26,30 @@ else
         rand!(rngs[k], slabs[k])
     end
 end
+# Resident memory as bench_harness.h measures it: hand freed memory back to
+# the kernel (jemalloc's arenas when it is preloaded), note the RSS, reset
+# the peak, and read the peak after the runs. One fill first, as the
+# runner's correctness check runs each form once before timing it, so the
+# output is resident and the fill compiled before the measurement starts.
+fill!()
+function status_kb(field)
+    isfile("/proc/self/status") || return -1
+    for line in eachline("/proc/self/status")
+        startswith(line, field * ":") && return parse(Int, split(line)[2])
+    end
+    return -1
+end
+GC.gc()
+mallctl = ccall(:dlsym, Ptr{Cvoid}, (Ptr{Cvoid}, Cstring), C_NULL, "mallctl")
+if mallctl != C_NULL
+    ccall(mallctl, Cint, (Cstring, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
+          "arena.4096.purge", C_NULL, C_NULL, C_NULL, 0)
+end
+rss_start = status_kb("VmRSS")
+try
+    write("/proc/self/clear_refs", "5")
+catch
+end
 # The shared protocol (apps/support/bench_harness.h): HB_WARMUP untimed
 # runs, HB_TRIALS timed ones, the best reported.
 for _ in 1:parse(Int, get(ENV, "HB_WARMUP", "3"))
@@ -37,6 +61,9 @@ for _ in 1:parse(Int, get(ENV, "HB_TRIALS", "30"))
     fill!()
     global best = min(best, (time_ns() - t0) / 1e3)
 end
+rss_peak = status_kb("VmHWM")
 using Printf
 @printf("  julia xoshiro %10.1f us  (Float32 rand!, %s)\n", best,
         nt == 1 ? "single thread" : "$nt threads, one generator per 8-stream block")
+growth = (rss_start < 0 || rss_peak < 0) ? -1 : max(0, rss_peak - rss_start)
+@printf("  mem julia xoshiro: rss_growth_kb=%d  rss_peak_kb=%d\n", growth, rss_peak)

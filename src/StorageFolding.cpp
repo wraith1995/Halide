@@ -1251,11 +1251,19 @@ class StorageFolding : public IRMutator {
         // the storage lives across every loop the dimension varies over, and
         // that the region required doesn't move with a loop between the
         // dimension and the producer.
+        //
+        // An explicit fold_storage of that dimension can only widen the
+        // window: the fold is the larger of the two.
         if (folder.slid_width > 0 && folder.slid_dim >= 0) {
             internal_assert(folder.slid_width > 0 && folder.slid_dim < func.dimensions())
                 << "Sliding window asked to fold " << op->name << " dimension "
                 << folder.slid_dim << " by " << folder.slid_width << "\n";
             Expr factor = (int)next_power_of_two((uint64_t)folder.slid_width);
+            for (const StorageDim &sd : func.schedule().storage_dims()) {
+                if (sd.fold_factor.defined() && sd.var == func.args()[folder.slid_dim]) {
+                    factor = simplify(max(factor, sd.fold_factor));
+                }
+            }
             body = FoldStorageOfFunction(op->name, folder.slid_dim, factor, "")(body);
             folder.dims_folded.push_back({folder.slid_dim, factor});
             debug(3) << "Folding " << op->name << " dimension " << folder.slid_dim

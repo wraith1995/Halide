@@ -33,6 +33,23 @@ $(BIN)/%/biquads_rdom.a: $(GENERATOR_BIN)/biquads.generator
 	$< -g biquads -f biquads_rdom -e $(GENERATOR_OUTPUTS) -o $(@D) \
 	    target=$*-no_runtime sections=$(SECTIONS) channels=$(CHANNELS) scan=rdom par=$(PAR)
 
+# The ablation forms (scan=fusion, slide in the generator). Fusion
+# recomputes the cascade from the first sample at every sample, quadratic in
+# SAMPLES, so it is only built and timed with ABLATE_FUSION=1, at a small
+# SAMPLES.
+ABLATE_FUSION ?= 0
+ABLATION = biquads_sld $(if $(filter 1,$(ABLATE_FUSION)),biquads_fus)
+
+$(BIN)/%/biquads_fus.a: $(GENERATOR_BIN)/biquads.generator
+	@mkdir -p $(@D)
+	$< -g biquads -f biquads_fus -e $(GENERATOR_OUTPUTS) -o $(@D) \
+	    target=$*-no_runtime sections=$(SECTIONS) channels=$(CHANNELS) scan=fusion par=$(PAR)
+
+$(BIN)/%/biquads_sld.a: $(GENERATOR_BIN)/biquads.generator
+	@mkdir -p $(@D)
+	$< -g biquads -f biquads_sld -e $(GENERATOR_OUTPUTS) -o $(@D) \
+	    target=$*-no_runtime sections=$(SECTIONS) channels=$(CHANNELS) scan=slide par=$(PAR)
+
 $(BIN)/%/runtime.a: $(GENERATOR_BIN)/biquads.generator
 	@mkdir -p $(@D)
 	$< -r runtime -o $(@D) target=$*
@@ -61,10 +78,11 @@ $(BIN)/%/fff_biquads.o: fff_biquads.cpp fff_biquads.h fff/*.h
 	@mkdir -p $(@D)
 	$(CXX) -O3 -march=native -std=c++20 -Wall -DSECTIONS=$(SECTIONS) -DFFF_STRIDE=$(FFF_STRIDE) -DFFF_PAIRWISE=$(FFF_PAIRWISE) -c $< -o $@
 
-$(BIN)/%/runner: runner.cpp fff_biquads.h $(BIN)/%/biquads_ind.a $(BIN)/%/biquads_unf.a $(BIN)/%/biquads_rdom.a $(BIN)/%/runtime.a $(FFF_OBJ)
+$(BIN)/%/runner: runner.cpp fff_biquads.h $(BIN)/%/biquads_ind.a $(BIN)/%/biquads_unf.a $(BIN)/%/biquads_rdom.a $(foreach a,$(ABLATION),$(BIN)/%/$(a).a) $(BIN)/%/runtime.a $(FFF_OBJ)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -I$(BIN)/$* -DCHANNELS=$(CHANNELS) -DSAMPLES=$(SAMPLES) \
 	    -DSECTIONS=$(SECTIONS) -DPARALLEL=$(if $(filter true,$(PAR)),1,0) \
+	    -DABLATE_FUSION=$(if $(filter 1,$(ABLATE_FUSION)),1,0) \
 	    -Wall -O3 -ffast-math -fno-finite-math-only $(filter-out %.h,$^) -o $@ $(IPP_FLAGS) $(FFF_FLAGS) $(LDFLAGS) -lpthread -ldl
 
 test: $(BIN)/$(HL_TARGET)/runner

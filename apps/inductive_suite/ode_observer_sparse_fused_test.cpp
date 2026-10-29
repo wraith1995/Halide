@@ -15,22 +15,244 @@
 // trajectories, one per thread when B > 1, for the Halide forms and the
 // baselines alike: the baselines' trajectories run as tasks on the Halide
 // runtime's thread pool, the same pool the Halide forms use.
+//
+// With a fourth argument `rk4`, the same problem is integrated by classical
+// RK4 at the same fixed step instead, a method SUNDIALS also provides (its
+// integrators have no Adams-Bashforth): the textbook C++ loop, Boost.odeint's
+// runge_kutta4, SUNDIALS ARKODE (when built WITH_SUNDIALS), and an inductive
+// Halide form that computes a whole step in one pass.
+//
+// usage: ode_observer_sparse_fused_test [D] [B] [T] [rk4]
 
 #include "Halide.h"
 
 #include "../support/bench_harness.h"
 #include "../support/jit_support.h"
 #include <boost/numeric/odeint.hpp>
+#ifdef WITH_SUNDIALS
+#include <arkode/arkode_erkstep.h>
+#include <nvector/nvector_serial.h>
+#endif
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <functional>
+#include <map>
 #include <vector>
 using namespace Halide;
+
+namespace {
+
+typedef int (*par_for_t)(void *, halide_task_t, int, int, uint8_t *);
+
+// Runs body(0) .. body(n - 1) as tasks of the Halide runtime's thread pool,
+// which exists once a pipeline has been JIT-compiled.
+void pool_for(par_for_t par_for, int n, const std::function<void(int)> &body) {
+    par_for(
+        nullptr, [](void *, int i, uint8_t *closure) {
+            (*(const std::function<void(int)> *)closure)(i);
+            return 0;
+        },
+        0, n, (uint8_t *)&body);
+}
+
+// The same problem, observer and batch, integrated by classical RK4 with a
+// fixed step h: a method Halide, Boost.odeint and SUNDIALS can all run as
+// written, so every form does the same arithmetic. The textbook C++ loop
+// (four right-hand sides and the stage sums, a pass over the slice each) is
+// the reference the others are checked against.
+int run_rk4(int D, int B, int T, float h, float eps, const Buffer<float> &y0) {
+    auto rhs_at = [=](float lm, float c, float lp) { return eps * (lm - 2.f * c + lp) + c - c * c * c; };
+    auto rhs = [=](const float *__restrict__ y, float *__restrict__ f) {
+        f[0] = rhs_at(y[0], y[0], y[1]);
+        for (int i = 1; i < D - 1; i++)
+            f[i] = rhs_at(y[i - 1], y[i], y[i + 1]);
+        f[D - 1] = rhs_at(y[D - 2], y[D - 1], y[D - 1]);
+    };
+    auto energy = [=](const float *y) {
+        float e = 0;
+        for (int i = 0; i < D; i++)
+            e += y[i];
+        return e / D;
+    };
+
+    // Halide: inductive in the step, one step per slice. The stages are
+    // recomputed inline from slice n - 1 at offsets -4..4 (k1 at -3..3, k2
+    // at -2..2, k3 at -1..1, k4 at 0), so a step reads one slice and writes
+    // one, for 16 right-hand sides per element instead of 4. Each stage
+    // value at an offset is one shared Expr. At the ends a stage reads its
+    // own value in place of the missing neighbour, as rhs() does. The
+    // observer is folded into the step, as in the AB2 form.
+    Var d("d"), b("b"), n("n");
+    Func y({Float(32), Float(32)}, 3, "y_rk4"), E("E_rk4");
+    y(d, b, n) = Tuple(undef<float>(), undef<float>());
+    RDom r(0, D, "r");
+    Expr i = r.x;
+    auto stencil = [&](Expr left, Expr center, Expr right) {
+        return eps * (left - 2.0f * center + right) + center - center * center * center;
+    };
+    using Stage = std::map<int, Expr>;
+    auto k = [&](Stage &P, int o) {
+        Expr c = P[o];
+        return stencil(select(i + o <= 0, c, P[o - 1]), c, select(i + o >= D - 1, c, P[o + 1]));
+    };
+    Stage Y, P2, P3, P4, K1, K2, K3;
+    for (int o = -4; o <= 4; o++)
+        Y[o] = y(clamp(i + o, 0, D - 1), b, n - 1)[0];
+    for (int o = -3; o <= 3; o++) {
+        K1[o] = k(Y, o);
+        P2[o] = Y[o] + (h / 2) * K1[o];
+    }
+    for (int o = -2; o <= 2; o++) {
+        K2[o] = k(P2, o);
+        P3[o] = Y[o] + (h / 2) * K2[o];
+    }
+    for (int o = -1; o <= 1; o++) {
+        K3[o] = k(P3, o);
+        P4[o] = Y[o] + h * K3[o];
+    }
+    Expr next = Y[0] + (h / 6) * (K1[0] + 2.0f * K2[0] + 2.0f * K3[0] + k(P4, 0));
+    Expr val = select(n <= 0, y0(i, b), likely(next));
+    Expr carried = select(i >= 16, y(max(i - 16, 0), b, n)[1], cast<float>(0));
+    y(i, b, n) = Tuple(val, carried + val);
+    RDom rl(0, 16, "rl");
+    E(b, n) = cast<float>(0);
+    E(b, n) += y(D - 16 + rl, b, n)[1] * (1.0f / D);
+    E.compute_root();
+    E.update(0).reorder(rl, n, b).atomic().vectorize(rl).parallel(b);
+    E.bound(b, 0, B).bound(n, 0, T);
+    E.output_buffer().dim(0).set_stride(T).dim(1).set_stride(1);
+    y.compute_at(E, n).store_at(E, b).fold_storage(n, 2);
+    y.update(0).allow_race_conditions().vectorize(r.x, 16);
+    E.compile_jit();
+
+    par_for_t par_for = (par_for_t)Internal::JITSharedRuntime::find_symbol(
+        get_jit_target_from_environment(), "halide_do_par_for");
+    if (!par_for) {
+        fprintf(stderr, "halide_do_par_for not found in the JIT runtime\n");
+        return 1;
+    }
+
+    std::vector<float> ec((size_t)B * T), eb((size_t)B * T);
+    hb::Stats s_cpp = hb::bench([&]() {
+        pool_for(par_for, B, [&](int bb) {
+            std::vector<float> yv(D), k1(D), k2(D), k3(D), k4(D), t(D);
+            for (int j = 0; j < D; j++)
+                yv[j] = y0(j, bb);
+            float *e = &ec[(size_t)bb * T];
+            e[0] = energy(yv.data());
+            for (int nn = 1; nn < T; nn++) {
+                rhs(yv.data(), k1.data());
+                for (int j = 0; j < D; j++)
+                    t[j] = yv[j] + 0.5f * h * k1[j];
+                rhs(t.data(), k2.data());
+                for (int j = 0; j < D; j++)
+                    t[j] = yv[j] + 0.5f * h * k2[j];
+                rhs(t.data(), k3.data());
+                for (int j = 0; j < D; j++)
+                    t[j] = yv[j] + h * k3[j];
+                rhs(t.data(), k4.data());
+                for (int j = 0; j < D; j++)
+                    yv[j] += (h / 6.f) * (k1[j] + 2 * k2[j] + 2 * k3[j] + k4[j]);
+                e[nn] = energy(yv.data());
+            }
+        });
+    });
+
+    namespace odeint = boost::numeric::odeint;
+    using state = std::vector<float>;
+    typedef odeint::runge_kutta4<state, float, state, float, odeint::range_algebra,
+                                 odeint::default_operations, odeint::initially_resizer>
+        rk4_f;
+    hb::Stats s_boost = hb::bench([&]() {
+        pool_for(par_for, B, [&](int bb) {
+            state x(D);
+            for (int j = 0; j < D; j++)
+                x[j] = y0(j, bb);
+            int step = 0;
+            auto sys = [&](const state &yv, state &dy, float) { rhs(yv.data(), dy.data()); };
+            auto obs = [&](const state &xs, float) {
+                if (step < T) eb[(size_t)bb * T + step++] = energy(xs.data());
+            };
+            odeint::integrate_n_steps(rk4_f(), sys, x, 0.0f, h, T - 1, obs);
+        });
+    });
+
+#ifdef WITH_SUNDIALS
+    // ARKODE's explicit integrator with the classical RK4 table and a fixed
+    // step, one step per call, in a single-precision build of SUNDIALS.
+    static_assert(sizeof(sunrealtype) == sizeof(float), "SUNDIALS must be built with SUNDIALS_PRECISION=SINGLE");
+    std::vector<float> es((size_t)B * T);
+    std::function<void(const float *, float *)> rhs_fn = rhs;
+    auto f_sun = [](sunrealtype, N_Vector yv, N_Vector fv, void *user) -> int {
+        (*(std::function<void(const float *, float *)> *)user)(N_VGetArrayPointer(yv), N_VGetArrayPointer(fv));
+        return 0;
+    };
+    hb::Stats s_sun = hb::bench([&]() {
+        pool_for(par_for, B, [&](int bb) {
+            SUNContext ctx;
+            SUNContext_Create(SUN_COMM_NULL, &ctx);
+            N_Vector x = N_VNew_Serial(D, ctx);
+            float *xp = N_VGetArrayPointer(x);
+            for (int j = 0; j < D; j++)
+                xp[j] = y0(j, bb);
+            void *ark = ERKStepCreate(f_sun, 0.0f, x, ctx);
+            ARKodeSetUserData(ark, &rhs_fn);
+            ERKStepSetTableNum(ark, ARKODE_KUTTA_RK4a_4_4);
+            ARKodeSetFixedStep(ark, h);
+            ARKodeSetMaxNumSteps(ark, T);
+            float *e = &es[(size_t)bb * T];
+            e[0] = energy(xp);
+            for (int nn = 1; nn < T; nn++) {
+                sunrealtype t;
+                ARKodeEvolve(ark, nn * h, x, &t, ARK_ONE_STEP);
+                e[nn] = energy(xp);
+            }
+            ARKodeFree(&ark);
+            N_VDestroy(x);
+            SUNContext_Free(&ctx);
+        });
+    });
+#endif
+
+    Buffer<float> ef = Buffer<float>(T, B).transposed(0, 1);
+    E.realize(ef);
+    hb::Stats s_fold = hb::bench([&]() { E.realize(ef); });
+
+    auto abserr = [&](auto get) {
+        double e = 0;
+        for (int bb = 0; bb < B; bb++)
+            for (int nn = 0; nn < T; nn++)
+                e = std::max(e, std::abs((double)get(bb, nn) - ec[(size_t)bb * T + nn]));
+        return e;
+    };
+    const double tol = 1e-4;
+    double err_f = abserr([&](int bb, int nn) { return ef(bb, nn); });
+    double err_b = abserr([&](int bb, int nn) { return eb[(size_t)bb * T + nn]; });
+    const double thr = (double)D * (double)T * B / 1e6;
+    char note[128];
+    snprintf(note, sizeof(note), "RK4, fixed h=%g  D=%d B=%d T=%d", h, D, B, T);
+    hb::print_spec_header("ode_observer_sparse_fused_rk4", "host", note);
+    hb::print_row("RK4 textbook C++ loop", s_cpp, thr / (s_cpp.min * 1e-3), "Mupd/s", 0.0, 0.0, true);
+    hb::print_row("RK4 Boost.odeint", s_boost, thr / (s_boost.min * 1e-3), "Mupd/s", 0.0, err_b, err_b < tol);
+    bool pass = err_f < tol && err_b < tol;
+#ifdef WITH_SUNDIALS
+    double err_s = abserr([&](int bb, int nn) { return es[(size_t)bb * T + nn]; });
+    hb::print_row("RK4 SUNDIALS ARKODE (fixed h)", s_sun, thr / (s_sun.min * 1e-3), "Mupd/s", 0.0, err_s, err_s < tol);
+    pass = pass && err_s < tol;
+#endif
+    hb::print_row("RK4 inductive FOLDED (fold n -> 2)", s_fold, thr / (s_fold.min * 1e-3), "Mupd/s", 0.0, err_f, err_f < tol);
+    printf("  -> %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
+}  // namespace
 
 int main(int argc, char **argv) {
     int D = argc > 1 ? atoi(argv[1]) : 1024;
     int B = argc > 2 ? atoi(argv[2]) : 1;
     int T = argc > 3 ? atoi(argv[3]) : 8192;
+    const bool rk4 = argc > 4 && !strcmp(argv[4], "rk4");
     const float h = 0.02f, eps = 0.1f;
     // The inductive observer keeps 16 lane partials along the slice.
     if (D % 16 != 0) {
@@ -43,6 +265,9 @@ int main(int argc, char **argv) {
     for (int bb = 0; bb < B; bb++)
         for (int i = 0; i < D; i++)
             y0(i, bb) = (float)(rand() % 200) / 100.0f - 1.0f;
+    if (rk4) {
+        return run_rk4(D, B, T, h, eps, y0);
+    }
 
     Var d("d"), b("b"), n("n");
 
@@ -121,6 +346,9 @@ int main(int argc, char **argv) {
 
     // Build one inductive pipeline, the observer folded into the step.
     // `fold_k` pins the state window (2 = folded, T = unfolded ablation).
+    // fold_k = 0 is the fusion-only ablation: y is computed at E's step loop
+    // but stored there too, so nothing slides, and each step recomputes the
+    // whole trajectory from the base case: O(T^2), run only at small T.
     auto build = [&](const char *tag, int fold_k) {
         // The state carries {y_n, f(y_{n-1}), running sum}: each step
         // evaluates the right-hand side once, on the slice it carries, and
@@ -165,7 +393,11 @@ int main(int argc, char **argv) {
         // allocation below), so each trajectory's observer strip is contiguous
         // and the threads do not false-share it.
         E.output_buffer().dim(0).set_stride(T).dim(1).set_stride(1);
-        y.compute_at(E, n).store_at(E, b).fold_storage(n, fold_k);
+        if (fold_k == 0) {
+            y.compute_at(E, n);
+        } else {
+            y.compute_at(E, n).store_at(E, b).fold_storage(n, fold_k);
+        }
         // The stencil's reads of the previous slice pass the race analysis
         // (n is inductive, so its loop is serial); the lane partial's read
         // sixteen elements back in the same slice does not. It is safe at
@@ -181,6 +413,9 @@ int main(int argc, char **argv) {
     // materialize.
     Func E_fold = build("fold", 2);
     Func E_unfold = build("unfold", T);
+    // The fusion-only ablation, when HB_FUSION is set.
+    const bool fusion = getenv("HB_FUSION") != nullptr;
+    Func E_fusion = fusion ? build("fusion", 0) : Func();
 
     // Non-inductive (materialize full trajectory) with the two-pass observer.
     // It has every slice in memory, so it recomputes the stencil of the slice
@@ -247,6 +482,14 @@ int main(int argc, char **argv) {
     hb::Stats s_fold = hb::bench([&]() { E_fold.realize(ef); });
     hb::Stats s_unfold = hb::bench([&]() { E_unfold.realize(eu); });
     hb::Stats s_mat = hb::bench([&]() { E_mat.realize(emat); });
+    Buffer<float> efu = Buffer<float>(T, B).transposed(0, 1);
+    hb::Stats s_fusion;
+    double bytes_fus = 0;
+    if (fusion) {
+        E_fusion.realize(efu);
+        s_fusion = hb::bench([&]() { E_fusion.realize(efu); });
+        bytes_fus = hb::profiled_peak_bytes(E_fusion, efu);
+    }
 
     // Measured peak internal scratch (untimed, separate from the benches above).
     double bytes_ind = hb::profiled_peak_bytes(E_fold, ef);
@@ -287,6 +530,98 @@ int main(int argc, char **argv) {
             odeint::integrate_n_steps(ab, sys, x, 0.0f, h, T - 1, obs);
         });
     });
+
+#ifdef WITH_SUNDIALS
+    // SUNDIALS, built in single precision so that every value is float, as
+    // above. Its integrators have no Adams-Bashforth 2 (CVODE's Adams family
+    // is implicit and adaptive), so it gets two rows: ARKODE's explicit
+    // integrator with a fixed step h and Heun's method, the same order as
+    // AB2 at two right-hand sides a step; and AB2 itself written with
+    // SUNDIALS' vector operations, the same arithmetic as Boost's stepper.
+    // Each trajectory has its own context and runs as a task on the Halide
+    // pool, as Boost's do. The right-hand side works on the vector's data in
+    // place.
+    static_assert(sizeof(sunrealtype) == sizeof(float), "SUNDIALS must be built with SUNDIALS_PRECISION=SINGLE");
+    struct SunRhs {
+        int D;
+        float eps;
+    };
+    auto f_sun = [](sunrealtype, N_Vector yv, N_Vector fv, void *user) -> int {
+        const SunRhs *s = (const SunRhs *)user;
+        const int D = s->D;
+        const float eps = s->eps;
+        const float *__restrict__ y = N_VGetArrayPointer(yv);
+        float *__restrict__ f = N_VGetArrayPointer(fv);
+        auto at = [&](float lm, float c, float lp) { return eps * (lm - 2.f * c + lp) + c - c * c * c; };
+        f[0] = at(y[0], y[0], y[1]);
+        for (int i = 1; i < D - 1; i++)
+            f[i] = at(y[i - 1], y[i], y[i + 1]);
+        f[D - 1] = at(y[D - 2], y[D - 1], y[D - 1]);
+        return 0;
+    };
+    SunRhs sun_user{D, eps};
+    auto sun_energy = [&](N_Vector x) {
+        const float *p = N_VGetArrayPointer(x);
+        float e = 0;
+        for (int i = 0; i < D; i++)
+            e += p[i];
+        return e / D;
+    };
+    std::vector<float> es((size_t)B * T), ev((size_t)B * T);
+    hb::Stats s_ark = hb::bench([&]() {
+        pool_for(B, [&](int bb) {
+            SUNContext ctx;
+            SUNContext_Create(SUN_COMM_NULL, &ctx);
+            N_Vector x = N_VNew_Serial(D, ctx);
+            float *xp = N_VGetArrayPointer(x);
+            for (int i = 0; i < D; i++)
+                xp[i] = y0(i, bb);
+            void *ark = ERKStepCreate(f_sun, 0.0f, x, ctx);
+            ARKodeSetUserData(ark, &sun_user);
+            ERKStepSetTableNum(ark, ARKODE_HEUN_EULER_2_1_2);
+            ARKodeSetFixedStep(ark, h);
+            ARKodeSetMaxNumSteps(ark, T);
+            es[(size_t)bb * T] = sun_energy(x);
+            for (int nn = 1; nn < T; nn++) {
+                sunrealtype t;
+                ARKodeEvolve(ark, nn * h, x, &t, ARK_ONE_STEP);
+                es[(size_t)bb * T + nn] = sun_energy(x);
+            }
+            ARKodeFree(&ark);
+            N_VDestroy(x);
+            SUNContext_Free(&ctx);
+        });
+    });
+    hb::Stats s_nvec = hb::bench([&]() {
+        pool_for(B, [&](int bb) {
+            SUNContext ctx;
+            SUNContext_Create(SUN_COMM_NULL, &ctx);
+            N_Vector x = N_VNew_Serial(D, ctx), f1 = N_VClone(x), f2 = N_VClone(x);
+            float *xp = N_VGetArrayPointer(x);
+            // The same start as the fused loop: f(y0), then y1 by RK4.
+            std::vector<float> xs(D);
+            for (int i = 0; i < D; i++)
+                xs[i] = xp[i] = y0(i, bb);
+            ev[(size_t)bb * T] = sun_energy(x);
+            f_sun(0, x, f2, &sun_user);
+            rk4_step(xs);
+            std::copy(xs.begin(), xs.end(), xp);
+            ev[(size_t)bb * T + 1] = sun_energy(x);
+            sunrealtype c[3] = {1.0f, 1.5f * h, -0.5f * h};
+            for (int nn = 2; nn < T; nn++) {
+                f_sun(0, x, f1, &sun_user);
+                N_Vector v[3] = {x, f1, f2};
+                N_VLinearCombination(3, c, v, x);  // y += h * (1.5 f1 - 0.5 f2)
+                std::swap(f1, f2);
+                ev[(size_t)bb * T + nn] = sun_energy(x);
+            }
+            N_VDestroy(f2);
+            N_VDestroy(f1);
+            N_VDestroy(x);
+            SUNContext_Free(&ctx);
+        });
+    });
+#endif
 
     // The fused C++ loop. Five slices rotate by pointer: the current y and
     // its right-hand side f1, the previous right-hand side f2, and the new
@@ -374,15 +709,30 @@ int main(int argc, char **argv) {
                   "Mupd/s", (double)D * 4, err_b, err_b < tol);
     hb::print_row("fused C++ loop", s_cpp, thr / (s_cpp.min * 1e-3),
                   "Mupd/s", 0.0, 0.0, true);
+#ifdef WITH_SUNDIALS
+    // Heun is a different method, so its distance from the AB2 trajectory
+    // is the two methods' difference, not round-off: shown, not checked.
+    double err_s = abserr([&](int bb, int nn) { return es[(size_t)bb * T + nn]; });
+    double err_v = abserr([&](int bb, int nn) { return ev[(size_t)bb * T + nn]; });
+    hb::print_row("SUNDIALS ARKODE Heun (fixed h)", s_ark, thr / (s_ark.min * 1e-3),
+                  "Mupd/s", 0.0, err_s, true);
+    hb::print_row("SUNDIALS N_Vector AB2", s_nvec, thr / (s_nvec.min * 1e-3),
+                  "Mupd/s", 0.0, err_v, err_v < tol);
+#endif
     hb::print_row("non-inductive (materialize)", s_mat, thr / (s_mat.min * 1e-3),
                   "Mupd/s", bytes_non, err_m, err_m < tol, "", fp_unfold);
+    double err_fu = fusion ? abserr([&](int bb, int nn) { return efu(bb, nn); }) : 0.0;
+    if (fusion) {
+        hb::print_row("inductive FUSION ONLY (no slide)", s_fusion, thr / (s_fusion.min * 1e-3),
+                      "Mupd/s", bytes_fus, err_fu, err_fu < tol, hb::verdict(s_fusion.min, s_mat.min), fp_unfold);
+    }
     hb::print_row("inductive UNFOLDED (fold n -> T)", s_unfold, thr / (s_unfold.min * 1e-3),
                   "Mupd/s", bytes_unf, err_u, err_u < tol, hb::verdict(s_unfold.min, s_mat.min), fp_unfold);
     hb::print_row("inductive FOLDED (fold n -> 2)", s_fold, thr / (s_fold.min * 1e-3),
                   "Mupd/s", bytes_ind, err_f, err_f < tol, hb::verdict(s_fold.min, s_unfold.min), fp_unfold);
     printf("  gap (inductive-fold vs Boost): %+.1f%%   inductive-fold vs non-ind: %.2fx\n",
            100.0 * (s_fold.min - s_boost.min) / s_boost.min, s_mat.min / s_fold.min);
-    bool pass = err_f < tol && err_u < tol && err_m < tol && err_b < tol;
+    bool pass = err_f < tol && err_u < tol && err_m < tol && err_b < tol && err_fu < tol;
     printf("  -> %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

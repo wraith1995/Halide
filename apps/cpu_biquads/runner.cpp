@@ -1,4 +1,4 @@
-// Benchmarks and checks the two forms of the biquad cascade against a
+// Benchmarks and checks the forms of the biquad cascade against a
 // double precision reference. The channel count times sample count is
 // chosen so the signal does not fit in the last level cache.
 
@@ -8,7 +8,15 @@
 
 #include "biquads_ind.h"
 #include "biquads_rdom.h"
+#include "biquads_sld.h"
 #include "biquads_unf.h"
+
+#ifndef ABLATE_FUSION
+#define ABLATE_FUSION 0
+#endif
+#if ABLATE_FUSION
+#include "biquads_fus.h"
+#endif
 
 #ifdef HAVE_FFF
 #include "fff_biquads.h"
@@ -160,14 +168,32 @@ int main(int argc, char **argv) {
     biquads_ind(x, sos, y);
     check(x, sos, y, "inductive");
     double t_ind = hb::bench_s([&]() { biquads_ind(x, sos, y); });
+    hb::print_mem("inductive", hb::last_stats());
 
     biquads_unf(x, sos, y);
     check(x, sos, y, "unfolded");
     double t_unf = hb::bench_s([&]() { biquads_unf(x, sos, y); });
+    hb::print_mem("unfolded", hb::last_stats());
 
     biquads_rdom(x, sos, y);
     check(x, sos, y, "rdom");
     double t_rdom = hb::bench_s([&]() { biquads_rdom(x, sos, y); });
+    hb::print_mem("rdom", hb::last_stats());
+
+    // The ablation: the inductive form's optimizations added one at a time,
+    // all unfolded. The inductive form is the last level, with the fold.
+    // The schedule never unrolls the recurrence, so there is no unroll
+    // level.
+#if ABLATE_FUSION
+    biquads_fus(x, sos, y);
+    check(x, sos, y, "ablation fusion");
+    double t_fus = hb::bench_s([&]() { biquads_fus(x, sos, y); });
+    hb::print_mem("ablation fusion", hb::last_stats());
+#endif
+    biquads_sld(x, sos, y);
+    check(x, sos, y, "ablation slide");
+    double t_sld = hb::bench_s([&]() { biquads_sld(x, sos, y); });
+    hb::print_mem("ablation slide", hb::last_stats());
 
 #ifdef HAVE_IPP
     // Intel IPP's multi-channel IIR: one biquad-cascade state per channel
@@ -234,6 +260,7 @@ int main(int argc, char **argv) {
     // reference.
     check(x, sos, yipp, "ipp", 1e-3);
     double t_ipp = hb::bench_s(ipp_run);
+    hb::print_mem("ipp", hb::last_stats());
     free(xin);
     free(yout);
 #endif
@@ -295,6 +322,7 @@ int main(int argc, char **argv) {
     }
     check(x, sos, yfff, "fff");
     double t_fff = hb::bench_s(fff_run);
+    hb::print_mem("fff", hb::last_stats());
     if (blocked) {
         free(xb);
         free(yb);
@@ -308,6 +336,12 @@ int main(int argc, char **argv) {
            t_unf * 1e6, t_unf / t_ind);
     printf("  rdom       %10.1f us  (%.2fx the inductive time)\n",
            t_rdom * 1e6, t_rdom / t_ind);
+#if ABLATE_FUSION
+    printf("  ablation fusion %10.1f us  (%.2fx: fused, stored per sample, recomputed from the first sample)\n",
+           t_fus * 1e6, t_fus / t_ind);
+#endif
+    printf("  ablation slide %10.1f us  (%.2fx: fused, sliding, unfolded; the unfolded schedule)\n",
+           t_sld * 1e6, t_sld / t_ind);
 #ifdef HAVE_IPP
     printf("  ipp        %10.1f us  (%.2fx: ippsIIR_32f_P, biquad cascade per channel%s)\n",
            t_ipp * 1e6, t_ipp / t_ind, PARALLEL ? ", threaded" : "");

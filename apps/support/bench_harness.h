@@ -20,22 +20,71 @@
 // not a synchronization per launch, which for a sub-millisecond kernel would
 // be most of the measurement. HB_BATCH overrides the batch size.
 //
-// Memory is reported ANALYTICALLY (byte-exact, deterministic): the app passes the
-// live bytes of the recurrence state/trajectory for each variant. This isolates
-// the quantity storage-folding controls from inputs/outputs (which are identical
-// across variants and must not be counted as a win). See print_row / mem_ratio.
+// Memory is reported two ways. The app passes each variant's state bytes
+// (the Halide profiler's measured heap peak for the Halide forms, analytic for
+// the C++ baselines). And bench() measures the process's resident memory over
+// the runs it times: the peak RSS (Linux VmHWM, reset just before the first
+// run) less the RSS at that point, after freed memory has been handed back to
+// the kernel. That is the memory a variant touches while it runs, beyond the
+// inputs, outputs and code already resident, measured the same way for
+// Halide forms and C++ baselines; print_row reports it as rss_growth_kb.
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
 #include <functional>
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 namespace hb {
+
+// A field of /proc/self/status in kB (VmRSS, VmHWM), or -1 off Linux.
+inline long proc_status_kb(const char *field) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long v = -1;
+    const size_t n = strlen(field);
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, field, n) && line[n] == ':') {
+            v = atol(line + n + 1);
+            break;
+        }
+    }
+    fclose(f);
+    return v;
+}
+
+// Hands memory the allocator holds but no one uses back to the kernel, so
+// that the next measurement starts from what is live: jemalloc's arenas when
+// it is the allocator (the benchmark driver preloads it, configured to keep
+// freed memory), glibc's otherwise.
+inline void release_free_memory() {
+    typedef int (*mallctl_t)(const char *, void *, size_t *, void *, size_t);
+    if (mallctl_t mallctl = (mallctl_t)dlsym(RTLD_DEFAULT, "mallctl")) {
+        mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
+        return;
+    }
+#ifdef __GLIBC__
+    malloc_trim(0);
+#endif
+}
+
+// Resets the kernel's peak-RSS mark (VmHWM) to the current RSS.
+inline void reset_peak_rss() {
+    if (FILE *f = fopen("/proc/self/clear_refs", "w")) {
+        fputs("5", f);
+        fclose(f);
+    }
+}
 
 inline int env_int(const char *k, int dflt) {
     const char *v = getenv(k);
@@ -55,7 +104,16 @@ inline int fold_factor(int folded, int full) {
 struct Stats {
     double median = 0, p25 = 0, p75 = 0, min = 0;
     int trials = 0;
+    // Resident memory over the timed runs and their warmup: the RSS when they
+    // started and its peak, in kB (-1 where /proc is unavailable).
+    long rss_start_kb = -1, rss_peak_kb = -1;
 };
+
+// The most recent bench()'s Stats, for runners that print their own rows.
+inline Stats &last_stats() {
+    static Stats s;
+    return s;
+}
 
 // Run `body` HB_WARMUP + HB_TRIALS times; return median/IQR/min over the timed
 // runs, per body. A trial is `batch` bodies followed by `finish`, timed
@@ -72,6 +130,9 @@ inline Stats bench(const std::function<void()> &body, int batch,
         if (finish)
             finish();
     };
+    release_free_memory();
+    const long rss_start = proc_status_kb("VmRSS");
+    reset_peak_rss();
     for (int i = 0; i < warmup; i++)
         trial();
     std::vector<double> ms;
@@ -89,7 +150,16 @@ inline Stats bench(const std::function<void()> &body, int batch,
     s.median = ms[trials / 2];
     s.p25 = ms[trials / 4];
     s.p75 = ms[(3 * trials) / 4];
+    s.rss_start_kb = rss_start;
+    s.rss_peak_kb = proc_status_kb("VmHWM");
+    last_stats() = s;
     return s;
+}
+
+// The resident memory a bench() touched beyond what was resident when it
+// started, in kB, or -1 if not measured.
+inline long rss_growth_kb(const Stats &s) {
+    return (s.rss_start_kb < 0 || s.rss_peak_kb < 0) ? -1 : std::max(0L, s.rss_peak_kb - s.rss_start_kb);
 }
 
 inline Stats bench(const std::function<void()> &body) {
@@ -191,10 +261,17 @@ inline void print_row(const char *variant, const Stats &s,
     // state_bytes is also emitted BYTE-EXACT as a trailing key=value: the %.2f MB
     // column floors sub-10KB and zero footprints to 0.00, which breaks a log-scale
     // memory plot. This field is analytic/deterministic (1 trial, no warmup needed).
-    printf("  %-30s %10.3f %10.3f   %8.1f %-4s %10.2f  %s%s%s%s%s  state_bytes=%.0f\n",
+    printf("  %-30s %10.3f %10.3f   %8.1f %-4s %10.2f  %s%s%s%s%s  state_bytes=%.0f  rss_growth_kb=%ld  rss_peak_kb=%ld\n",
            variant, s.min, s.median, tput, tput_unit,
            mb(state_bytes), status, errbuf,
-           verdict[0] ? "  " : "", verdict, fpbuf, state_bytes);
+           verdict[0] ? "  " : "", verdict, fpbuf, state_bytes,
+           rss_growth_kb(s), s.rss_peak_kb);
+}
+
+// One line of resident-memory figures for a runner that prints its own rows:
+// "  mem <label>: rss_growth_kb=... rss_peak_kb=...".
+inline void print_mem(const char *label, const Stats &s) {
+    printf("  mem %s: rss_growth_kb=%ld  rss_peak_kb=%ld\n", label, rss_growth_kb(s), s.rss_peak_kb);
 }
 
 // Convenience for the memory-scaling story: ratio of two analytic footprints.

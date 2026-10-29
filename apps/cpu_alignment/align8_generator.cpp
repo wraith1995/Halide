@@ -13,6 +13,15 @@
 // CIGARs as ksw_gg, so the output stays byte-exact. Three forms, matching
 // align16: scan = inductive (folded two-row window) / unfolded (fused,
 // no fold) / rdom (update definitions materializing the full state).
+//
+// Two more forms build up the inductive schedule one optimization at a
+// time, for the ablation: scan = fusion computes each inductive Func
+// (the state and the walk) inside its consumer's loop over the
+// recurrence axis and stores it there too, so nothing slides and every
+// iteration recomputes the history from the base case; scan = slide adds
+// the sliding window (storage hoisted to the block) but folds nothing,
+// neither the state nor the walk. The inductive form is the third level,
+// sliding plus folding.
 
 #include "Halide.h"
 #include "align_traceback.h"
@@ -25,12 +34,16 @@ class Align8 : public Halide::Generator<Align8> {
 public:
     enum class ScanForm { Inductive,
                           Unfolded,
-                          RDom };
+                          RDom,
+                          Fusion,
+                          Slide };
     GeneratorParam<ScanForm> scan{"scan",
                                   ScanForm::Inductive,
                                   {{"inductive", ScanForm::Inductive},
                                    {"unfolded", ScanForm::Unfolded},
-                                   {"rdom", ScanForm::RDom}}};
+                                   {"rdom", ScanForm::RDom},
+                                   {"fusion", ScanForm::Fusion},
+                                   {"slide", ScanForm::Slide}}};
     GeneratorParam<bool> par{"par", false};
     // Streaming stores for the direction plane under par (off only to
     // test cache-resident planes).
@@ -167,7 +180,21 @@ public:
         if (par) {
             path.parallel(bo);
         }
-        if (scan != ScanForm::RDom) {
+        if (scan == ScanForm::Fusion) {
+            // Stored where it is computed: each step realizes the walk
+            // from the start again. Storage folding would fold a
+            // one-dimensional inductive Func in place over its own loop
+            // (ps), and no fold_storage overrides that, since an explicit
+            // fold is only applied over a loop outside the producer. Its
+            // in-place fold only recognizes the loop by the name of the
+            // Func's own var, so renaming the loop leaves the walk unfolded.
+            Var ps_steps("ps_steps");
+            tb.compute_at(path, ps).rename(ps, ps_steps).vectorize(b, VEC);
+        } else if (scan == ScanForm::Slide) {
+            // A slot per step (the walk has J + I steps after the start
+            // at -1), so the explicit fold never wraps.
+            tb.compute_at(path, ps).store_at(path, bo).fold_storage(ps, J + I + 1).vectorize(b, VEC);
+        } else if (scan != ScanForm::RDom) {
             tb.compute_at(path, ps).store_at(path, bo).fold_storage(ps, 2).vectorize(b, VEC);
         } else {
             tb.compute_at(path, bo).vectorize(b, VEC);
@@ -184,7 +211,13 @@ public:
             }
         }
 
-        if (scan != ScanForm::RDom) {
+        if (scan == ScanForm::Fusion) {
+            // Stored where it is computed: each row of the direction
+            // plane realizes the state from the border row again. Its
+            // two-dimensional recurrence leaves nothing for the automatic
+            // folding pass to fold, so this needs no explicit fold.
+            dp8.compute_at(dir, i).vectorize(b, VEC);
+        } else if (scan != ScanForm::RDom) {
             dp8.compute_at(dir, i).store_at(path, bo).vectorize(b, VEC);
             if (scan == ScanForm::Inductive) {
                 dp8.fold_storage(i, 2);

@@ -21,10 +21,30 @@ materialized walk, written out at every chunk).
   with the shared harness (ten launches per synchronization).
 - `triton_bench.py`: mamba_ssm's Triton kernels
   (`mamba_chunk_scan_combined` and its backward) at the same shape,
-  timed with CUDA events under the same protocol.
+  timed with CUDA events under the same protocol, each row followed by a
+  `mem` line with torch's device allocator peak and its growth over the
+  inputs (counting the outputs the library allocates).
+
+An ablation takes the inductive state walks apart, with the tensor core
+schedule (`WMMA=true`). The runners build these beside the SCAN form and
+print them as rows `ablation fusion` and `ablation slide`, with a `mem`
+line each; the inductive form (both, folded) is the last level and the
+RDom forms the first:
+
+- `scan=fusion` (pipelines `mamba2_fus`, `mamba2_bwd_fus`): each state
+  computed and stored inside the walk over chunks, so every chunk
+  recomputes it from the first one, with what each chunk leaves behind
+  computed inside that walk. Quadratic in SEQ/CHUNK, so it is only built
+  with `make ABLATE_FUSION=1`.
+- `scan=slide` (pipelines `mamba2_sld`, `mamba2_bwd_sld`): the state slid
+  along the walk, its per-thread storage as long as the walk (an explicit
+  fold_storage that wide) rather than folded to the live chunks.
+
+The schedule does not unroll the walk, so there is no slide+unroll or
+slide+fold level.
 
 `make test` and `make test_bwd` take `SEQ STATE CHANNELS HEADS GROUPS
-CHUNK SCAN WMMA` on the command line. The numbers in the paper's table
+CHUNK SCAN WMMA ABLATE_FUSION` on the command line. The numbers in the paper's table
 come from `apps/inductive_benchmarks.py`, which builds each side at its
 own best chunk (Triton 256; the Halide backward 128, where its causal
 pruning makes smaller chunks cheaper) and lists the shape in the row.

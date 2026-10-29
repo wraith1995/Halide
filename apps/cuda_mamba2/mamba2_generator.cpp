@@ -79,14 +79,26 @@ public:
     // being slid into the walk and narrowed on the way out. Only the tensor
     // core schedule can be built all three ways; the fused one needs the state
     // slid.
+    //
+    // Two more forms take the inductive one apart for an ablation, with the
+    // tensor core schedule only:
+    //
+    //  fusion:     the state computed and stored inside the walk over chunks,
+    //              so every chunk recomputes it from the first one.
+    //  slide:      the state slid along the walk, with storage for every
+    //              chunk rather than folded to the live ones.
     enum class ScanForm { Inductive,
                           RDomUndef,
-                          RDom };
+                          RDom,
+                          Fusion,
+                          Slide };
     GeneratorParam<ScanForm> scan{"scan",
                                   ScanForm::Inductive,
                                   {{"inductive", ScanForm::Inductive},
                                    {"rdom_undef", ScanForm::RDomUndef},
-                                   {"rdom", ScanForm::RDom}}};
+                                   {"rdom", ScanForm::RDom},
+                                   {"fusion", ScanForm::Fusion},
+                                   {"slide", ScanForm::Slide}}};
     // Whether the four multiplies go to the tensor cores.
     GeneratorParam<bool> wmma{"wmma", false};
     // Whether to take the reference implementation's shape instead: a kernel
@@ -310,6 +322,10 @@ public:
 
         out(d, idx, t, b) = y(d, idx, t, b);
 
+        _halide_user_assert(wmma || (scan != ScanForm::Fusion && scan != ScanForm::Slide))
+            << "The fusion and slide forms take the tensor core schedule apart, "
+            << "so they need wmma=true.\n";
+
         try {
             if (!using_autoscheduler()) {
                 if (wmma) {
@@ -482,14 +498,19 @@ private:
         const bool state_init_is_chunk_state = !inductive() && !undef_init();
         Func cs = state_init_is_chunk_state ? H : chunk_state.in();
         Var hto("hto"), hti("hti");
+        // In the fusion form the state's own walk recomputes every chunk
+        // before this one, so what each chunk leaves behind goes inside that
+        // walk instead, one chunk per step of it.
+        Var tw("tw");
+        const LoopLevel cs_at = scan == ScanForm::Fusion ? LoopLevel(H, tw) : LoopLevel(Hop, hti);
         if (inductive()) {
             // What each chunk leaves behind is computed inside the walk that
             // consumes it, a chunk per step, and crosses to the carried state
             // through a tile of shared memory rather than through global.
             // Locations are set here; the walk's own schedule is below.
-            chunk_state.compute_at(Hop, hti).unroll(t);
+            chunk_state.compute_at(cs_at).unroll(t);
             chunk_state.update().unroll(t);
-            cs.compute_at(Hop, hti)
+            cs.compute_at(cs_at)
                 .store_in(MemoryType::GPUShared)
                 .unroll(cs.args()[2])
                 .tile(d, p, rxi, ryi, tile, tile)
@@ -589,14 +610,35 @@ private:
                 .gpu_blocks(ddo, b)
                 .gpu_lanes(ddi)
                 .gpu_threads(hw);
-            H.compute_at(Hop, hti)
-                .store_at(Hop, ddo)
-                .slide(Hop, t)
-                .store_in(MemoryType::Stack)
-                .split(p, hw, hp, tile)
-                .reorder(d, hp, hw)
-                .gpu_lanes(d)
-                .gpu_threads(hw);
+            if (scan == ScanForm::Fusion) {
+                // Computed and stored per chunk, so every chunk walks the
+                // state up from the first one. The storage is bounded at a
+                // whole walk and the step before it, which is what a chunk's
+                // walk can need, and renaming the walk keeps storage folding
+                // from folding it in place over its own loop.
+                H.compute_at(Hop, hti)
+                    .store_in(MemoryType::Stack)
+                    .bound_storage(t, (int)seq / (int)chunk + 1)
+                    .split(p, hw, hp, tile)
+                    .reorder(d, hp, hw)
+                    .gpu_lanes(d)
+                    .gpu_threads(hw)
+                    .rename(t, tw);
+            } else {
+                H.compute_at(Hop, hti)
+                    .store_at(Hop, ddo)
+                    .slide(Hop, t)
+                    .store_in(MemoryType::Stack)
+                    .split(p, hw, hp, tile)
+                    .reorder(d, hp, hw)
+                    .gpu_lanes(d)
+                    .gpu_threads(hw);
+                if (scan == ScanForm::Slide) {
+                    // Storage for every chunk: an explicit fold no narrower
+                    // than the walk.
+                    H.fold_storage(t, (int)seq / (int)chunk);
+                }
+            }
         } else {
             // Written as an update definition the walk is the Func, so there is
             // nothing to slide it into and nothing to narrow it on the way out.
@@ -842,8 +884,10 @@ private:
     // Every multiply is a tile of this size on the tensor cores.
     static constexpr int tile = 16;
 
+    // The ablation forms are the inductive form, scheduled differently.
     bool inductive() const {
-        return scan == ScanForm::Inductive;
+        return scan == ScanForm::Inductive || scan == ScanForm::Fusion ||
+               scan == ScanForm::Slide;
     }
     // Whether the pure definition of a scan stores nothing, leaving the update
     // to supply the base case.

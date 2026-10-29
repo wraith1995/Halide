@@ -24,6 +24,16 @@ FORMS := inductive unfolded rdom
 SHORT_inductive := ind
 SHORT_unfolded := unf
 SHORT_rdom := rdom
+SHORT_slide := sld
+SHORT_fusion := fus
+
+# The optimization ablation of the int8 inductive form: slide (fused,
+# sliding window, nothing folded) always; fusion (each inductive Func
+# stored where it is computed, recomputing its history every iteration,
+# so quadratic in the recurrence length) only with ABLATE_FUSION=1, at
+# small sizes. The fold level is the inductive form itself.
+ABLATE_FUSION ?= 0
+ABL_FORMS := slide $(if $(filter 1,$(ABLATE_FUSION)),fusion)
 
 $(GENERATOR_BIN)/%.generator: %_generator.cpp align_traceback.h $(GENERATOR_DEPS)
 	@mkdir -p $(@D)
@@ -37,8 +47,10 @@ $$(BIN)/%/$(1)_$$(SHORT_$(2)).a: $$(GENERATOR_BIN)/$(1).generator
 	    target=$$*-no_runtime$$(LARGE)$$(PROF) scan=$(2) par=$$(PAR) stream=$$(STREAM)
 endef
 $(foreach g,$(GENS),$(foreach f,$(FORMS),$(eval $(call GEN_rule,$(g),$(f)))))
+$(foreach f,slide fusion,$(eval $(call GEN_rule,align8,$(f))))
 
-STATIC_LIBS := $(foreach g,$(GENS),$(foreach f,$(FORMS),$(BIN)/$(HL_TARGET)/$(g)_$(SHORT_$(f)).a))
+STATIC_LIBS := $(foreach g,$(GENS),$(foreach f,$(FORMS),$(BIN)/$(HL_TARGET)/$(g)_$(SHORT_$(f)).a)) \
+               $(foreach f,$(ABL_FORMS),$(BIN)/$(HL_TARGET)/align8_$(SHORT_$(f)).a)
 
 $(BIN)/%/runtime.a: $(GENERATOR_BIN)/align16.generator
 	@mkdir -p $(@D)
@@ -62,7 +74,7 @@ endif
 $(BIN)/%/runner: runner.cpp $(STATIC_LIBS) $(BIN)/%/runtime.a $(BIN)/%/ksw2_gg.o $(BIN)/%/ksw2_gg2_sse.o
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -I$(BIN)/$* -DQLEN=$(QLEN) -DTLEN=$(TLEN) -DBATCH=$(BATCH) \
-	    -DPARALLEL=$(if $(filter true,$(PAR)),1,0) \
+	    -DPARALLEL=$(if $(filter true,$(PAR)),1,0) -DABLATE_FUSION=$(if $(filter 1,$(ABLATE_FUSION)),1,0) \
 	    -Wall -O3 -march=native -ffast-math $(filter %.cpp %.a %.o,$^) $(PARASAIL_FLAGS) -o $@ $(LDFLAGS) -lpthread -ldl
 
 test: $(BIN)/$(HL_TARGET)/runner

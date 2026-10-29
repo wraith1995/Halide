@@ -4,10 +4,25 @@
 #include "../support/bench_harness.h"
 #include "mamba2.h"
 
+// The ablation forms, built with the tensor core schedule.
+#ifndef ABLATION
+#define ABLATION 0
+#endif
+#ifndef ABLATE_FUSION
+#define ABLATE_FUSION 0
+#endif
+#if ABLATION
+#include "mamba2_sld.h"
+#if ABLATE_FUSION
+#include "mamba2_fus.h"
+#endif
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace Halide::Runtime;
@@ -115,12 +130,39 @@ int main(int argc, char **argv) {
     Buffer<float> Delta(seq, heads), A(heads);
     Buffer<float16_t> result(channels, chunk, num_chunks, heads);
 
-    auto run = [&]() {
-        if (mamba2(X, Bm, Cm, Delta, A, result) != 0) {
-            printf("mamba2 returned an error\n");
+    // Every form is checked and timed the same way. The first is the one
+    // SCAN chose; the rest are the ablation of the inductive form: fusion
+    // alone, then sliding over storage for every chunk. The inductive form
+    // adds the fold.
+    struct Form {
+        const char *label;
+        decltype(&mamba2) fn;
+        const char *what;
+    };
+    std::vector<Form> forms = {{"Halide mamba2", mamba2, ""}};
+#if ABLATION && ABLATE_FUSION
+    forms.push_back({"ablation fusion", mamba2_fus,
+                     "fused, stored per chunk, recomputed from the first chunk"});
+#endif
+#if ABLATION
+    forms.push_back({"ablation slide", mamba2_sld, "fused, sliding, storage for every chunk"});
+#endif
+
+    auto run = [&](const Form &f) {
+        if (f.fn(X, Bm, Cm, Delta, A, result) != 0) {
+            printf("%s returned an error\n", f.label);
             exit(1);
         }
         result.copy_to_host();
+    };
+    auto check_all = [&](const char *what, double rel_tol) {
+        bool all = true;
+        for (const Form &f : forms) {
+            run(f);
+            std::string label = &f == &forms[0] ? std::string(what) : std::string(f.label) + ": " + what;
+            all &= check(X, Bm, Cm, Delta, A, result, label.c_str(), rel_tol);
+        }
+        return all;
     };
 
     bool ok = true;
@@ -156,8 +198,7 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        run();
-        ok &= check(X, Bm, Cm, Delta, A, result, "sparse whole numbers", 0.0);
+        ok &= check_all("sparse whole numbers", 0.0);
     }
 
     // Then the arithmetic, with the decay and the precision the app is for.
@@ -180,8 +221,7 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        run();
-        ok &= check(X, Bm, Cm, Delta, A, result, "random", 1e-3);
+        ok &= check_all("random", 1e-3);
     }
 
     // Two multiplies of chunk x state x chunk and chunk x chunk x channels for
@@ -192,9 +232,18 @@ int main(int argc, char **argv) {
         2.0 * num_chunks * chunk *
         ((double)groups * chunk * state +
          heads * ((double)chunk * channels + 2.0 * state * channels));
-    double t = hb::bench_s([&]() { mamba2(X, Bm, Cm, Delta, A, result); },
-                           10, [&]() { result.device_sync(); });
-    printf("  Halide mamba2 %30.0f GFlop/s %10.1f us\n", flops / t / 1e9, t * 1e6);
+    std::vector<double> times;
+    for (const Form &f : forms) {
+        times.push_back(hb::bench_s([&]() { f.fn(X, Bm, Cm, Delta, A, result); },
+                                    10, [&]() { result.device_sync(); }));
+        hb::print_mem(f.label, hb::last_stats());
+    }
+    printf("  Halide mamba2 %30.0f GFlop/s %10.1f us\n", flops / times[0] / 1e9, times[0] * 1e6);
+    for (size_t i = 1; i < forms.size(); i++) {
+        printf("  %s %10.1f us  (%.0f GFlop/s, %.2fx the Halide mamba2 row: %s)\n",
+               forms[i].label, times[i] * 1e6, flops / times[i] / 1e9, times[i] / times[0],
+               forms[i].what);
+    }
 
     printf("%s\n", ok ? "Success!" : "FAILED");
     return ok ? 0 : 1;

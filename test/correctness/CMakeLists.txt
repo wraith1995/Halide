@@ -359,6 +359,7 @@ tests(
     slide_two_deep.cpp
     slide_directive.cpp
     slide_down_over_dimension.cpp
+    slide_explicit_fold.cpp
     slide_staging_bounds.cpp
     sliding_backwards.cpp
     sliding_over_guard_with_if.cpp

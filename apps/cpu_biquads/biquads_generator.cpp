@@ -28,12 +28,26 @@ public:
                           // whole trajectory stays live. Isolates folding
                           // from fusion.
                           Unfolded,
-                          RDom };
+                          RDom,
+                          // The ablation forms add the inductive form's
+                          // optimizations one at a time. Fusion alone: each
+                          // section computed and stored inside the walk, so
+                          // every sample recomputes the cascade from the
+                          // first one. Slide adds the sliding window over
+                          // storage for the whole walk, and is the same
+                          // schedule as Unfolded. The inductive form adds
+                          // the fold. The channel-block unroll is part of
+                          // every level; the recurrence itself is never
+                          // unrolled.
+                          Fusion,
+                          Slide };
     GeneratorParam<ScanForm> scan{"scan",
                                   ScanForm::Inductive,
                                   {{"inductive", ScanForm::Inductive},
                                    {"unfolded", ScanForm::Unfolded},
-                                   {"rdom", ScanForm::RDom}}};
+                                   {"rdom", ScanForm::RDom},
+                                   {"fusion", ScanForm::Fusion},
+                                   {"slide", ScanForm::Slide}}};
     // Whether blocks of channels spread across cores.
     GeneratorParam<bool> par{"par", false};
 
@@ -106,7 +120,7 @@ public:
         // ---------------- Schedule ----------------
 
         const int VEC = natural_vector_size<float>();
-        Var co("co"), ci("ci");
+        Var co("co"), ci("ci"), nw("nw");
         if (inductive()) {
             // One serial walk over the samples per block of channels, a
             // vector of channels wide. Every section computes its next
@@ -126,6 +140,14 @@ public:
                     .unroll(coi)
                     .parallel(coo);
                 for (Func f : ys) {
+                    if (scan == ScanForm::Fusion) {
+                        // Renaming the section's own loop keeps storage
+                        // folding from folding it in place over that loop.
+                        f.compute_at(y, coi)
+                            .vectorize(c, VEC)
+                            .rename(n, nw);
+                        continue;
+                    }
                     f.store_at(y, coo)
                         .compute_at(y, coi)
                         .vectorize(c, VEC);
@@ -137,6 +159,14 @@ public:
                     .vectorize(ci)
                     .unroll(co);
                 for (Func f : ys) {
+                    if (scan == ScanForm::Fusion) {
+                        // Renaming the section's own loop keeps storage
+                        // folding from folding it in place over that loop.
+                        f.compute_at(y, co)
+                            .vectorize(c, VEC)
+                            .rename(n, nw);
+                        continue;
+                    }
                     f.store_root()
                         .compute_at(y, co)
                         .vectorize(c, VEC);

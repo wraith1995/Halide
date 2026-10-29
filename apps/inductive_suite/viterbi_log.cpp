@@ -120,7 +120,12 @@ int main(int argc, char **argv) {
 
         // Build one variant; returns the decoded `path` Func. fold_k pins the
         // score storage window when inductive (2 = folded, T+1 = unfolded ablation).
+        // fold_k = 0 is the fusion-only ablation: the scores are computed at
+        // prev's step loop but stored there too, so nothing slides, and each
+        // step recomputes the whole trajectory from the base case: O(T^2),
+        // run only at small T.
         auto build = [&](bool inductive, int fold_k = 2) -> Func {
+            const bool fusion = inductive && fold_k == 0;
             // The walk carries {best score, argmax} per state as one Tuple:
             // every candidate is computed once, and the compare that keeps
             // the larger score is the compare that keeps its index (>= so
@@ -143,7 +148,7 @@ int main(int argc, char **argv) {
 
             // The argmax is a byte: it indexes the states, and the backpointer
             // plane, one per state per step, is what the traceback reads.
-            Func state({Float(32), UInt(8)}, 3, inductive ? "state_i" : "state_n");
+            Func state({Float(32), UInt(8)}, 3, fusion ? "state_fu" : inductive ? "state_i" : "state_n");
             state(s, t, b) = {neg_inf, cast<uint8_t>(0)};
 
             // A candidate for output state `out` from previous state `in` at
@@ -187,17 +192,19 @@ int main(int argc, char **argv) {
 
             // The backpointers, materialized for the traceback: a copy of the
             // argmax component, one row per step, while the scores fold.
-            Func prev(UInt(8), 3, inductive ? "prev_i" : "prev_n");
+            Func prev(UInt(8), 3, fusion ? "prev_fu" : inductive ? "prev_i" : "prev_n");
             prev(s, t, b) = state(s, t, b)[1];
 
-            Func path(Int(32), 2, inductive ? "path_i" : "path_n");
+            Func path(Int(32), 2, fusion ? "path_fu" : inductive ? "path_i" : "path_n");
             path(t, b) = undef<int>();
             path(T - 1, b) = cast<int>(prev(0, T, b));
             RDom rt(1, T - 1, "rt");
             path(T - 1 - rt, b) = cast<int>(prev(clamp(path(T - rt, b), 0, S - 1), T - rt, b));
 
             prev.bound(s, 0, S).bound(t, 0, T + 1).bound(b, 0, B);
-            if (inductive) {
+            if (fusion) {
+                state.compute_at(prev, t);
+            } else if (inductive) {
                 // Each sequence's window is its own: stored at its decode.
                 state.compute_at(prev, t).store_at(prev, b).fold_storage(t, fold_k);
             } else {
@@ -209,6 +216,11 @@ int main(int argc, char **argv) {
             path.compute_root();
             path.update(0).parallel(b);
             path.update(1).parallel(b);
+            if (const char *dir = getenv("HB_STMT")) {
+                path.compile_to_lowered_stmt(std::string(dir) + "/viterbi_log_" + path.name() + "_" +
+                                                 std::to_string(fold_k) + ".stmt",
+                                             path.infer_arguments());
+            }
             return path;
         };
 
@@ -220,6 +232,17 @@ int main(int argc, char **argv) {
         hb::Stats sn = hb::bench([&] { path_n.realize(res_n); });
         hb::Stats su = hb::bench([&] { path_u.realize(res_u); });
         hb::Stats si = hb::bench([&] { path_i.realize(res_i); });
+        // The fusion-only ablation, when HB_FUSION is set.
+        const bool fusion = getenv("HB_FUSION") != nullptr;
+        Func path_f = fusion ? build(true, 0) : Func();
+        Buffer<int> res_f(T, B);
+        hb::Stats sf;
+        double bytes_fus = 0;
+        if (fusion) {
+            path_f.realize(res_f);
+            sf = hb::bench([&] { path_f.realize(res_f); });
+            bytes_fus = hb::profiled_peak_bytes(path_f, res_f);
+        }
 
         // Measured peak internal scratch (untimed, separate from the benches above).
         double bytes_non = hb::profiled_peak_bytes(path_n, res_n);
@@ -332,6 +355,7 @@ int main(int argc, char **argv) {
             return m;
         };
         Mismatch mi = compare(res_i), mu = compare(res_u), mn = compare(res_n);
+        Mismatch mf = fusion ? compare(res_f) : Mismatch();
 
         // The log-probability of a decoded path, against the reference
         // optimum, worst over the sequences.
@@ -355,6 +379,8 @@ int main(int argc, char **argv) {
         bool oki = mi.unexcused == 0 && gi <= score_tol;
         bool oku = mu.unexcused == 0 && gu <= score_tol;
         bool okn = mn.unexcused == 0 && gn <= score_tol;
+        double gf = fusion ? score_gap(res_f) : 0;
+        bool okf = !fusion || (mf.unexcused == 0 && gf <= score_tol);
 
         // Roofline x-axis: unfolded footprint (backpointer trajectory, S*(T+1)
         // states) / LLC. Recurrence-length (T) and state-count (S) sweeps collapse
@@ -374,6 +400,16 @@ int main(int argc, char **argv) {
                       "Mstates/s", bytes_unf, gu, oku, hb::verdict(su.min, sn.min), fp_unfold);
         hb::print_row("inductive FOLDED (fold t -> 2)", si, (S * (double)T * B) / (si.min * 1e3),
                       "Mstates/s", bytes_ind, gi, oki, hb::verdict(si.min, su.min), fp_unfold);
+        // The per-optimization ablation, cumulative: fusion (HB_FUSION only),
+        // then slide, which is the UNFOLDED form above (fused, sliding, the
+        // window pinned to the whole trajectory), then fold, the FOLDED form.
+        // The recurrence is not unrolled, so there is no slide+unroll level.
+        if (fusion) {
+            hb::print_row("ablation fusion", sf, (S * (double)T * B) / (sf.min * 1e3),
+                          "Mstates/s", bytes_fus, gf, okf, hb::verdict(sf.min, sn.min), fp_unfold);
+        }
+        hb::print_row("ablation slide", su, (S * (double)T * B) / (su.min * 1e3),
+                      "Mstates/s", bytes_unf, gu, oku, hb::verdict(su.min, sn.min), fp_unfold);
         printf("  reference decisions on the paths within %.0e nats of a tie: %d of %d\n",
                tie_tol, near_ties, T * B);
         auto report = [&](const char *name, const Mismatch &m) {
@@ -383,8 +419,9 @@ int main(int argc, char **argv) {
         report("non", mn);
         report("unfold", mu);
         report("fold", mi);
+        if (fusion) report("fusion", mf);
 
-        return (oki && oku && okn) ? 0 : 1;
+        return (oki && oku && okn && okf) ? 0 : 1;
     } catch (const Halide::Error &e) {
         fprintf(stderr, "EXCEPTION: %s\n", e.what());
         return 1;
