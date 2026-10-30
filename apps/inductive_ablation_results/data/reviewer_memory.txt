@@ -1,0 +1,14 @@
+Paper machine: AMD Threadripper 9970X (32 cores, AVX-512, all-cores rows on 32 threads) and NVIDIA RTX 5060 Ti (driver 595.71.05).
+Peak Halide heap (MB) at each step; fusion only at the small size (paper form's heap there in brackets).
+
+Experiment             RDom (non-inductive)  (1) Fusion only*  (2) + Sliding window  (3) + Loop unrolling  (4) + Storage folding = paper
+---------------------  --------------------  ----------------  --------------------  --------------------  -----------------------------
+rng                                    4295        4.2 (vs 0)                  4295                  4295                              0
+biquads                                2114        0.1 (vs 0)                  8590                 = (2)                              0
+alignment                             10758      5.9 (vs 0.6)                 11843                 = (2)                           1095
+prefix mean                            1074        0.3 (vs 0)                  1074                  1074                              0
+viterbi                                 671        0.2 (vs 0)                   591                 = (2)                            134
+ODE                                    1074        6.3 (vs 0)                  3221                 = (2)                              0
+mamba2 fwd (GPU)                        141                42                    42                 = (2)                             42
+mamba2 bwd (GPU)                        277               235                   235                 = (2)                            235
+flash attention (GPU)                     0               n/a                   n/a                     0                              0

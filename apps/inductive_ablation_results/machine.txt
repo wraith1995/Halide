@@ -1,0 +1,7 @@
+host (paper machine)  Thu Oct 29 17:08:41 UTC 2026
+CPU(s):                                  64
+Model name:                              AMD Ryzen Threadripper 9970X 32-Cores
+Thread(s) per core:                      2
+Socket(s):                               1
+CPU(s) scaling MHz:                      37%
+affinity pid 3595785's current affinity list: 0-63

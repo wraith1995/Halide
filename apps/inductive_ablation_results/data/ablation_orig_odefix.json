@@ -1,0 +1,80 @@
+{
+ "7:ode": {
+  "config": "Allen-Cahn D=1024, batch 32, T=8192, all cores",
+  "rows": [
+   {
+    "level": "rdom",
+    "name": "non-inductive (materialize)",
+    "ms": 26.539,
+    "heap": 1073.741824,
+    "growth": 1026.0,
+    "peak": 1214.15625,
+    "kind": "halide"
+   },
+   {
+    "level": "slide",
+    "name": "inductive UNFOLDED (fold n -> T)",
+    "ms": 53.004,
+    "heap": 3221.225472,
+    "growth": 3264.0,
+    "peak": 3452.8828125,
+    "kind": "halide"
+   },
+   {
+    "level": "slide+unroll",
+    "name": "-",
+    "ms": null,
+    "heap": null,
+    "growth": null,
+    "peak": null,
+    "kind": "halide"
+   },
+   {
+    "level": "fold",
+    "name": "inductive FOLDED (fold n -> 2)",
+    "ms": 1.179,
+    "heap": 0.0,
+    "growth": 0.09765625,
+    "peak": 188.8828125,
+    "kind": "halide"
+   },
+   {
+    "level": "",
+    "name": "Boost.odeint",
+    "ms": 1.889,
+    "heap": null,
+    "growth": 62.0,
+    "peak": 259.50390625,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "fused C++ loop",
+    "ms": 1.996,
+    "heap": null,
+    "growth": 0.125,
+    "peak": 257.953125,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "SUNDIALS N_Vector AB2",
+    "ms": 2.907,
+    "heap": null,
+    "growth": 0.0,
+    "peak": 260.65625,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "SUNDIALS ARKODE Heun (fixed h)",
+    "ms": 13.207,
+    "heap": null,
+    "growth": 0.6171875,
+    "peak": 260.77734375,
+    "kind": "baseline"
+   }
+  ],
+  "app": "ode"
+ }
+}

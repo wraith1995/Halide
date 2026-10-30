@@ -1,0 +1,21 @@
+Paper machine: AMD Threadripper 9970X, 32 cores, AVX-512; all-cores rows use 32 threads, one per core.
+Paper form vs third-party implementations. CPU: resident-memory growth during the timed runs,
+the same measurement for every implementation. GPU: Halide's peak device heap vs the torch allocator's
+growth during the call.
+
+Experiment   Paper form: time  RSS growth (MB)            Third-party implementation  Time vs paper  RSS growth (MB)
+-----------  ----------------  ---------------  ------------------------------------  -------------  ---------------
+rng                   18.1 ms                0                       scalar C++ loop         59.75x                0
+                                                                         Julia rand!          1.00x              0.7
+biquads               29.5 ms                0  Finding Fast Filters strided cascade          0.83x                0
+                                                             Intel IPP ippsIIR_32f_P          2.70x              3.5
+alignment             26.4 ms             1109                ksw2 (minimap2 kernel)          2.58x              127
+                                                                            parasail          1.96x               65
+                                                                         ksw2 scalar         13.87x               33
+prefix mean           23.4 ms                0              oneTBB parallel_for rows          1.00x              0.2
+                                                                oneTBB parallel_scan          1.16x              0.1
+viterbi               12.0 ms              130                                (none)
+ODE                   1.18 ms              0.1                          Boost.odeint          1.60x               62
+                                                                      fused C++ loop          1.69x              0.1
+                                                               SUNDIALS N_Vector AB2          2.47x                0
+                                                      SUNDIALS ARKODE Heun (fixed h)         11.20x              0.6

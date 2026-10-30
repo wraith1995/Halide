@@ -1,0 +1,6 @@
+{"mamba2 fwd (GPU)": {"paper": 1571.3, "rdom": 1805.1, "fusion": 4900.4, "slide": 1627.5, "slide_unroll": "= (2), no unroll",
+                      "paper_heap": 42, "rdom_heap": 141, "fusion_heap": 42, "slide_heap": 42, "slide_unroll_heap": "= (2)"},
+ "mamba2 bwd (GPU)": {"paper": 5884.4, "rdom": 6082.7, "fusion": 24331.7, "slide": 6190.1, "slide_unroll": "= (2), no unroll",
+                      "paper_heap": 235, "rdom_heap": 277, "fusion_heap": 235, "slide_heap": 235, "slide_unroll_heap": "= (2)"},
+ "flash attention (GPU)": {"paper": 397.5, "rdom": 436.3, "fusion": null, "slide": null, "slide_unroll": 401.4,
+                      "paper_heap": 0, "rdom_heap": 0, "fusion_heap": null, "slide_heap": null, "slide_unroll_heap": 0}}
