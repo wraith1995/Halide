@@ -1,0 +1,20 @@
+Paper machine: AMD Threadripper 9970X (32 cores, AVX-512, all-cores rows on 32 threads) and NVIDIA RTX 5060 Ti (driver 595.71.05).
+Time: each step's time / the paper form's time, at the paper's sizes on all cores.
+* Fusion only recomputes the recurrence from its start for every output, O(T^2), so it is
+  measured at a small size on one thread, against the paper form at that same size.
+= (2): the paper form does not unroll this walk, so step (3) is the step (2) schedule.
+
+Experiment             RDom (non-inductive)  (1) Fusion only*  (2) + Sliding window  (3) + Loop unrolling  (4) + Storage folding = paper
+---------------------  --------------------  ----------------  --------------------  --------------------  -----------------------------
+rng                                   5.55x             6038x                 4.75x                 4.78x                1.00x (18.1 ms)
+biquads                               6.51x             2787x                 5.69x      = (2), no unroll                1.00x (29.5 ms)
+alignment                            13.12x               62x                13.88x      = (2), no unroll                1.00x (26.4 ms)
+prefix mean                           2.06x              490x                 1.73x                 1.73x                1.00x (23.4 ms)
+viterbi                               3.56x              988x                 1.34x      = (2), no unroll                1.00x (12.0 ms)
+ODE                                  22.51x              302x                44.96x      = (2), no unroll                1.00x (1.18 ms)
+mamba2 fwd (GPU)                      1.15x             3.12x                 1.04x      = (2), no unroll                1.00x (1.57 ms)
+mamba2 bwd (GPU)                      1.03x             4.13x                 1.05x      = (2), no unroll                1.00x (5.88 ms)
+flash attention (GPU)                 1.10x               n/a                   n/a                 1.01x                1.00x (0.40 ms)
+
+rng: slide + fold without the unroll is 1.10x.
+prefix mean: slide + fold without the unroll is 1.00x.

@@ -1,0 +1,452 @@
+{
+ "2:cpu_rng": {
+  "config": "32 streams x 4096 steps, 1 thread",
+  "rows": [
+   {
+    "level": "rdom",
+    "name": "rdom",
+    "ms": 0.048100000000000004,
+    "heap": 4.194304,
+    "growth": 4.015625,
+    "peak": 17.32421875,
+    "kind": "halide"
+   },
+   {
+    "level": "fusion",
+    "name": "ablation fusion",
+    "ms": 65.8113,
+    "heap": 4.195328,
+    "growth": 6.1328125,
+    "peak": 18.51171875,
+    "kind": "halide"
+   },
+   {
+    "level": "slide",
+    "name": "ablation slide",
+    "ms": 0.0432,
+    "heap": 4.196352,
+    "growth": 5.0078125,
+    "peak": 16.2421875,
+    "kind": "halide"
+   },
+   {
+    "level": "slide+unroll",
+    "name": "ablation slide+unroll",
+    "ms": 0.0352,
+    "heap": 4.196352,
+    "growth": 4.015625,
+    "peak": 15.7421875,
+    "kind": "halide"
+   },
+   {
+    "level": "slide+fold",
+    "name": "ablation slide+fold",
+    "ms": 0.0212,
+    "heap": 0.0,
+    "growth": 0.0,
+    "peak": 11.7265625,
+    "kind": "halide"
+   },
+   {
+    "level": "fold",
+    "name": "inductive",
+    "ms": 0.0109,
+    "heap": 0.0,
+    "growth": 0.0,
+    "peak": 12.83984375,
+    "kind": "halide"
+   },
+   {
+    "level": "",
+    "name": "scalar C++ loop",
+    "ms": 0.1884,
+    "heap": null,
+    "growth": 0.0,
+    "peak": 12.83984375,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "Julia rand!",
+    "ms": 0.018699999999999998,
+    "heap": null,
+    "growth": 0.38671875,
+    "peak": 317.515625,
+    "kind": "baseline"
+   }
+  ],
+  "app": "cpu_rng"
+ },
+ "5:cpu_biquads": {
+  "config": "8 sections, 32 ch x 1024 samples, 1 thread",
+  "rows": [
+   {
+    "level": "rdom",
+    "name": "rdom",
+    "ms": 0.0461,
+    "heap": 0.262144,
+    "growth": 0.2578125,
+    "peak": 9.30859375,
+    "kind": "halide"
+   },
+   {
+    "level": "fusion",
+    "name": "ablation fusion",
+    "ms": 30.375400000000003,
+    "heap": 0.131328,
+    "growth": 0.23046875,
+    "peak": 9.26953125,
+    "kind": "halide"
+   },
+   {
+    "level": "slide",
+    "name": "ablation slide",
+    "ms": 0.0188,
+    "heap": 1.052672,
+    "growth": 1.03125,
+    "peak": 10.0703125,
+    "kind": "halide"
+   },
+   {
+    "level": "slide+unroll",
+    "name": "-",
+    "ms": null,
+    "heap": null,
+    "growth": null,
+    "peak": null,
+    "kind": "halide"
+   },
+   {
+    "level": "fold",
+    "name": "inductive",
+    "ms": 0.0109,
+    "heap": 0.0,
+    "growth": 0.00390625,
+    "peak": 10.50390625,
+    "kind": "halide"
+   },
+   {
+    "level": "",
+    "name": "Finding Fast Filters strided cascade",
+    "ms": 0.0211,
+    "heap": null,
+    "growth": 0.0,
+    "peak": 9.95703125,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "Intel IPP ippsIIR_32f_P",
+    "ms": 0.196,
+    "heap": null,
+    "growth": 0.046875,
+    "peak": 9.91796875,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "scipy.sosfilt",
+    "ms": 0.24,
+    "heap": null,
+    "growth": 0.3125,
+    "peak": 112.1484375,
+    "kind": "baseline"
+   }
+  ],
+  "app": "cpu_biquads"
+ },
+ "8:ode": {
+  "config": "Allen-Cahn D=1024, batch 1, T=512, 1 thread",
+  "rows": [
+   {
+    "level": "rdom",
+    "name": "non-inductive (materialize)",
+    "ms": 0.073,
+    "heap": 2.097152,
+    "growth": 2.00390625,
+    "peak": 107.953125,
+    "kind": "halide"
+   },
+   {
+    "level": "fusion",
+    "name": "inductive FUSION ONLY (no slide)",
+    "ms": 11.706,
+    "heap": 6.291456,
+    "growth": 11.6015625,
+    "peak": 118.15625,
+    "kind": "halide"
+   },
+   {
+    "level": "slide",
+    "name": "inductive UNFOLDED (fold n -> T)",
+    "ms": 0.063,
+    "heap": 6.291456,
+    "growth": 7.5078125,
+    "peak": 113.73046875,
+    "kind": "halide"
+   },
+   {
+    "level": "slide+unroll",
+    "name": "-",
+    "ms": null,
+    "heap": null,
+    "growth": null,
+    "peak": null,
+    "kind": "halide"
+   },
+   {
+    "level": "fold",
+    "name": "inductive FOLDED (fold n -> 2)",
+    "ms": 0.036,
+    "heap": 0.0,
+    "growth": 0.01171875,
+    "peak": 106.234375,
+    "kind": "halide"
+   },
+   {
+    "level": "",
+    "name": "Boost.odeint",
+    "ms": 0.054,
+    "heap": null,
+    "growth": 0.32421875,
+    "peak": 110.515625,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "fused C++ loop",
+    "ms": 0.061,
+    "heap": null,
+    "growth": 0.0,
+    "peak": 109.8203125,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "SUNDIALS N_Vector AB2",
+    "ms": 0.084,
+    "heap": null,
+    "growth": 0.0,
+    "peak": 109.8203125,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "SUNDIALS ARKODE Heun (fixed h)",
+    "ms": 0.434,
+    "heap": null,
+    "growth": 0.40625,
+    "peak": 110.41015625,
+    "kind": "baseline"
+   }
+  ],
+  "app": "ode"
+ },
+ "11:viterbi": {
+  "config": "16 states, 4 symbols, T=2000, 1 decode, 1 thread",
+  "rows": [
+   {
+    "level": "rdom",
+    "name": "non-inductive (materialize)",
+    "ms": 0.031,
+    "heap": 0.16008,
+    "growth": 0.12890625,
+    "peak": 104.07421875,
+    "kind": "halide"
+   },
+   {
+    "level": "fusion",
+    "name": "ablation fusion",
+    "ms": 31.625,
+    "heap": 0.192176,
+    "growth": 0.59375,
+    "peak": 104.62109375,
+    "kind": "halide"
+   },
+   {
+    "level": "slide",
+    "name": "ablation slide",
+    "ms": 0.033,
+    "heap": 0.192096,
+    "growth": 0.12890625,
+    "peak": 103.13671875,
+    "kind": "halide"
+   },
+   {
+    "level": "slide+unroll",
+    "name": "-",
+    "ms": null,
+    "heap": null,
+    "growth": null,
+    "peak": null,
+    "kind": "halide"
+   },
+   {
+    "level": "fold",
+    "name": "inductive FOLDED (fold t -> 2)",
+    "ms": 0.032,
+    "heap": 0.032016,
+    "growth": 0.0,
+    "peak": 103.0078125,
+    "kind": "halide"
+   }
+  ],
+  "app": "viterbi"
+ },
+ "14:prefixsum": {
+  "config": "65536 x 2 rows, running mean, 1 thread",
+  "rows": [
+   {
+    "level": "rdom",
+    "name": "non-inductive (RDom, materialize row)",
+    "ms": 0.032,
+    "heap": 0.262144,
+    "growth": 0.25390625,
+    "peak": 103.8984375,
+    "kind": "halide"
+   },
+   {
+    "level": "fusion",
+    "name": "ablation fusion",
+    "ms": 12.74,
+    "heap": 0.262148,
+    "growth": 1.6953125,
+    "peak": 106.921875,
+    "kind": "halide"
+   },
+   {
+    "level": "slide",
+    "name": "ablation slide",
+    "ms": 0.039,
+    "heap": 0.262144,
+    "growth": 0.25390625,
+    "peak": 106.39453125,
+    "kind": "halide"
+   },
+   {
+    "level": "slide+unroll",
+    "name": "ablation slide+unroll",
+    "ms": 0.026,
+    "heap": 0.262144,
+    "growth": 0.25390625,
+    "peak": 106.45703125,
+    "kind": "halide"
+   },
+   {
+    "level": "slide+fold",
+    "name": "ablation slide+fold",
+    "ms": 0.048,
+    "heap": 0.0,
+    "growth": 0.14453125,
+    "peak": 106.34765625,
+    "kind": "halide"
+   },
+   {
+    "level": "fold",
+    "name": "inductive FOLDED",
+    "ms": 0.026,
+    "heap": 0.0,
+    "growth": 0.0,
+    "peak": 103.875,
+    "kind": "halide"
+   },
+   {
+    "level": "",
+    "name": "oneTBB parallel_for rows",
+    "ms": 0.06,
+    "heap": null,
+    "growth": 0.0,
+    "peak": 11.87109375,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "oneTBB parallel_scan",
+    "ms": 0.061,
+    "heap": null,
+    "growth": 0.0,
+    "peak": 11.87109375,
+    "kind": "baseline"
+   }
+  ],
+  "app": "prefixsum"
+ },
+ "17:cpu_alignment": {
+  "config": "128x128 x 128 pairs, 1 thread, fill+traceback+cigar, AVX2",
+  "rows": [
+   {
+    "level": "rdom",
+    "name": "int8 rdom",
+    "ms": 0.1923,
+    "heap": 5.32512,
+    "growth": 5.11328125,
+    "peak": 16.234375,
+    "kind": "halide"
+   },
+   {
+    "level": "fusion",
+    "name": "ablation fusion",
+    "ms": 13.8875,
+    "heap": 5.932288,
+    "growth": 9.11328125,
+    "peak": 20.5859375,
+    "kind": "halide"
+   },
+   {
+    "level": "slide",
+    "name": "ablation slide",
+    "ms": 0.2419,
+    "heap": 5.989376,
+    "growth": 5.7265625,
+    "peak": 17.08984375,
+    "kind": "halide"
+   },
+   {
+    "level": "slide+unroll",
+    "name": "-",
+    "ms": null,
+    "heap": null,
+    "growth": null,
+    "peak": null,
+    "kind": "halide"
+   },
+   {
+    "level": "fold",
+    "name": "int8 ind",
+    "ms": 0.2243,
+    "heap": 0.607488,
+    "growth": 0.50390625,
+    "peak": 10.33203125,
+    "kind": "halide"
+   },
+   {
+    "level": "",
+    "name": "ksw2 (minimap2 kernel)",
+    "ms": 1.0936,
+    "heap": null,
+    "growth": 0.04296875,
+    "peak": 11.08984375,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "parasail",
+    "ms": 1.5685,
+    "heap": null,
+    "growth": 0.74609375,
+    "peak": 11.71875,
+    "kind": "baseline"
+   },
+   {
+    "level": "",
+    "name": "ksw2 scalar",
+    "ms": 5.3389,
+    "heap": null,
+    "growth": 0.0234375,
+    "peak": 10.9765625,
+    "kind": "baseline"
+   }
+  ],
+  "app": "cpu_alignment"
+ }
+}
