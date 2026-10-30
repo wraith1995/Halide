@@ -120,6 +120,7 @@ int run_rk4(int D, int B, int T, float h, float eps, const Buffer<float> &y0) {
     E(b, n) += y(D - 16 + rl, b, n)[1] * (1.0f / D);
     E.compute_root();
     E.update(0).reorder(rl, n, b).atomic().vectorize(rl).parallel(b);
+    E.reorder(n, b).vectorize(n, 16).parallel(b);
     E.bound(b, 0, B).bound(n, 0, T);
     E.output_buffer().dim(0).set_stride(T).dim(1).set_stride(1);
     y.compute_at(E, n).store_at(E, b).fold_storage(n, 2);
@@ -341,6 +342,7 @@ int main(int argc, char **argv) {
         partial.update(0).reorder(l, rdo).vectorize(l);
         E.compute_root();
         E.update(0).reorder(rdi, n, b).parallel(b);
+        E.reorder(n, b).vectorize(n, 16).parallel(b);
         E.bound(b, 0, B).bound(n, 0, T);
     };
 
@@ -386,6 +388,9 @@ int main(int argc, char **argv) {
         // The 16 partials reduce as a shuffle tree rather than a chain of
         // 16 dependent adds per step.
         E.update(0).reorder(rl, n, b).atomic().vectorize(rl).parallel(b);
+        // The output is n-dense, so its zero fill runs along n, in parallel
+        // over the batch, not as a serial walk striding across trajectories.
+        E.reorder(n, b).vectorize(n, 16).parallel(b);
         E.bound(b, 0, B).bound(n, 0, T);
 
         // Each trajectory's window is its own: stored at its batch index.
