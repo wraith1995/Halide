@@ -80,7 +80,8 @@ bandwidth per core. The GPU rows need an NVIDIA GPU with tensor cores and
 CUDA~13; the paper used a consumer GPU.
 
 \subsubsection{Software dependencies}
-Linux, a C++17 compiler, GNU make, CMake, \texttt{uv}, and jemalloc. The driver
+Linux, a C++17 compiler, GNU make, pkg-config, \texttt{uv}, jemalloc, and the
+libpng, libjpeg and zlib headers. The driver
 preloads jemalloc into every process, configured to keep freed memory, so that no
 timed run pays page faults for scratch that an earlier run freed. Optional
 baselines are built when found: Boost.odeint (\texttt{BOOST\_DIR}, or
@@ -100,8 +101,9 @@ None; every app generates its input from a fixed seed.
 git clone -b inductive_artifact \
   https://github.com/wraith1995/Halide.git
 cd Halide
-sudo apt install libjemalloc2 libboost-dev \
-  libtbb-dev
+sudo apt install build-essential pkg-config \
+  libpng-dev libjpeg-turbo8-dev zlib1g-dev \
+  libjemalloc2 libboost-dev libtbb-dev
 inductive_artifact/setup.sh
 # or, with the Python and GPU baselines:
 WITH_PYTHON_BASELINES=1 \

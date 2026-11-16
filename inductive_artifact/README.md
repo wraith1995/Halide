@@ -7,11 +7,13 @@ part to `\input` into the paper).
 
 ## Setup
 
-Linux x86-64, a C++17 compiler, GNU make, CMake, [uv](https://docs.astral.sh/uv/)
-and jemalloc:
+Linux x86-64, a C++17 compiler, GNU make, pkg-config,
+[uv](https://docs.astral.sh/uv/), jemalloc, and the libpng and libjpeg
+headers (Halide's Makefile checks for them):
 
 ```shell
-sudo apt install libjemalloc2 libboost-dev libtbb-dev
+sudo apt install build-essential pkg-config libpng-dev libjpeg-turbo8-dev zlib1g-dev \
+    libjemalloc2 libboost-dev libtbb-dev
 inductive_artifact/setup.sh
 # With the Python and GPU baselines (scipy, IPP, oneTBB, torch, Triton, mamba_ssm):
 WITH_PYTHON_BASELINES=1 inductive_artifact/setup.sh
