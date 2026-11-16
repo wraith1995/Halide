@@ -1,0 +1,9 @@
+# Build outputs and environments from a host build of this checkout.
+.git
+.venv
+bin
+distrib
+build*
+apps/**/bin
+apps/inductive_benchmarks_logs
+inductive_artifact/results

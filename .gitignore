@@ -259,6 +259,7 @@ CLAUDE.local.md
 # Allow particular extension-less files
 !gradlew
 !Makefile
+!inductive_artifact/Dockerfile
 !packaging/ubuntu/changelog
 !packaging/ubuntu/copyright
 !packaging/ubuntu/triggers
