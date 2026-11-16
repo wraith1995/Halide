@@ -134,6 +134,10 @@ export PARASAIL_DIR=$PWD/parasail-2.6.2
 \end{verbatim}
 }
 
+\noindent\textbf{Docker (optional).} \path{inductive_artifact/Dockerfile}
+builds an image with all of the above done (CPU, or GPU on CUDA~13); its
+README gives the commands.
+
 \noindent\textbf{Basic test.} \texttt{inductive\_artifact/basic\_test.sh}
 runs Halide's own tests of inductive functions with Halide's Makefile: 15
 correctness tests (inductive functions, storage folding and sliding windows)

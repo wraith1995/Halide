@@ -37,6 +37,29 @@ cmake --build parasail-2.6.2/build --target parasail -j
 export PARASAIL_DIR=$PWD/parasail-2.6.2
 ```
 
+### Optional: Docker
+
+As an alternative to the steps above, `inductive_artifact/Dockerfile` builds
+an image with all of them done: the apt packages, Julia, parasail and the
+Halide build. From the repository root:
+
+```shell
+# CPU
+docker build -f inductive_artifact/Dockerfile -t inductive-artifact .
+docker run --rm -it inductive-artifact inductive_artifact/basic_test.sh
+docker run --rm -it inductive-artifact inductive_artifact/run_benchmarks.sh
+# GPU, with the Python and GPU baselines (needs the NVIDIA Container Toolkit)
+docker build -f inductive_artifact/Dockerfile -t inductive-artifact-gpu \
+    --build-arg BASE=nvidia/cuda:13.0.2-devel-ubuntu24.04 --build-arg PYTHON_BASELINES=1 .
+docker run --rm -it --gpus all inductive-artifact-gpu inductive_artifact/run_benchmarks.sh
+```
+
+Results are written inside the container, under `/artifact/inductive_artifact/results`;
+mount a host directory there (`-v $PWD/results:/artifact/inductive_artifact/results`)
+to keep them.
+
+### Basic test
+
 To check the installation, `inductive_artifact/basic_test.sh` runs Halide's
 own tests of inductive functions with Halide's Makefile: the correctness
 tests of inductive functions, storage folding and sliding windows, and the
