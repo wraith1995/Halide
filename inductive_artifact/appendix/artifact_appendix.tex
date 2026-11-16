@@ -77,8 +77,9 @@ memory-bound, so their speedups depend on the memory bandwidth available per
 core. The GPU apps need an NVIDIA GPU with tensor cores and CUDA~13.
 
 \subsubsection{Software dependencies}
-Linux, a C++17 compiler, GNU make, CMake, pkg-config, \texttt{uv},
-jemalloc, and the libpng, libjpeg and zlib headers. Every process the scripts
+With Docker, only Docker (and the NVIDIA Container Toolkit for the GPU
+apps). Without it: Linux, a C++17 compiler, GNU make, CMake, pkg-config,
+\texttt{uv}, jemalloc, and the libpng, libjpeg and zlib headers. Every process the scripts
 launch, baselines included, preloads jemalloc configured to keep freed memory,
 as in the paper. Boost.odeint, oneTBB and Intel IPP are found through
 \texttt{BOOST\_DIR}, \texttt{TBB\_DIR} and \texttt{IPP\_DIR}, or a system
@@ -93,18 +94,36 @@ None; every input is generated.
 
 \subsection{Installation}
 
-Halide is built as its \path{README.md} describes under ``Building Halide
-with make'', with LLVM from Halide's package index (``Acquiring LLVM'').
-\texttt{setup.sh} does both: it creates a Python 3.12 environment in
-\path{.venv} holding LLVM, then builds the Halide distribution,
-\path{distrib/}, which every app links against. The README covers Halide's
-requirements in more detail if the build fails.
+\noindent\textbf{With Docker (recommended).} Build the CPU image, or the
+GPU image (CUDA~13, with the Python and GPU baselines), and open a shell in
+it; for the GPU image add \texttt{--gpus all}, which needs the NVIDIA
+Container Toolkit:
 
 {\footnotesize
 \begin{verbatim}
 git clone -b inductive_artifact \
   https://github.com/wraith1995/Halide.git
 cd Halide
+docker build -f inductive_artifact/Dockerfile \
+  -t inductive-artifact .
+# or, for the GPU image:
+docker build -f inductive_artifact/Dockerfile \
+  -t inductive-artifact \
+  --build-arg BASE=nvidia/cuda:13.0.2-devel-ubuntu24.04 \
+  --build-arg PYTHON_BASELINES=1 .
+docker run --rm -it inductive-artifact bash
+\end{verbatim}
+}
+
+\noindent The image holds every dependency below and the Halide build; the
+shell opens in the artifact's tree.
+
+\noindent\textbf{On the host.} \texttt{setup.sh} builds Halide as its
+\path{README.md} describes (``Building Halide with make''), with LLVM from
+Halide's package index installed in \path{.venv}. In the clone:
+
+{\footnotesize
+\begin{verbatim}
 sudo apt install build-essential cmake pkg-config \
   libpng-dev libjpeg-turbo8-dev zlib1g-dev \
   libjemalloc2 libboost-dev libtbb-dev
@@ -114,9 +133,8 @@ WITH_PYTHON_BASELINES=1 inductive_artifact/setup.sh
 \end{verbatim}
 }
 
-\noindent Julia and parasail are installed by hand. Julia's installer
-puts \texttt{julia} on the \texttt{PATH} for new shells; parasail is found
-through \texttt{PARASAIL\_DIR}:
+\noindent Julia and parasail are installed by hand (Julia goes on the
+\texttt{PATH} for new shells):
 
 {\footnotesize
 \begin{verbatim}
@@ -134,15 +152,12 @@ export PARASAIL_DIR=$PWD/parasail-2.6.2
 \end{verbatim}
 }
 
-\noindent\textbf{Docker (optional).} \path{inductive_artifact/Dockerfile}
-builds an image with all of the above done (CPU, or GPU on CUDA~13); its
-README gives the commands.
-
-\noindent\textbf{Basic test.} \texttt{inductive\_artifact/basic\_test.sh}
-runs Halide's own tests of inductive functions with Halide's Makefile: 15
-correctness tests (inductive functions, storage folding and sliding windows)
-and 23 error tests (schedules of inductive functions that Halide must
-reject). It ends with \texttt{Basic test passed.}
+\noindent\textbf{Basic test.} In the container or on the host,
+\texttt{inductive\_artifact/basic\_test.sh} runs Halide's own tests of
+inductive functions with Halide's Makefile: 15 correctness tests (inductive
+functions, storage folding and sliding windows) and 23 error tests
+(schedules of inductive functions that Halide must reject). It ends with
+\texttt{Basic test passed.}
 
 \subsection{Experiment workflow}
 
@@ -223,16 +238,7 @@ per core. The ranking of the apps and the memory values should not change.
 
 \subsection{Experiment customization}
 
-Each app's Makefile takes its problem size on the command line, and the
-README in each app lists the knobs. Environment variables set the number of
-cores (\texttt{HB\_NCORES}), the core that single-thread rows are pinned to
-(\texttt{HB\_PIN\_CORE}), the Python used for the baselines
-(\texttt{HB\_PYTHON}), and the jemalloc library (\texttt{HB\_JEMALLOC}).
-
-\subsection{Methodology}
-
-Submission, reviewing and badging methodology:
-\begin{itemize}
-  \item \url{https://www.acm.org/publications/policies/artifact-review-and-badging-current}
-  \item \url{https://cTuning.org/ae}
-\end{itemize}
+Each app's Makefile takes its problem size on the command line (see its
+README). \texttt{HB\_NCORES}, \texttt{HB\_PIN\_CORE}, \texttt{HB\_PYTHON}
+and \texttt{HB\_JEMALLOC} set the core count, the core for single-thread
+rows, the baselines' Python and the jemalloc library.
