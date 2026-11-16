@@ -40,9 +40,9 @@ against a reference implementation before it is timed.
   \item {\bf Run-time environment:} Linux x86-64 with jemalloc. The optional
     baselines are Boost.odeint, oneTBB, Intel IPP, parasail, Julia, scipy,
     PyTorch, Triton and mamba\_ssm.
-  \item {\bf Hardware:} a multicore x86-64 CPU. The paper's machine
-    (\artsec{sec:benchmarks}{in the paper}) has 32 cores with AVX-512; AVX2 also
-    works. The GPU apps need an NVIDIA GPU with tensor cores.
+  \item {\bf Hardware:} a multicore x86-64 CPU (AVX2 or newer); for the
+    GPU apps, an NVIDIA GPU with tensor cores. The paper used an AMD Ryzen
+    Threadripper 9970X and an NVIDIA GeForce RTX 5060 Ti.
   \item {\bf Execution:} two shell scripts. All-cores rows use one thread
     per physical core.
   \item {\bf Metrics:} best of 30 timed runs after 3 warmups (ms); peak
@@ -70,7 +70,9 @@ On Zenodo, \artifactdoi: one 34~MB archive. The apps are in \path{apps/};
 the scripts and instructions in \path{inductive_artifact/}.
 
 \subsubsection{Hardware dependencies}
-The CPU apps run on any x86-64 Linux machine. The all-cores rows are
+The paper's results were measured on an AMD Ryzen Threadripper 9970X (Zen~5,
+32 cores in four 8-core chiplets, AVX-512) and an NVIDIA GeForce RTX 5060 Ti
+(driver 595.71, CUDA~13). The CPU apps run on any x86-64 Linux machine. The all-cores rows are
 memory-bound, so their speedups depend on the memory bandwidth available per
 core. The GPU apps need an NVIDIA GPU with tensor cores and CUDA~13.
 
@@ -170,8 +172,8 @@ inductive_artifact/run_ablation.sh    # ablation
 apps: \texttt{cpu\_rng}, \texttt{cpu\_biquads}, \texttt{cpu\_alignment},
 \texttt{prefixsum}, \texttt{viterbi}, \texttt{ode}, \texttt{flash\_attention}
 and \texttt{cuda\_mamba2}. Finished rows are cached, so a partial run
-updates the table rather than replacing it. The GPU apps print their own
-ablation levels:
+updates the table rather than replacing it. The GPU apps time the same
+ablation themselves:
 
 {\footnotesize
 \begin{verbatim}
@@ -220,16 +222,17 @@ not plot. The tables from the paper's machine are in
     (Mamba-2 backward). Relative to the vendor kernels it reaches 94\% of
     PyTorch, 98\% of Triton on the forward pass and 73\% of Triton on the
     backward pass.
-  \item \textbf{Ablation (CPU).} The levels add the optimizations one at a
-    time: fusion only, then a sliding window, then storage folding. Each level
-    is needed: only with all of them does the schedule reach roughly the
-    paper's results, and earlier levels are slower, fusion alone by far,
-    since it recomputes each recurrence from its start.
+  \item \textbf{Ablation (CPU).} \path{run_ablation.sh} times each CPU app
+    with fusion alone, then with fusion and a sliding window, and then with
+    storage folding as well, which is the paper's schedule. We expect all
+    three optimizations to be needed to reach roughly the paper's results.
+    Fusion alone is far slower, since it recomputes each recurrence from its
+    start.
 \end{enumerate}
 
-Absolute times depend on the machine. The all-cores speedups come from
-memory traffic, so they are smaller on a machine with more memory bandwidth
-per core. The ranking of the apps and the memory values should not change.
+We do not expect identical results on a different machine, but the
+speedups and the ablation should look similar. The GPU results are very
+sensitive to the particular GPU.
 
 \subsection{Experiment customization}
 
