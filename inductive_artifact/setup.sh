@@ -19,6 +19,14 @@ command -v uv >/dev/null || { echo "uv is needed: https://docs.astral.sh/uv/"; e
 source .venv/bin/activate
 uv pip install --index https://pypi.halide-lang.org/simple "halide-llvm~=22.1.0"
 LLVM_PREFIX=$(halide-llvm --prefix)
+# Some of the package's tools (clang, clang++, ...) start as scripts that
+# replace themselves with a symlink the first time they run. Run each one
+# once here, so that a parallel make never finds one mid-replacement.
+for tool in "$LLVM_PREFIX"/bin/*; do
+    if [ -f "$tool" ] && [ ! -L "$tool" ] && head -c 2 "$tool" | grep -q '#!' && grep -q link_target "$tool"; then
+        "$tool" --version >/dev/null 2>&1 || true
+    fi
+done
 
 make -j"$JOBS" LLVM_CONFIG="$LLVM_PREFIX/bin/llvm-config" distrib
 

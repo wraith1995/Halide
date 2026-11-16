@@ -8,20 +8,39 @@ bibliography; CGO places the artifact appendix before the References).
 
 ## Setup
 
-Linux x86-64, a C++17 compiler, GNU make, pkg-config,
+Halide is built as the top-level `README.md` describes under "Building Halide
+with make", with LLVM from Halide's package index ("Acquiring LLVM").
+`setup.sh` does both: it creates a Python 3.12 environment in `.venv` holding
+LLVM 22, then builds `distrib/`, the Halide distribution every app in `apps/`
+links against. It needs Linux x86-64, a C++17 compiler, GNU make, pkg-config,
 [uv](https://docs.astral.sh/uv/), jemalloc, and the libpng and libjpeg
 headers (Halide's Makefile checks for them):
 
 ```shell
-sudo apt install build-essential pkg-config libpng-dev libjpeg-turbo8-dev zlib1g-dev \
+sudo apt install build-essential cmake pkg-config libpng-dev libjpeg-turbo8-dev zlib1g-dev \
     libjemalloc2 libboost-dev libtbb-dev
 inductive_artifact/setup.sh
 # With the Python and GPU baselines (scipy, IPP, oneTBB, torch, Triton, mamba_ssm):
 WITH_PYTHON_BASELINES=1 inductive_artifact/setup.sh
 ```
 
-`setup.sh` creates a Python 3.12 environment in `.venv` holding LLVM 22, and builds `distrib/`, the Halide
-distribution every app in `apps/` links against.
+Two baselines are installed by hand: Julia, for the RNG rows, and parasail,
+for the alignment rows. Julia's installer puts `julia` on the `PATH` for new
+shells; parasail is found through `PARASAIL_DIR`:
+
+```shell
+curl -fsSL https://install.julialang.org | sh -s -- --default-channel 1.12
+curl -L https://github.com/jeffdaily/parasail/archive/refs/tags/v2.6.2.tar.gz | tar xz
+cmake -S parasail-2.6.2 -B parasail-2.6.2/build -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build parasail-2.6.2/build --target parasail -j
+export PARASAIL_DIR=$PWD/parasail-2.6.2
+```
+
+To check the installation, `inductive_artifact/basic_test.sh` runs Halide's
+own tests of inductive functions with Halide's Makefile: the correctness
+tests of inductive functions, storage folding and sliding windows, and the
+error tests of schedules Halide must reject. It ends with `Basic test passed.`
 
 ## Running
 
@@ -49,8 +68,8 @@ Optional baselines are used when found:
 | `BOOST_DIR` (or `libboost-dev`) | Boost.odeint (ODE) |
 | `TBB_DIR` (or `libtbb-dev`, or `tbb-devel` in the venv) | oneTBB (prefix mean) |
 | `IPP_DIR` (default: the venv) | Intel IPP (biquads) |
-| `PARASAIL_DIR` | parasail (alignment) |
-| `HB_JULIA` (or `julia` on the `PATH`) | Julia (rng) |
+| `PARASAIL_DIR` (see Setup) | parasail (alignment) |
+| `HB_JULIA` (or `julia` on the `PATH`; see Setup) | Julia (rng) |
 | `HB_PYTHON` (default: the venv's python) | scipy, torch, Triton, mamba_ssm |
 
 `HB_NCORES`, `HB_PIN_CORE` and `HB_JEMALLOC` override the core count, the

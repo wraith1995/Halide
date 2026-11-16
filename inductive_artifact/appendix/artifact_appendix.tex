@@ -77,27 +77,35 @@ memory-bound, so their speedups depend on the memory bandwidth available per
 core. The GPU apps need an NVIDIA GPU with tensor cores and CUDA~13.
 
 \subsubsection{Software dependencies}
-Linux, a C++17 compiler, GNU make, pkg-config, \texttt{uv}, jemalloc, and the
-libpng, libjpeg and zlib headers. Every process the scripts launch, baselines
-included, preloads jemalloc configured to keep freed memory, as in the paper.
-The baselines are optional. Boost.odeint, oneTBB, Intel IPP and parasail are
-found through \texttt{BOOST\_DIR}, \texttt{TBB\_DIR}, \texttt{IPP\_DIR} and
-\texttt{PARASAIL\_DIR}, or a system install. Julia is found on the
-\texttt{PATH}. The Python baselines come from
-\path{inductive_artifact/requirements.txt}. When a baseline is missing, the
-row reports the fastest baseline that is present.
+Linux, a C++17 compiler, GNU make, CMake, pkg-config, \texttt{uv},
+jemalloc, and the libpng, libjpeg and zlib headers. Every process the scripts
+launch, baselines included, preloads jemalloc configured to keep freed memory,
+as in the paper. Boost.odeint, oneTBB and Intel IPP are found through
+\texttt{BOOST\_DIR}, \texttt{TBB\_DIR} and \texttt{IPP\_DIR}, or a system
+install, and the Python baselines come from
+\path{inductive_artifact/requirements.txt}. Julia (the RNG baseline) and
+parasail (the alignment baseline) must be installed by hand, as shown in the
+next section. When a baseline is missing, the row reports the fastest
+baseline that is present.
 
 \subsubsection{Data sets}
 None; every input is generated.
 
 \subsection{Installation}
 
+Halide is built as its \path{README.md} describes under ``Building Halide
+with make'', with LLVM from Halide's package index (``Acquiring LLVM'').
+\texttt{setup.sh} does both: it creates a Python 3.12 environment in
+\path{.venv} holding LLVM, then builds the Halide distribution,
+\path{distrib/}, which every app links against. The README covers Halide's
+requirements in more detail if the build fails.
+
 {\footnotesize
 \begin{verbatim}
 git clone -b inductive_artifact \
   https://github.com/wraith1995/Halide.git
 cd Halide
-sudo apt install build-essential pkg-config \
+sudo apt install build-essential cmake pkg-config \
   libpng-dev libjpeg-turbo8-dev zlib1g-dev \
   libjemalloc2 libboost-dev libtbb-dev
 inductive_artifact/setup.sh
@@ -106,8 +114,31 @@ WITH_PYTHON_BASELINES=1 inductive_artifact/setup.sh
 \end{verbatim}
 }
 
-\noindent\texttt{setup.sh} installs LLVM into \path{.venv} and builds the
-Halide distribution, \path{distrib/}, which every app links against.
+\noindent Julia and parasail are installed by hand. Julia's installer
+puts \texttt{julia} on the \texttt{PATH} for new shells; parasail is found
+through \texttt{PARASAIL\_DIR}:
+
+{\footnotesize
+\begin{verbatim}
+curl -fsSL https://install.julialang.org | \
+  sh -s -- --default-channel 1.12
+curl -L https://github.com/jeffdaily/parasail/\
+archive/refs/tags/v2.6.2.tar.gz | tar xz
+cmake -S parasail-2.6.2 -B parasail-2.6.2/build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build parasail-2.6.2/build \
+  --target parasail -j
+export PARASAIL_DIR=$PWD/parasail-2.6.2
+\end{verbatim}
+}
+
+\noindent\textbf{Basic test.} \texttt{inductive\_artifact/basic\_test.sh}
+runs Halide's own tests of inductive functions with Halide's Makefile: 15
+correctness tests (inductive functions, storage folding and sliding windows)
+and 23 error tests (schedules of inductive functions that Halide must
+reject). It ends with \texttt{Basic test passed.}
 
 \subsection{Experiment workflow}
 
