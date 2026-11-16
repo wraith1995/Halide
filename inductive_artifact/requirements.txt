@@ -1,0 +1,12 @@
+# Python baselines and the libraries the C++ baselines can take from a venv.
+# The versions are the ones the paper's numbers were measured with.
+numpy==2.2.4
+scipy==1.15.3
+# Intel IPP (cpu_biquads, IPP_DIR) and oneTBB (prefixsum, TBB_DIR).
+ipp-devel
+ipp-static
+tbb-devel
+# GPU baselines (cuda_mamba2, cuda_attention). mamba_ssm is installed by
+# setup.sh after torch, since it builds against it.
+torch==2.11.0
+triton==3.6.0
