@@ -4,7 +4,6 @@
 % places the artifact appendix before the References, up to two pages).
 % The archived artifact (Zenodo):
 \newcommand{\artifactdoi}{\href{https://doi.org/10.5281/zenodo.24284710}{10.5281/zenodo.24284710}}
-\newcommand{\artifactrepo}{\url{https://github.com/wraith1995/Halide/tree/inductive_artifact}}
 % Figure references that fall back to text when built outside the paper.
 \newcommand{\artfig}[2]{\ifcsname r@#1\endcsname Figure~\ref{#1}\else #2\fi}
 \newcommand{\artsec}[2]{\ifcsname r@#1\endcsname Section~\ref{#1}\else #2\fi}
@@ -67,9 +66,8 @@ against a reference implementation before it is timed.
 \subsection{Description}
 
 \subsubsection{How delivered}
-The branch \texttt{inductive\_artifact} of \artifactrepo, archived at
-\artifactdoi. The benchmark apps are in \path{apps/}, and the artifact's
-scripts and instructions are in \path{inductive_artifact/}.
+On Zenodo, \artifactdoi: one 34~MB archive. The apps are in \path{apps/};
+the scripts and instructions in \path{inductive_artifact/}.
 
 \subsubsection{Hardware dependencies}
 The CPU apps run on any x86-64 Linux machine. The all-cores rows are
@@ -101,9 +99,9 @@ Container Toolkit:
 
 {\footnotesize
 \begin{verbatim}
-git clone -b inductive_artifact \
-  https://github.com/wraith1995/Halide.git
-cd Halide
+curl -L -o artifact.tar.gz https://zenodo.org/records/\
+24284710/files/Halide-inductive_artifact.tar.gz
+tar xzf artifact.tar.gz && cd Halide-inductive_artifact
 docker build -f inductive_artifact/Dockerfile \
   -t inductive-artifact .
 # or, for the GPU image:
@@ -120,7 +118,7 @@ shell opens in the artifact's tree.
 
 \noindent\textbf{On the host.} \texttt{setup.sh} builds Halide as its
 \path{README.md} describes (``Building Halide with make''), with LLVM from
-Halide's package index installed in \path{.venv}. In the clone:
+Halide's package index installed in \path{.venv}. In the unpacked archive:
 
 {\footnotesize
 \begin{verbatim}
