@@ -203,8 +203,9 @@ not plot. The tables from the paper's machine are in
     mean and ODE, and 671~MB for Viterbi. On the GPU, Mamba-2 forward needs
     42~MB against 141~MB. These values depend only on the problem sizes, so
     they should match exactly. The ODE and Viterbi all-cores rows run one
-    batch element per core, so their memory scales with the core count;
-    \texttt{HB\_NCORES=32} gives the paper's sizes.
+    batch element per detected core, so their memory scales with the core
+    count. Nothing needs setting; \texttt{HB\_NCORES=32} gives the paper's
+    sizes (oversubscribing a machine with fewer cores).
   \item \textbf{CPU speedups (\artfig{fig:cpuspeedup}{CPU figure}).} The
     inductive form is faster than the non-inductive form in every app. On
     the paper's machine the speedups are prefix mean 2.00$\times$, Viterbi

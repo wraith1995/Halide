@@ -100,6 +100,21 @@ Optional baselines are used when found:
 `HB_NCORES`, `HB_PIN_CORE` and `HB_JEMALLOC` override the core count, the
 core single-thread rows are pinned to, and the jemalloc library.
 
+### Core count
+
+Nothing needs to be set: by default the scripts run the all-cores rows with one
+thread per physical core the process may use. `HB_NCORES` matters only for the
+ODE and Viterbi all-cores rows, whose batch is one trajectory or decode per
+core, so on a machine without 32 cores they run a different problem size from
+the paper's, and their memory and times differ with it. The other rows have
+fixed sizes. `HB_NCORES=32` reproduces the paper's sizes:
+
+| Machine | Effect of `HB_NCORES=32` |
+|---|---|
+| More than 32 cores | Uses the first 32 cores: the paper's configuration. |
+| Exactly 32 cores | Same as the default. |
+| Fewer than 32 cores | Paper-sized ODE and Viterbi batches, but 32 threads share the cores: the memory matches the paper, the times are oversubscribed. |
+
 ## Expected results
 
 The paper machine's outputs are `apps/inductive_benchmarks_results.md` and
