@@ -1,5 +1,7 @@
 # Inductive Funcs: artifact
 
+Archived at Zenodo: [10.5281/zenodo.24284710](https://doi.org/10.5281/zenodo.24284710).
+
 Scripts to build this fork of Halide and rerun the paper's benchmark table
 and optimization ablation. The CGO artifact appendix is in `appendix/`
 (`latexmk -pdf main.tex` builds a standalone copy; `artifact_appendix.tex` is
