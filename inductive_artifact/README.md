@@ -2,8 +2,8 @@
 
 Scripts to build this fork of Halide and rerun the paper's benchmark table
 and optimization ablation. The CGO artifact appendix is in `appendix/`
-(`latexmk -pdf main.tex` builds a standalone copy; `appendix.tex` is the
-part to `\input` into the paper).
+(`latexmk -pdf main.tex` builds a standalone copy; `artifact_appendix.tex` is
+the part to `\input` into the paper, after `\appendix`).
 
 ## Setup
 
@@ -58,8 +58,10 @@ core single-thread rows are pinned to, and the jemalloc library.
 ## Expected results
 
 The paper machine's outputs are `apps/inductive_benchmarks_results.md` and
-`apps/inductive_ablation_results/`. The peak-heap columns are properties of
-the programs and should match on any machine. The time ratios depend on the
+`apps/inductive_ablation_results/`. The peak-heap columns depend only on the
+problem sizes, so they should match exactly; the ODE and Viterbi all-cores
+rows run one batch element per core, so theirs scale with the core count
+(`HB_NCORES=32` gives the paper's sizes). The time ratios depend on the
 machine: the all-cores rows are memory-bound, so they shrink on a machine with
-more memory bandwidth per core. `appendix/appendix.tex` lists the claims to
+more memory bandwidth per core. `appendix/artifact_appendix.tex` lists the claims to
 check.

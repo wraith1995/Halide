@@ -1,11 +1,11 @@
 % Standalone build of the artifact appendix: latexmk -pdf main.tex
-\documentclass[conference]{IEEEtran}
-\usepackage[T1]{fontenc}
-\usepackage{url}
-\usepackage[hidelinks]{hyperref}
+% In the paper: \appendix \input{artifact_appendix} after the bibliography.
+\documentclass[sigplan,screen]{acmart}
+\settopmatter{printacmref=false,printccs=false,printfolios=true}
+\setcopyright{none}
 \begin{document}
-\title{Artifact Appendix}
+\title{Inductive Functions: Artifact Appendix}
 \maketitle
 \appendix
-\input{appendix}
+\input{artifact_appendix}
 \end{document}
