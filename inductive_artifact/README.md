@@ -3,7 +3,8 @@
 Scripts to build this fork of Halide and rerun the paper's benchmark table
 and optimization ablation. The CGO artifact appendix is in `appendix/`
 (`latexmk -pdf main.tex` builds a standalone copy; `artifact_appendix.tex` is
-the part to `\input` into the paper, after `\appendix`).
+the part to `\input` into the paper, after `\appendix` and before the
+bibliography; CGO places the artifact appendix before the References).
 
 ## Setup
 
@@ -19,7 +20,7 @@ inductive_artifact/setup.sh
 WITH_PYTHON_BASELINES=1 inductive_artifact/setup.sh
 ```
 
-`setup.sh` installs LLVM 22 into `.venv` and builds `distrib/`, the Halide
+`setup.sh` creates a Python 3.12 environment in `.venv` holding LLVM 22, and builds `distrib/`, the Halide
 distribution every app in `apps/` links against.
 
 ## Running

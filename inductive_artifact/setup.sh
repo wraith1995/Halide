@@ -12,9 +12,12 @@ cd "$ROOT"
 JOBS=${JOBS:-$(nproc)}
 
 command -v uv >/dev/null || { echo "uv is needed: https://docs.astral.sh/uv/"; exit 1; }
-[ -d .venv ] || uv sync --group ci-llvm-22 --no-install-project
+# A Python 3.12 environment (uv downloads that Python if the system has
+# another) holding only the LLVM build Halide's CI uses.
+[ -x .venv/bin/python ] || uv venv --python 3.12 .venv
 # shellcheck disable=SC1091
 source .venv/bin/activate
+uv pip install --index https://pypi.halide-lang.org/simple "halide-llvm~=22.1.0"
 LLVM_PREFIX=$(halide-llvm --prefix)
 
 make -j"$JOBS" LLVM_CONFIG="$LLVM_PREFIX/bin/llvm-config" distrib
