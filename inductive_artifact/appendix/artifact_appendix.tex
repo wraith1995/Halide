@@ -220,15 +220,11 @@ not plot. The tables from the paper's machine are in
     (Mamba-2 backward). Relative to the vendor kernels it reaches 94\% of
     PyTorch, 98\% of Triton on the forward pass and 73\% of Triton on the
     backward pass.
-  \item \textbf{Ablation (CPU).} The levels are non-inductive, fusion only,
-    fusion with a sliding window, and the full schedule with storage
-    folding. Fusion alone is far slower than any other level, because each
-    output recomputes the recurrence from its start. It is measured at a
-    small size, where it runs 62--6038$\times$ slower than the full schedule.
-    Adding the sliding window lands near the non-inductive form
-    (1.3--14$\times$ the full schedule). ODE is the exception at
-    39$\times$: its unfolded window is three times the non-inductive
-    storage. Storage folding is the fastest level in every app.
+  \item \textbf{Ablation (CPU).} The levels add the optimizations one at a
+    time: fusion only, then a sliding window, then storage folding. Each level
+    is needed: only with all of them does the schedule reach roughly the
+    paper's results, and earlier levels are slower, fusion alone by far,
+    since it recomputes each recurrence from its start.
 \end{enumerate}
 
 Absolute times depend on the machine. The all-cores speedups come from
