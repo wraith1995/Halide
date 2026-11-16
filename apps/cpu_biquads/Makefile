@@ -2,7 +2,9 @@ HL_TARGET ?= host
 # The whole app builds with clang: the "Finding Fast Filters" library the
 # runner links needs its vector extensions. The runner keeps infinities
 # under fast-math for the benchmark harness's initial best time.
-CXX = clang++-21
+# Override CLANGXX to pick a particular clang (e.g. CLANGXX=clang++-21).
+CLANGXX ?= clang++
+CXX = $(CLANGXX)
 
 include ../support/Makefile.inc
 
@@ -54,9 +56,10 @@ $(BIN)/%/runtime.a: $(GENERATOR_BIN)/biquads.generator
 	@mkdir -p $(@D)
 	$< -r runtime -o $(@D) target=$*
 
-# Optional Intel IPP baseline (pip install ipp-devel ipp-static puts it
-# in a venv; point IPP_DIR at that venv).
-IPP_DIR ?= $(HOME)/.claude/jobs/6e7f4185/tmp/venv
+# Optional Intel IPP baseline. pip install ipp-devel ipp-static puts it in
+# a Python environment; IPP_DIR is that environment's prefix, by default
+# the active virtualenv. Without it the runner skips the IPP row.
+IPP_DIR ?= $(VIRTUAL_ENV)
 ifneq (,$(wildcard $(IPP_DIR)/include/ipp/ipps.h))
 IPP_FLAGS = -DHAVE_IPP -I$(IPP_DIR)/include/ipp -L$(IPP_DIR)/lib -lipps -lippvm -lippcore -Wl,-rpath,$(IPP_DIR)/lib
 endif

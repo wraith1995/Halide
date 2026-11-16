@@ -23,10 +23,12 @@ from pathlib import Path
 APPS = Path(__file__).resolve().parent
 LOGS = APPS / "inductive_benchmarks_logs"
 SCRATCH = Path(os.environ.get("HB_SCRATCH", "/tmp")) / "hb_peak"
-# Where the baselines live; each can be overridden from the environment for
-# a machine laid out differently.
-VENV = Path(os.environ.get("HB_VENV_PYTHON", Path.home() / ".claude/jobs/6e7f4185/tmp/venv/bin/python"))
-JULIA = Path(os.environ.get("HB_JULIA", Path.home() / ".juliaup/bin/julia"))
+# The Python baselines (scipy, torch, Triton, mamba_ssm) run under
+# HB_PYTHON, by default the interpreter running this driver, so run it from
+# the environment that has them installed. Julia is HB_JULIA, or julia on
+# the PATH. A baseline that is missing is reported as unavailable.
+VENV = Path(os.environ.get("HB_PYTHON", sys.executable))
+JULIA = Path(os.environ.get("HB_JULIA") or shutil.which("julia") or "julia")
 # The CPUs this process may run on (a batch job's allocation, or the whole
 # machine). Parallel configs use one thread per physical core: the first
 # hardware thread of each core in the allocation.
@@ -58,9 +60,12 @@ NCORES = int(os.environ.get("HB_NCORES", len(CORES)))
 # otherwise pay a first-touch page fault per 4 KB of it; retaining is what
 # any application that reuses its work buffers gets. Without the library the
 # numbers change materially, so its absence is an error, not a fallback.
-JEMALLOC = os.environ.get("HB_JEMALLOC", "/lib/x86_64-linux-gnu/libjemalloc.so.2")
+JEMALLOC_CANDIDATES = ["/lib/x86_64-linux-gnu/libjemalloc.so.2", "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
+                       "/usr/lib64/libjemalloc.so.2", "/usr/lib/libjemalloc.so.2", "/usr/local/lib/libjemalloc.so.2"]
+JEMALLOC = os.environ.get("HB_JEMALLOC") or next((p for p in JEMALLOC_CANDIDATES if Path(p).exists()),
+                                                 JEMALLOC_CANDIDATES[0])
 # thp:always backs every allocation with transparent huge pages where the
-# kernel allows (this box has them in madvise mode): the serial forms that
+# kernel allows (including in madvise mode): the serial forms that
 # stream gigabyte signals otherwise vary by 30% run to run with where the
 # 4 KB pages land, and huge pages take that spread away.
 MALLOC_CONF = "oversize_threshold:0,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always"
@@ -240,7 +245,8 @@ def cpu_biquads(par):
     out = sh(f"make -s {kv} test", d, log=LOGS / f"cpu_biquads_par{par}.txt", pin=not par, cores=par)
     scipy = None
     if VENV.exists() and not par:  # scipy is single-threaded; compare it in the serial config
-        so = sh(f"{VENV} sosfilt_bench.py {knobs['CHANNELS']} {knobs['SAMPLES']} {knobs['SECTIONS']}", d, pin=True)
+        so = sh(f"{VENV} sosfilt_bench.py {knobs['CHANNELS']} {knobs['SAMPLES']} {knobs['SECTIONS']}", d, pin=True,
+                check=False)
         scipy = us_row(so, "scipy.sosfilt")
     # Intel IPP's multi-channel IIR (ippsIIR_32f_P), threaded across channels
     # in the parallel config, when the runner was built with it.
@@ -430,7 +436,7 @@ def mamba2(direction):
         except RuntimeError:
             pass
     return dict(params=f"{direction}, seq {shape['SEQ']}, state {shape['STATE']}, {shape['HEADS']} heads x "
-                       f"{shape['CHANNELS']}, chunk {ours_chunk} (Triton {triton_chunk}), RTX 5060 Ti",
+                       f"{shape['CHANNELS']}, chunk {ours_chunk} (Triton {triton_chunk})",
                 ind=times["inductive"], rdom=times["rdom"],
                 ind_mb=mem.get("inductive"), rdom_mb=mem.get("rdom"),
                 base_name="Triton (mamba_ssm)" if triton else "Triton (unavailable)", base=triton)
@@ -477,7 +483,7 @@ def flash_attention():
                        ["attention_flash", "attention_flash_rdom"], "flash_attention")
     return dict(ind_mb=amem.get("attention_flash"), rdom_mb=amem.get("attention_flash_rdom"),
                 params=f"{shape['QUERIES']} queries x {shape['KEYS']} keys, depth {shape['DEPTH']}, fp16, "
-                       f"chunk 64 (RDom {rdom_chunk}), RTX 5060 Ti",
+                       f"chunk 64 (RDom {rdom_chunk})",
                 ind=ind, rdom=rdom, base_name=bn or "torch flash (unavailable)", base=bt)
 
 
@@ -570,8 +576,9 @@ def main():
     notes = (
         "Times are milliseconds per run: inductive = the folded inductive-Func form, RDom = the same "
         "algorithm as update definitions (materializing), baseline = the fastest non-Halide implementation "
-        "available on this machine, with the others tried listed beside it. Measured on a Threadripper 9970X "
-        "(Zen 5, 32 cores in four 8-core chiplets) and an RTX 5060 Ti (driver 595.71, CUDA 13).\n\n"
+        "available on this machine, with the others tried listed beside it. Measured on a 32-core x86-64 "
+        "workstation CPU with AVX-512 (four 8-core chiplets, one NUMA node) and a consumer NVIDIA GPU "
+        "(CUDA 13).\n\n"
         "The two peak-heap columns are the Halide profiler's memory_peak for each form, the high-water "
         "mark of the pipeline's internal heap (halide_malloc) during one run, read from the profiler's "
         "JSON report; input and output buffers, allocated by the harness, are not counted. This is what "
@@ -638,7 +645,7 @@ def main():
         "GPU a trial is ten launches and one device synchronization, divided by ten. The ode all-cores "
         "forms run in about a millisecond, short enough that a single realize is dominated by thread-pool "
         "fork/join and scheduling noise (the machine masks threads to the core set but does not pin them), "
-        "so that row times a batch of sixteen realizes together and divides, which the header records; the "
+        "so that row times a batch of 128 realizes together and divides, which the header records; the "
         "other rows are long enough to time one at a time. Baseline versions: "
         "torch 2.11.0+cu130 (FlashAttention-2 and cuDNN SDPA backends), Triton 3.6.0, mamba_ssm 2.3.2.post1, "
         "Julia 1.12.7, scipy 1.15.3, numpy 2.2.4.\n\n")

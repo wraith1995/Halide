@@ -1,4 +1,4 @@
-Paper machine: AMD Threadripper 9970X (32 cores, AVX-512, all-cores rows on 32 threads) and NVIDIA RTX 5060 Ti (driver 595.71.05).
+Paper machine: a 32-core AVX-512 x86-64 workstation CPU (all-cores rows on 32 threads) and a consumer NVIDIA GPU (CUDA 13).
 Time: each step's time / the paper form's time, at the paper's sizes on all cores.
 * Fusion only recomputes the recurrence from its start for every output, O(T^2), so it is
   measured at a small size on one thread, against the paper form at that same size.

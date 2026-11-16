@@ -1,4 +1,4 @@
-Paper machine: AMD Threadripper 9970X (32 cores, AVX-512, all-cores rows on 32 threads) and NVIDIA RTX 5060 Ti (driver 595.71.05).
+Paper machine: a 32-core AVX-512 x86-64 workstation CPU (all-cores rows on 32 threads) and a consumer NVIDIA GPU (CUDA 13).
 Paper form vs third-party implementations. CPU: resident-memory growth during the timed runs,
 the same measurement for every implementation. GPU: Halide's peak device heap vs the torch allocator's
 growth during the call.

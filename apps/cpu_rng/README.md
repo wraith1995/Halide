@@ -42,7 +42,7 @@ top 24 bits of each half, converted and scaled by 2^-24). numpy's
 default fill is PCG64, a different and smaller-state generator, reported
 for ecosystem context only.
 
-Measured on a Threadripper 9970X (Zen 5), one thread, 1 GB of floats
+Measured on a 32-core AVX-512 x86-64 workstation CPU, one thread, 1 GB of floats
 (32 streams x 4M steps x 2):
 
     inductive       35.2 ms   (31 GB/s of output)

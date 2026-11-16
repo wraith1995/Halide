@@ -65,8 +65,8 @@ $(BIN)/%/ksw2_gg2_sse.o: ksw2/ksw2_gg2_sse.c
 	$(CC) -O3 -march=native -ffast-math -c $< -o $@
 
 # Optional parasail baseline: build https://github.com/jeffdaily/parasail
-# with cmake into $(PARASAIL_DIR)/build and this picks it up.
-PARASAIL_DIR ?= $(HOME)/projects/parasail
+# with cmake into $(PARASAIL_DIR)/build and set PARASAIL_DIR to pick it up.
+PARASAIL_DIR ?=
 ifneq (,$(wildcard $(PARASAIL_DIR)/build/libparasail.a))
 PARASAIL_FLAGS = -DHAVE_PARASAIL -I$(PARASAIL_DIR) $(PARASAIL_DIR)/build/libparasail.a
 endif

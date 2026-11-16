@@ -10,7 +10,7 @@
 //    inductive classifier), which removes ~5x duplicated arithmetic;
 //  - two vectors of series advance together through each walk, hiding the
 //    divide's latency (the same interleaving that pays in cpu_biquads).
-// Measured here (Zen 5, B=256 T=16384, one thread): as shipped the
+// Measured here (32-core AVX-512 x86-64, B=256 T=16384, one thread): as shipped the
 // inductive form lost 68ms to 20ms; fixed, in double, it won 14ms to 20ms
 // against the non-inductive form's best schedule; in single precision it
 // is 1.3ms to 3.7ms.

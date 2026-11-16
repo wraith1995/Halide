@@ -261,7 +261,7 @@ def cpu_biquads(sections, channels, samples, par, fusion=False):
              from_us(out, mems, "fff", "", "baseline", FFF_NAME),
              from_us(out, mems, "ipp", "", "baseline", "Intel IPP ippsIIR_32f_P")]
     if ib.VENV.exists() and not par:
-        so = sh(f"{ib.VENV} sosfilt_bench.py {channels} {samples} {sections}", d, pin=True,
+        so = sh(f"{ib.VENV} sosfilt_bench.py {channels} {samples} {sections}", d, pin=True, check=False,
                 log=LOGS / f"abl_biquads_scipy_{channels}_{samples}.txt")
         rows.append(from_us(so, mem_lines(so), "scipy.sosfilt", "", "baseline", "scipy.sosfilt"))
     peaks = aot_peaks(d, kv + " HL_TARGET=host-profile", ["biquads_rdom", "biquads_fus", "biquads_sld", "biquads_ind"],

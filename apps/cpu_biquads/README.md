@@ -39,8 +39,8 @@ Knobs: SECTIONS, CHANNELS, SAMPLES, PAR (spread channel blocks across
 cores).
 
 The numbers live in the table apps/inductive_benchmarks.py writes
-(apps/inductive_benchmarks_results.md), measured on a Threadripper 9970X
-(Zen 5, 128 MB L3) under one protocol for every form and baseline. At
+(apps/inductive_benchmarks_results.md), measured on a 32-core AVX-512 x86-64
+workstation CPU (128 MB L3) under one protocol for every form and baseline. At
 eight sections over 32 channels x 8M samples (1 GB) on one core the
 inductive form takes 95 ms and the RDom form 447 ms; over 1024 channels
 x 256K samples on all 32 cores, 26 ms against 193 ms. The RDom form is

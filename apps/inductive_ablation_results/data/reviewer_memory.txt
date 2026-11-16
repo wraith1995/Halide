@@ -1,4 +1,4 @@
-Paper machine: AMD Threadripper 9970X (32 cores, AVX-512, all-cores rows on 32 threads) and NVIDIA RTX 5060 Ti (driver 595.71.05).
+Paper machine: a 32-core AVX-512 x86-64 workstation CPU (all-cores rows on 32 threads) and a consumer NVIDIA GPU (CUDA 13).
 Peak Halide heap (MB) at each step; fusion only at the small size (paper form's heap there in brackets).
 
 Experiment             RDom (non-inductive)  (1) Fusion only*  (2) + Sliding window  (3) + Loop unrolling  (4) + Storage folding = paper

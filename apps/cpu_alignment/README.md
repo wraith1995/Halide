@@ -95,7 +95,7 @@ the dense-DP regime; on high-identity pairs wavefront methods (WFA)
 are the right algorithm and would win - cite them as context, not as
 this benchmark's competitor.
 
-Measured on a Threadripper 9970X (Zen 5). Every number is the full
+Measured on a 32-core AVX-512 x86-64 workstation CPU (four 8-core chiplets, 128 MB L3). Every number is the full
 contract - fill, traceback, and run-length CIGAR. The matched-ISA
 comparison below uses interleaved single-shot medians (INTERLEAVE=9
 rounds cycling int8, int16, ksw2, parasail) so all sides share thermal
@@ -165,7 +165,7 @@ fused forms now pack two cells' directions into a byte (ksw2's state in
 the low two bits, its two extension flags in the next two; the walk
 reads a nibble), which halves what the fill streams out and lifts it to
 ~180 Gcell/s: 28 ms for the all-cores row, from 38. The
-9970X is four CCDs with separate L3s and fabric links; spreading
+CPU is four CCDs with separate L3s and fabric links; spreading
 threads across CCDs recovers 12-28 percent on the way up. There is no
 cache-resident regime for a batch-width x N^2 block at 1k lengths (a
 plane that fits total L3 is SLOWER with regular stores, 60 vs 91

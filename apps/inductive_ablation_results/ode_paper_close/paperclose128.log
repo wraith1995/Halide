@@ -1,0 +1,30 @@
+# ode_paperclose 1024 32 8192, HB_BATCH=128 HL_NUM_THREADS=32 taskset -c 0-31, three runs.
+# Columns: variant, best ms, median ms, throughput, peak heap MB, check. Trailing
+# columns of each row were cut when the output was captured.
+== HB_BATCH=128 run 1
+### protocol: warmup=3 trials=30 batch=128  metric=best(min) ms; median shown for reference
+  Boost.odeint (rk4 init + observer)      2.205      2.490   121730.2 Mupd/s       0.00  PASS (err 3.4e-08)
+  fused C++ loop                      2.621      2.989   102425.4 Mupd/s       0.00  PASS (err 0)
+  non-inductive (materialize)        27.020     27.455     9934.6 Mupd/s    1024.00  PASS (err 3.9e-08)
+  inductive UNFOLDED (fold n -> T)     53.782     54.250     4991.2 Mupd/s    3072.00  PASS (err 3.9e-08)
+  inductive FOLDED (fold n -> 2)      1.232      1.478   217805.4 Mupd/s       0.00  PASS (err 3.9e-08)
+  gap (inductive-fold vs Boost): -44.1%   inductive-fold vs non-ind: 21.92x
+  -> PASS
+== HB_BATCH=128 run 2
+### protocol: warmup=3 trials=30 batch=128  metric=best(min) ms; median shown for reference
+  Boost.odeint (rk4 init + observer)      2.048      2.287   131101.6 Mupd/s       0.00  PASS (err 3.4e-08)
+  fused C++ loop                      2.562      2.799   104759.0 Mupd/s       0.00  PASS (err 0)
+  non-inductive (materialize)        27.048     27.689     9924.4 Mupd/s    1024.00  PASS (err 3.9e-08)
+  inductive UNFOLDED (fold n -> T)     53.452     54.053     5022.0 Mupd/s    3072.00  PASS (err 3.9e-08)
+  inductive FOLDED (fold n -> 2)      1.386      1.491   193709.6 Mupd/s       0.00  PASS (err 3.9e-08)
+  gap (inductive-fold vs Boost): -32.3%   inductive-fold vs non-ind: 19.52x
+  -> PASS
+== HB_BATCH=128 run 3
+### protocol: warmup=3 trials=30 batch=128  metric=best(min) ms; median shown for reference
+  Boost.odeint (rk4 init + observer)      2.065      2.400   130021.0 Mupd/s       0.00  PASS (err 3.4e-08)
+  fused C++ loop                      2.546      2.964   105447.1 Mupd/s       0.00  PASS (err 0)
+  non-inductive (materialize)        26.972     27.507     9952.4 Mupd/s    1024.00  PASS (err 3.9e-08)
+  inductive UNFOLDED (fold n -> T)     53.574     54.256     5010.5 Mupd/s    3072.00  PASS (err 3.9e-08)
+  inductive FOLDED (fold n -> 2)      1.285      1.476   208925.1 Mupd/s       0.00  PASS (err 3.9e-08)
+  gap (inductive-fold vs Boost): -37.8%   inductive-fold vs non-ind: 20.99x
+  -> PASS

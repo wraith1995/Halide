@@ -1,4 +1,4 @@
-Paper machine: AMD Threadripper 9970X, 32 cores, AVX-512; all-cores rows use 32 threads, one per core.
+Paper machine: a 32-core AVX-512 x86-64 workstation CPU; all-cores rows use 32 threads, one per core.
 Paper form vs third-party implementations. CPU: resident-memory growth during the timed runs,
 the same measurement for every implementation. GPU: Halide's peak device heap vs the torch allocator's
 growth during the call.

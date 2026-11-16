@@ -1,7 +1,7 @@
 # Inductive-Func ablation results
 
-Measurements on the paper machine (AMD Threadripper 9970X, 32 cores; NVIDIA
-RTX 5060 Ti), with the paper's protocol: jemalloc preloaded with
+Measurements on the paper machine (a 32-core AVX-512 x86-64 workstation CPU
+and a consumer NVIDIA GPU, CUDA 13), with the paper's protocol: jemalloc preloaded with
 `oversize_threshold:0,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always`,
 `taskset -c 0-31`, `HL_NUM_THREADS=32`, best of 30 trials.
 
@@ -57,10 +57,9 @@ HB_BATCH=128 HL_NUM_THREADS=32 taskset -c 0-31 ./ode_paperclose 1024 32 8192    
 HB_FUSION=1 HL_NUM_THREADS=1 taskset -c 0 ./ode_paperclose 1024 1 512           # fusion only
 ```
 
-`paperclose128.log` has the three paper-config runs at 128 realizes per
-sample, the paper driver's setting (19.52-21.92x over RDom; the paper
-reports 19.01x). `paperclose.log` has three runs at 16 realizes per sample
-(19.79-23.05x) and the two fusion-only runs.
+`ode_paper_close/paperclose128.log` has the three paper-config runs at 128
+realizes per sample, the paper driver's setting (19.52-21.92x over RDom; the
+paper reports 19.01x). Three runs at 16 realizes per sample gave 19.79-23.05x.
 
 ## Files
 
@@ -68,7 +67,7 @@ reports 19.01x). `paperclose.log` has three runs at 16 realizes per sample
   growth from `apps/inductive_ablation.py`. `allcores` and `fusion` are the
   CPU suite; `odefix` and `odefix_fusion` are ODE on this branch's source,
   with the same zero-fill schedule.
-- `data/gpu_5060.json`: the GPU rows.
+- `data/gpu.json`: the GPU rows.
 - `data/reviewer_*.txt`: the tables `reviewer_tables.py` renders from them,
   with a loop-unrolling column and memory tables.
-- `machine.txt`: the machine's CPU.
+- `machine.txt`: the machine's CPU topology.

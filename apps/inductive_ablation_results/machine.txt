@@ -1,7 +1,4 @@
-host (paper machine)  Thu Oct 29 17:08:41 UTC 2026
-CPU(s):                                  64
-Model name:                              AMD Ryzen Threadripper 9970X 32-Cores
-Thread(s) per core:                      2
-Socket(s):                               1
-CPU(s) scaling MHz:                      37%
-affinity pid 3595785's current affinity list: 0-63
+CPU: 32-core x86-64 workstation CPU with AVX-512, 2 hardware threads per core
+     (64 logical CPUs), one socket, four 8-core chiplets, 128 MB L3, one NUMA node
+GPU: consumer NVIDIA GPU, CUDA 13
+All-cores rows: taskset -c 0-31, HL_NUM_THREADS=32 (the first hardware thread of each core)
