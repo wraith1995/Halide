@@ -10,3 +10,10 @@ tbb-devel
 # setup.sh after torch, since it builds against it.
 torch==2.11.0
 triton==3.6.0
+# What mamba_ssm's Triton kernels import, and what its setup.py needs to
+# install without building its CUDA extensions.
+einops
+packaging
+setuptools
+wheel
+ninja

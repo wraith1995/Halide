@@ -33,8 +33,9 @@ make -j"$JOBS" LLVM_CONFIG="$LLVM_PREFIX/bin/llvm-config" distrib
 if [ "${WITH_PYTHON_BASELINES:-0}" = 1 ]; then
     uv pip install -r inductive_artifact/requirements.txt \
         --extra-index-url https://download.pytorch.org/whl/cu130
-    # mamba_ssm compiles CUDA extensions against the torch just installed.
-    uv pip install --no-build-isolation "mamba_ssm==2.3.2.post1"
+    # The Triton baseline loads only mamba_ssm's Triton kernels, so its CUDA
+    # extensions are not built (they would need nvcc and a long compile).
+    MAMBA_SKIP_CUDA_BUILD=TRUE uv pip install --no-build-isolation --no-deps "mamba_ssm==2.3.2.post1"
 fi
 
 echo "Halide distribution: $ROOT/distrib"
